@@ -51,7 +51,7 @@ def memory_check(config: dict[str, Any]) -> CheckResult | None:
     try:
         import psutil  # type: ignore
     except Exception:
-        return None
+        return proc_memory_check(config)
 
     vm = psutil.virtual_memory()
     threshold = float(config.get("memory_percent_warn", 85))
@@ -69,7 +69,7 @@ def cpu_check(config: dict[str, Any]) -> CheckResult | None:
     try:
         import psutil  # type: ignore
     except Exception:
-        return load_average_check()
+        return proc_cpu_check(config) or load_average_check()
 
     percent = psutil.cpu_percent(interval=0.2)
     threshold = float(config.get("cpu_percent_warn", 85))
@@ -94,3 +94,72 @@ def load_average_check() -> CheckResult | None:
         summary=f"Load average {one:.2f}, {five:.2f}, {fifteen:.2f}",
         details={"load_1m": one, "load_5m": five, "load_15m": fifteen},
     )
+
+
+def proc_memory_check(config: dict[str, Any]) -> CheckResult | None:
+    meminfo = Path("/proc/meminfo")
+    if not meminfo.exists():
+        return None
+
+    values: dict[str, int] = {}
+    for line in meminfo.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            values[parts[0].rstrip(":")] = int(parts[1]) * 1024
+
+    total = values.get("MemTotal")
+    available = values.get("MemAvailable")
+    if not total or available is None:
+        return None
+
+    used_percent = round(((total - available) / total) * 100, 2)
+    threshold = float(config.get("memory_percent_warn", 85))
+    status = "warning" if used_percent >= threshold else "ok"
+    return CheckResult(
+        source="server",
+        name="Memory usage",
+        status=status,
+        summary=f"Memory usage {used_percent}%",
+        details={"used_percent": used_percent, "available_bytes": available, "threshold": threshold},
+    )
+
+
+def proc_cpu_check(config: dict[str, Any]) -> CheckResult | None:
+    first = read_proc_cpu()
+    if not first:
+        return None
+
+    import time
+
+    time.sleep(0.2)
+    second = read_proc_cpu()
+    if not second:
+        return None
+
+    idle_delta = second["idle"] - first["idle"]
+    total_delta = second["total"] - first["total"]
+    if total_delta <= 0:
+        return None
+
+    used_percent = round((1 - idle_delta / total_delta) * 100, 2)
+    threshold = float(config.get("cpu_percent_warn", 85))
+    status = "warning" if used_percent >= threshold else "ok"
+    return CheckResult(
+        source="server",
+        name="CPU usage",
+        status=status,
+        summary=f"CPU usage {used_percent}%",
+        details={"used_percent": used_percent, "threshold": threshold},
+    )
+
+
+def read_proc_cpu() -> dict[str, int] | None:
+    stat = Path("/proc/stat")
+    if not stat.exists():
+        return None
+    fields = stat.read_text(encoding="utf-8", errors="replace").splitlines()[0].split()
+    if not fields or fields[0] != "cpu":
+        return None
+    values = [int(value) for value in fields[1:]]
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    return {"idle": idle, "total": sum(values)}
