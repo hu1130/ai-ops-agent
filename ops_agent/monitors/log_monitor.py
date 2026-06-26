@@ -41,6 +41,23 @@ def run_log_check(check: dict[str, Any], base_dir: Path) -> CheckResult:
 
 
 def tail_file(path: Path, max_lines: int) -> list[str]:
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        lines = handle.readlines()
-    return [line.rstrip("\n") for line in lines[-max_lines:]]
+    if max_lines <= 0:
+        return []
+
+    block_size = 8192
+    chunks: list[bytes] = []
+    line_count = 0
+    with path.open("rb") as handle:
+        handle.seek(0, 2)
+        position = handle.tell()
+        while position > 0 and line_count <= max_lines:
+            read_size = min(block_size, position)
+            position -= read_size
+            handle.seek(position)
+            chunk = handle.read(read_size)
+            chunks.append(chunk)
+            line_count += chunk.count(b"\n")
+
+    data = b"".join(reversed(chunks))
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    return lines[-max_lines:]
