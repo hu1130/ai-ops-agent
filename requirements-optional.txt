@@ -1,0 +1,2 @@
+# Optional. The agent runs without this, but psutil enables CPU and memory checks.
+psutil>=5.9.0

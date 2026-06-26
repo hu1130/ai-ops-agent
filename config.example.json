@@ -1,0 +1,42 @@
+{
+  "app": {
+    "name": "internal-ops-agent",
+    "interval_seconds": 60,
+    "database_path": "data/ops_agent.db",
+    "dashboard_host": "127.0.0.1",
+    "dashboard_port": 8765
+  },
+  "http_checks": [
+    {
+      "name": "Example homepage",
+      "url": "https://example.com",
+      "method": "GET",
+      "timeout_seconds": 5,
+      "expected_status": 200,
+      "max_latency_ms": 3000
+    }
+  ],
+  "server_checks": {
+    "enabled": true,
+    "disk_path": ".",
+    "cpu_percent_warn": 85,
+    "memory_percent_warn": 85,
+    "disk_percent_warn": 90
+  },
+  "log_checks": [
+    {
+      "name": "Application log",
+      "path": "logs/app.log",
+      "tail_lines": 200,
+      "keywords": ["ERROR", "Exception", "Traceback", "timeout", "failed"]
+    }
+  ],
+  "ai": {
+    "enabled": true,
+    "max_log_chars": 4000
+  },
+  "alerts": {
+    "webhook_url": "",
+    "cooldown_seconds": 300
+  }
+}
