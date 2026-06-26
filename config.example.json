@@ -16,6 +16,22 @@
       "max_latency_ms": 3000
     }
   ],
+  "json_checks": [
+    {
+      "name": "AI customer service synthetic chat",
+      "url": "https://example.com/v1/chat",
+      "timeout_seconds": 20,
+      "expected_status": 200,
+      "max_latency_ms": 10000,
+      "json": {
+        "session_id": "ops-agent-probe",
+        "message": "hello",
+        "api_key": ""
+      },
+      "required_paths": ["messages.0.text"],
+      "bad_phrases": ["系统异常", "API key", "服务未启用"]
+    }
+  ],
   "server_checks": {
     "enabled": true,
     "disk_path": ".",

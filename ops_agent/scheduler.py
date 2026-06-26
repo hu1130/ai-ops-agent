@@ -8,6 +8,7 @@ from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig
 from ops_agent.events import CheckResult
 from ops_agent.monitors.http_monitor import run_http_checks
+from ops_agent.monitors.json_api_monitor import run_json_checks
 from ops_agent.monitors.log_monitor import run_log_checks
 from ops_agent.monitors.server_monitor import run_server_checks
 from ops_agent.storage import Storage
@@ -22,6 +23,7 @@ class OpsScheduler:
     def run_once(self) -> list[CheckResult]:
         results: list[CheckResult] = []
         results.extend(run_http_checks(self.config.http_checks))
+        results.extend(run_json_checks(self.config.json_checks))
         results.extend(run_server_checks(self.config.server_checks, self.config.base_dir))
         results.extend(run_log_checks(self.config.log_checks, self.config.base_dir))
         self.storage.save_results(results)

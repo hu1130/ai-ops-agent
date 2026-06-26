@@ -20,6 +20,10 @@ class AppConfig:
         return list(self.raw.get("http_checks", []))
 
     @property
+    def json_checks(self) -> list[dict[str, Any]]:
+        return list(self.raw.get("json_checks", []))
+
+    @property
     def server_checks(self) -> dict[str, Any]:
         return self.raw.get("server_checks", {})
 
