@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,20 @@ def run_log_check(check: dict[str, Any], base_dir: Path) -> CheckResult:
             details={"path": str(path)},
         )
 
-    lines = tail_file(path, tail_lines)
+    if check.get("only_new", False):
+        lines = read_new_lines(path, base_dir)
+        if not lines:
+            return CheckResult(
+                source="log",
+                name=name,
+                status="ok",
+                summary="No new log lines",
+                details={"path": str(path), "match_count": 0, "matches": []},
+            )
+        lines = lines[-tail_lines:]
+    else:
+        lines = tail_file(path, tail_lines)
+
     matches = [line for line in lines if any(keyword.lower() in line.lower() for keyword in keywords)]
     status = "warning" if matches else "ok"
     summary = f"Found {len(matches)} suspicious log lines" if matches else "No suspicious log lines"
@@ -61,3 +75,40 @@ def tail_file(path: Path, max_lines: int) -> list[str]:
     data = b"".join(reversed(chunks))
     lines = data.decode("utf-8", errors="replace").splitlines()
     return lines[-max_lines:]
+
+
+def read_new_lines(path: Path, base_dir: Path) -> list[str]:
+    state_path = base_dir / "data" / "log_offsets.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state = load_offset_state(state_path)
+    key = str(path)
+    size = path.stat().st_size
+    previous = int(state.get(key, size))
+
+    if previous > size:
+        previous = 0
+
+    state[key] = size
+    save_offset_state(state_path, state)
+
+    if key not in state or previous == size:
+        return []
+
+    with path.open("rb") as handle:
+        handle.seek(previous)
+        data = handle.read()
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+def load_offset_state(path: Path) -> dict[str, int]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return {str(key): int(value) for key, value in raw.items()}
+
+
+def save_offset_state(path: Path, state: dict[str, int]) -> None:
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
