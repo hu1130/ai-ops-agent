@@ -53,6 +53,17 @@
   },
   "alerts": {
     "webhook_url": "",
-    "cooldown_seconds": 300
+    "cooldown_seconds": 300,
+    "email": {
+      "enabled": false,
+      "smtp_host": "smtp.qq.com",
+      "smtp_port": 465,
+      "use_ssl": true,
+      "use_tls": false,
+      "username": "your@qq.com",
+      "password": "smtp authorization code",
+      "from_email": "your@qq.com",
+      "to_emails": ["your@qq.com"]
+    }
   }
 }

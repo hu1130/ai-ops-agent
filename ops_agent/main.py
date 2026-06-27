@@ -29,6 +29,7 @@ def main() -> int:
     notifier = Notifier(
         webhook_url=str(config.alerts.get("webhook_url", "")),
         cooldown_seconds=int(config.alerts.get("cooldown_seconds", 300)),
+        email=dict(config.alerts.get("email", {})),
     )
     scheduler = OpsScheduler(config, storage, notifier)
 
