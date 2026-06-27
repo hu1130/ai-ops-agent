@@ -1,6 +1,11 @@
 import unittest
 
-from ops_agent.monitors.json_api_monitor import find_bad_phrase, get_path, validate_json_response
+from ops_agent.monitors.json_api_monitor import (
+    expand_dynamic_values,
+    find_bad_phrase,
+    get_path,
+    validate_json_response,
+)
 
 
 class JsonApiMonitorTest(unittest.TestCase):
@@ -15,6 +20,11 @@ class JsonApiMonitorTest(unittest.TestCase):
     def test_find_bad_phrase(self) -> None:
         phrase = find_bad_phrase({"message": "系统异常，请稍后再试"}, ["系统异常"])
         self.assertEqual(phrase, "系统异常")
+
+    def test_expand_dynamic_values_replaces_uuid(self) -> None:
+        payload = expand_dynamic_values({"session_id": "ops-agent-{{uuid}}"})
+        self.assertTrue(str(payload["session_id"]).startswith("ops-agent-"))
+        self.assertNotIn("{{uuid}}", payload["session_id"])
 
 
 if __name__ == "__main__":

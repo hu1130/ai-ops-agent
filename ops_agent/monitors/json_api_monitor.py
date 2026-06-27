@@ -4,6 +4,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+import uuid
 from typing import Any
 
 from ops_agent.events import CheckResult
@@ -19,7 +20,7 @@ def run_json_check(check: dict[str, Any]) -> CheckResult:
     timeout = float(check.get("timeout_seconds", 15))
     expected_status = int(check.get("expected_status", 200))
     max_latency_ms = int(check.get("max_latency_ms", 10000))
-    payload = check.get("json", {})
+    payload = expand_dynamic_values(check.get("json", {}))
     headers = {"Content-Type": "application/json", "User-Agent": "ops-agent/0.1"}
     headers.update({str(key): str(value) for key, value in check.get("headers", {}).items()})
 
@@ -133,3 +134,16 @@ def find_bad_phrase(value: Any, phrases: list[str]) -> str:
         if phrase.lower() in text:
             return phrase
     return ""
+
+
+def expand_dynamic_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: expand_dynamic_values(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [expand_dynamic_values(item) for item in value]
+    if isinstance(value, str):
+        return (
+            value.replace("{{uuid}}", uuid.uuid4().hex)
+            .replace("{{timestamp}}", str(int(time.time())))
+        )
+    return value

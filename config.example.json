@@ -24,7 +24,7 @@
       "expected_status": 200,
       "max_latency_ms": 10000,
       "json": {
-        "session_id": "ops-agent-probe",
+        "session_id": "ops-agent-probe-{{uuid}}",
         "message": "hello",
         "api_key": ""
       },
