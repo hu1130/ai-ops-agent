@@ -5,6 +5,7 @@ import smtplib
 import time
 import urllib.request
 from dataclasses import dataclass, field
+from email.header import Header
 from email.message import EmailMessage
 from typing import Any
 
@@ -71,10 +72,10 @@ class Notifier:
             raise ValueError("Email alert is enabled but smtp_host, username, password, or to_emails is missing")
 
         message = EmailMessage()
-        message["Subject"] = title
+        message["Subject"] = Header(title, "utf-8").encode()
         message["From"] = from_email
         message["To"] = ", ".join(recipients)
-        message.set_content(text)
+        message.set_content(text, charset="utf-8")
 
         if use_ssl:
             with smtplib.SMTP_SSL(host, port, timeout=20) as smtp:
