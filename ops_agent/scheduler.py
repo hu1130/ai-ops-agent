@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import time
 from pathlib import Path
 
@@ -14,12 +16,21 @@ from ops_agent.monitors.server_monitor import run_server_checks
 from ops_agent.storage import Storage
 
 
+@dataclass
+class IssueState:
+    failure_count: int = 0
+    is_open: bool = False
+    last_summary: str = ""
+
+
 class OpsScheduler:
     def __init__(self, config: AppConfig, storage: Storage, notifier: Notifier):
         self.config = config
         self.storage = storage
         self.notifier = notifier
         self._last_run: dict[str, float] = {}
+        self._issues: dict[str, IssueState] = {}
+        self._last_daily_report_date: str = ""
 
     def run_once(self, respect_intervals: bool = False) -> list[CheckResult]:
         cycle_started_at = time.time()
@@ -31,15 +42,61 @@ class OpsScheduler:
         if results:
             self.storage.save_results(results)
 
-        problems = [result for result in results if result.is_problem]
-        if problems:
-            severity = "critical" if any(item.status == "critical" for item in problems) else "warning"
-            title = f"Ops Agent detected {len(problems)} issue(s)"
-            analysis = analyze_incident(results, self.config.ai)
-            self.storage.save_incident(severity, title, analysis, problems)
-            self.notifier.send(title, analysis, dedupe_key=problem_key(problems))
+        self.process_alert_states(results)
 
         return results
+
+    def process_alert_states(self, results: list[CheckResult]) -> None:
+        threshold = int(self.config.alerts.get("consecutive_failures", 2))
+        recovery_enabled = bool(self.config.alerts.get("recovery_enabled", True))
+        new_alerts: list[CheckResult] = []
+        recoveries: list[CheckResult] = []
+
+        for result in results:
+            key = check_key(result)
+            state = self._issues.setdefault(key, IssueState())
+            if result.is_problem:
+                state.failure_count += 1
+                state.last_summary = result.summary
+                if not state.is_open and state.failure_count >= threshold:
+                    state.is_open = True
+                    new_alerts.append(result)
+            else:
+                if state.is_open and recovery_enabled:
+                    recoveries.append(result)
+                state.failure_count = 0
+                state.is_open = False
+                state.last_summary = result.summary
+
+        if new_alerts:
+            severity = "critical" if any(item.status == "critical" for item in new_alerts) else "warning"
+            title = f"Ops Agent detected {len(new_alerts)} issue(s)"
+            analysis = analyze_incident(new_alerts, self.config.ai)
+            self.storage.save_incident(severity, title, analysis, new_alerts)
+            self.notifier.send(title, analysis, dedupe_key=problem_key(new_alerts))
+
+        if recoveries:
+            title = f"Ops Agent recovered {len(recoveries)} issue(s)"
+            text = build_recovery_message(recoveries)
+            self.storage.save_incident("ok", title, text, recoveries)
+            self.notifier.send(title, text, dedupe_key="recovered:" + problem_key(recoveries))
+
+    def send_daily_report_if_due(self) -> None:
+        report_config = self.config.alerts.get("daily_report", {})
+        if not report_config.get("enabled", False):
+            return
+
+        now = datetime.now()
+        report_hour = int(report_config.get("hour", 9))
+        today = now.date().isoformat()
+        if now.hour != report_hour or self._last_daily_report_date == today:
+            return
+
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        rows = self.storage.recent_results(since.isoformat())
+        title = str(report_config.get("title", "Ops Agent daily report"))
+        self.notifier.send(title, build_daily_report(rows), dedupe_key=f"daily-report:{today}")
+        self._last_daily_report_date = today
 
     def due_checks(self, source: str, checks: list[dict], respect_intervals: bool, now: float) -> list[dict]:
         if not respect_intervals:
@@ -63,6 +120,7 @@ class OpsScheduler:
             started = time.perf_counter()
             try:
                 results = self.run_once(respect_intervals=True)
+                self.send_daily_report_if_due()
                 print(f"Check complete: {len(results)} result(s).")
             except Exception as exc:
                 print(f"Scheduler error: {exc}")
@@ -72,3 +130,36 @@ class OpsScheduler:
 
 def problem_key(problems: list[CheckResult]) -> str:
     return "|".join(f"{item.source}:{item.name}:{item.status}" for item in problems)
+
+
+def check_key(result: CheckResult) -> str:
+    return f"{result.source}:{result.name}"
+
+
+def build_recovery_message(results: list[CheckResult]) -> str:
+    lines = ["以下监控项已经恢复正常：", ""]
+    for result in results:
+        lines.append(f"- {result.source}/{result.name}: {result.summary}")
+    return "\n".join(lines)
+
+
+def build_daily_report(rows: list[dict]) -> str:
+    total = len(rows)
+    warnings = sum(1 for row in rows if row.get("status") == "warning")
+    critical = sum(1 for row in rows if row.get("status") == "critical")
+    ok = sum(1 for row in rows if row.get("status") == "ok")
+    latest: dict[str, dict] = {}
+    for row in rows:
+        latest[f"{row.get('source')}/{row.get('name')}"] = row
+
+    lines = [
+        "AI 运维监控日报",
+        "",
+        f"过去 24 小时巡检记录：{total} 条",
+        f"正常：{ok} 条；警告：{warnings} 条；严重：{critical} 条",
+        "",
+        "当前最近状态：",
+    ]
+    for key, row in sorted(latest.items()):
+        lines.append(f"- [{row.get('status')}] {key}: {row.get('summary')}")
+    return "\n".join(lines)

@@ -55,6 +55,13 @@
   "alerts": {
     "webhook_url": "",
     "cooldown_seconds": 300,
+    "consecutive_failures": 2,
+    "recovery_enabled": true,
+    "daily_report": {
+      "enabled": true,
+      "hour": 9,
+      "title": "AI 运维监控日报"
+    },
     "email": {
       "enabled": false,
       "smtp_host": "smtp.qq.com",

@@ -106,6 +106,18 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def recent_results(self, since_iso: str) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                """
+                select * from check_results
+                where created_at >= ?
+                order by id asc
+                """,
+                (since_iso,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def close(self) -> None:
         with self.lock:
             self.connection.close()
