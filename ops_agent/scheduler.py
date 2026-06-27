@@ -8,6 +8,8 @@ from pathlib import Path
 from ops_agent.ai.analyzer import analyze_incident
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig
+from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
+from ops_agent.diagnostics.suggestions import build_action_suggestions
 from ops_agent.events import CheckResult
 from ops_agent.monitors.http_monitor import run_http_checks
 from ops_agent.monitors.json_api_monitor import run_json_checks
@@ -72,6 +74,9 @@ class OpsScheduler:
             severity = "critical" if any(item.status == "critical" for item in new_alerts) else "warning"
             title = f"Ops Agent detected {len(new_alerts)} issue(s)"
             analysis = analyze_incident(new_alerts, self.config.ai)
+            diagnostics = format_snapshot(collect_diagnostics(new_alerts, self.config))
+            suggestions = build_action_suggestions(new_alerts)
+            analysis = f"{analysis}{suggestions}{diagnostics}"
             self.storage.save_incident(severity, title, analysis, new_alerts)
             self.notifier.send(title, analysis, dedupe_key=problem_key(new_alerts))
 

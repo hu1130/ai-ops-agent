@@ -62,6 +62,14 @@
       "hour": 9,
       "title": "AI 运维监控日报"
     },
+    "diagnostics": {
+      "enabled": true,
+      "include_logs": true,
+      "include_docker": true,
+      "max_log_lines": 60,
+      "max_log_chars": 6000,
+      "command_timeout_seconds": 5
+    },
     "email": {
       "enabled": false,
       "smtp_host": "smtp.qq.com",
