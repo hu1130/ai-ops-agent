@@ -22,11 +22,12 @@ class OpsScheduler:
         self._last_run: dict[str, float] = {}
 
     def run_once(self, respect_intervals: bool = False) -> list[CheckResult]:
+        cycle_started_at = time.time()
         results: list[CheckResult] = []
-        results.extend(run_http_checks(self.due_checks("http", self.config.http_checks, respect_intervals)))
-        results.extend(run_json_checks(self.due_checks("json", self.config.json_checks, respect_intervals)))
+        results.extend(run_http_checks(self.due_checks("http", self.config.http_checks, respect_intervals, cycle_started_at)))
+        results.extend(run_json_checks(self.due_checks("json", self.config.json_checks, respect_intervals, cycle_started_at)))
         results.extend(run_server_checks(self.config.server_checks, self.config.base_dir))
-        results.extend(run_log_checks(self.due_checks("log", self.config.log_checks, respect_intervals), self.config.base_dir))
+        results.extend(run_log_checks(self.due_checks("log", self.config.log_checks, respect_intervals, cycle_started_at), self.config.base_dir))
         if results:
             self.storage.save_results(results)
 
@@ -40,11 +41,10 @@ class OpsScheduler:
 
         return results
 
-    def due_checks(self, source: str, checks: list[dict], respect_intervals: bool) -> list[dict]:
+    def due_checks(self, source: str, checks: list[dict], respect_intervals: bool, now: float) -> list[dict]:
         if not respect_intervals:
             return checks
 
-        now = time.time()
         due: list[dict] = []
         default_interval = int(self.config.app.get("interval_seconds", 60))
         for index, check in enumerate(checks):
