@@ -19,14 +19,16 @@ class OpsScheduler:
         self.config = config
         self.storage = storage
         self.notifier = notifier
+        self._last_run: dict[str, float] = {}
 
-    def run_once(self) -> list[CheckResult]:
+    def run_once(self, respect_intervals: bool = False) -> list[CheckResult]:
         results: list[CheckResult] = []
-        results.extend(run_http_checks(self.config.http_checks))
-        results.extend(run_json_checks(self.config.json_checks))
+        results.extend(run_http_checks(self.due_checks("http", self.config.http_checks, respect_intervals)))
+        results.extend(run_json_checks(self.due_checks("json", self.config.json_checks, respect_intervals)))
         results.extend(run_server_checks(self.config.server_checks, self.config.base_dir))
-        results.extend(run_log_checks(self.config.log_checks, self.config.base_dir))
-        self.storage.save_results(results)
+        results.extend(run_log_checks(self.due_checks("log", self.config.log_checks, respect_intervals), self.config.base_dir))
+        if results:
+            self.storage.save_results(results)
 
         problems = [result for result in results if result.is_problem]
         if problems:
@@ -38,13 +40,29 @@ class OpsScheduler:
 
         return results
 
+    def due_checks(self, source: str, checks: list[dict], respect_intervals: bool) -> list[dict]:
+        if not respect_intervals:
+            return checks
+
+        now = time.time()
+        due: list[dict] = []
+        default_interval = int(self.config.app.get("interval_seconds", 60))
+        for index, check in enumerate(checks):
+            interval = int(check.get("interval_seconds", default_interval))
+            key = f"{source}:{check.get('name', index)}"
+            last_run = self._last_run.get(key)
+            if last_run is None or now - last_run >= interval:
+                due.append(check)
+                self._last_run[key] = now
+        return due
+
     def run_forever(self) -> None:
         interval = int(self.config.app.get("interval_seconds", 60))
         print(f"Ops Agent started. Interval: {interval}s. Base: {Path.cwd()}")
         while True:
             started = time.perf_counter()
             try:
-                results = self.run_once()
+                results = self.run_once(respect_intervals=True)
                 print(f"Check complete: {len(results)} result(s).")
             except Exception as exc:
                 print(f"Scheduler error: {exc}")

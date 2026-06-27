@@ -20,6 +20,7 @@
     {
       "name": "AI customer service synthetic chat",
       "url": "https://example.com/v1/chat",
+      "interval_seconds": 300,
       "timeout_seconds": 20,
       "expected_status": 200,
       "max_latency_ms": 10000,
