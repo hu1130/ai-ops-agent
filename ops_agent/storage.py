@@ -44,6 +44,7 @@ class Storage:
                 create table if not exists action_logs (
                     id integer primary key autoincrement,
                     created_at text not null,
+                    updated_at text,
                     action_type text not null,
                     title text not null,
                     risk text not null,
@@ -51,11 +52,28 @@ class Storage:
                     reason text not null,
                     params_json text not null,
                     output text not null,
-                    error text not null
+                    error text not null,
+                    approved_by text,
+                    approved_at text
                 );
                 """
             )
+            self.ensure_action_log_columns()
             self.connection.commit()
+
+    def ensure_action_log_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("pragma table_info(action_logs)").fetchall()
+        }
+        additions = {
+            "updated_at": "alter table action_logs add column updated_at text",
+            "approved_by": "alter table action_logs add column approved_by text",
+            "approved_at": "alter table action_logs add column approved_at text",
+        }
+        for column, statement in additions.items():
+            if column not in columns:
+                self.connection.execute(statement)
 
     def save_results(self, results: list[CheckResult]) -> None:
         with self.lock:
@@ -151,6 +169,42 @@ class Storage:
             )
             self.connection.commit()
             return int(cursor.lastrowid)
+
+    def get_action_log(self, action_id: int) -> dict | None:
+        with self.lock:
+            row = self.connection.execute(
+                """
+                select * from action_logs
+                where id = ?
+                """,
+                (action_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_action_log(
+        self,
+        action_id: int,
+        status: str,
+        output: str = "",
+        error: str = "",
+        approved_by: str = "",
+    ) -> None:
+        approved_at = utc_now_iso() if approved_by else None
+        with self.lock:
+            self.connection.execute(
+                """
+                update action_logs
+                set updated_at = ?,
+                    status = ?,
+                    output = ?,
+                    error = ?,
+                    approved_by = coalesce(nullif(?, ''), approved_by),
+                    approved_at = coalesce(?, approved_at)
+                where id = ?
+                """,
+                (utc_now_iso(), status, output, error, approved_by, approved_at, action_id),
+            )
+            self.connection.commit()
 
     def latest_action_logs(self, limit: int = 50) -> list[dict]:
         with self.lock:

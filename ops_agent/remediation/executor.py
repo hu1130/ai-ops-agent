@@ -3,26 +3,30 @@ from __future__ import annotations
 import shlex
 import socket
 import subprocess
-from typing import Any
 
 from ops_agent.config import AppConfig
 from ops_agent.remediation.actions import ActionResult, RemediationAction
 
 
-READ_ONLY_COMMANDS = {"df", "free", "ps", "docker", "journalctl", "tail", "systemctl"}
+READ_ONLY_COMMANDS = {"df", "free", "ps", "docker", "journalctl", "tail", "systemctl", "pgrep"}
 MUTATING_ACTIONS = {"restart_service", "restart_docker_container", "cleanup_temp_files", "rotate_large_log"}
 
 
-def execute_action(action: RemediationAction, config: AppConfig, dry_run: bool = True) -> ActionResult:
+def execute_action(
+    action: RemediationAction,
+    config: AppConfig,
+    dry_run: bool = True,
+    approved: bool = False,
+) -> ActionResult:
     if dry_run:
         return ActionResult(action=action, status="dry_run", output=describe_dry_run(action))
-
-    if action.risk != "low" and not action.auto_execute:
-        return ActionResult(action=action, status="skipped", error="非低风险动作需要人工确认。")
 
     allowed_actions = set(config.raw.get("remediation", {}).get("allowed_actions", []))
     if allowed_actions and action.action_type not in allowed_actions:
         return ActionResult(action=action, status="skipped", error=f"动作未在 allowed_actions 中: {action.action_type}")
+
+    if action.action_type in MUTATING_ACTIONS and not approved:
+        return ActionResult(action=action, status="skipped", error="该动作会修改系统状态，需要先人工确认。")
 
     if action.action_type == "check_port":
         return check_port(action)
@@ -30,8 +34,12 @@ def execute_action(action: RemediationAction, config: AppConfig, dry_run: bool =
         return run_read_only_command(action, ["pgrep", "-af", str(action.params.get("pattern", ""))], config)
     if action.action_type == "run_diagnostic_command":
         return run_configured_diagnostic(action, config)
-    if action.action_type in MUTATING_ACTIONS:
-        return ActionResult(action=action, status="skipped", error="会修改系统状态的动作当前仅支持计划和 dry-run。")
+    if action.action_type == "restart_service":
+        return restart_service(action, config)
+    if action.action_type == "restart_docker_container":
+        return restart_docker_container(action, config)
+    if action.action_type in {"cleanup_temp_files", "rotate_large_log"}:
+        return ActionResult(action=action, status="skipped", error="该修改类动作已建模，但执行器尚未开放。")
     return ActionResult(action=action, status="skipped", error=f"未知动作类型: {action.action_type}")
 
 
@@ -68,7 +76,35 @@ def run_configured_diagnostic(action: RemediationAction, config: AppConfig) -> A
     return run_read_only_command(action, args, config)
 
 
+def restart_service(action: RemediationAction, config: AppConfig) -> ActionResult:
+    service = str(action.params.get("service", "")).strip()
+    allowed = set(config.raw.get("remediation", {}).get("allowed_services", []))
+    if not service:
+        return ActionResult(action=action, status="failed", error="service 参数不能为空。")
+    if service not in allowed:
+        return ActionResult(action=action, status="skipped", error=f"服务不在 allowed_services 白名单中: {service}")
+    return run_mutating_command(action, ["systemctl", "restart", service], config)
+
+
+def restart_docker_container(action: RemediationAction, config: AppConfig) -> ActionResult:
+    container = str(action.params.get("container", "")).strip()
+    allowed = set(config.raw.get("remediation", {}).get("allowed_containers", []))
+    if not container:
+        return ActionResult(action=action, status="failed", error="container 参数不能为空。")
+    if container not in allowed:
+        return ActionResult(action=action, status="skipped", error=f"容器不在 allowed_containers 白名单中: {container}")
+    return run_mutating_command(action, ["docker", "restart", container], config)
+
+
 def run_read_only_command(action: RemediationAction, args: list[str], config: AppConfig) -> ActionResult:
+    return run_command(action, args, config)
+
+
+def run_mutating_command(action: RemediationAction, args: list[str], config: AppConfig) -> ActionResult:
+    return run_command(action, args, config)
+
+
+def run_command(action: RemediationAction, args: list[str], config: AppConfig) -> ActionResult:
     timeout = int(config.raw.get("remediation", {}).get("command_timeout_seconds", 8))
     max_output = int(config.raw.get("remediation", {}).get("max_command_output_chars", 4000))
     try:

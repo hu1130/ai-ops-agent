@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
-from pathlib import Path
 from urllib.parse import urlparse
 
 from ops_agent.config import AppConfig, load_config
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.events import CheckResult
 from ops_agent.remediation.actions import RemediationAction
-from ops_agent.remediation.executor import execute_action, format_action_plan
+from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action, format_action_plan
 from ops_agent.remediation.planner import build_remediation_plan
 from ops_agent.storage import Storage
 
@@ -29,12 +29,19 @@ def parse_args() -> argparse.Namespace:
     plan_parser.add_argument("--url", default="", help="Related URL for http/json_api issues")
     plan_parser.add_argument("--path", default="", help="Related log path for log issues")
 
-    run_parser = subparsers.add_parser("run-action", help="Run a single safe remediation action")
+    run_parser = subparsers.add_parser("run-action", help="Run or request a remediation action")
     run_parser.add_argument("--type", required=True, help="Action type")
     run_parser.add_argument("--host", default="", help="Host for check_port")
     run_parser.add_argument("--port", type=int, default=0, help="Port for check_port")
     run_parser.add_argument("--command", dest="diagnostic_command", default="", help="Read-only diagnostic command")
+    run_parser.add_argument("--service", default="", help="Service name for restart_service")
+    run_parser.add_argument("--container", default="", help="Container name for restart_docker_container")
     run_parser.add_argument("--execute", action="store_true", help="Actually execute safe actions; default is dry-run")
+
+    approve_parser = subparsers.add_parser("approve-action", help="Approve and execute a pending action")
+    approve_parser.add_argument("--id", type=int, required=True, help="Action log id")
+    approve_parser.add_argument("--by", default="operator", help="Approver name")
+    approve_parser.add_argument("--execute", action="store_true", help="Required to execute after approval")
 
     subparsers.add_parser("action-logs", help="Show latest remediation action audit logs")
     return parser.parse_args()
@@ -82,22 +89,10 @@ def main() -> int:
         return 0
 
     if args.command == "run-action":
-        action = build_cli_action(args)
-        result = execute_action(action, config, dry_run=not args.execute)
-        storage = open_storage(config)
-        storage.save_action_log(
-            action.action_type,
-            action.title,
-            action.risk,
-            result.status,
-            action.reason,
-            action.params,
-            result.output,
-            result.error,
-        )
-        storage.close()
-        print(format_action_plan([action], [result]))
-        return 0 if result.status in {"dry_run", "executed"} else 1
+        return run_action_command(args, config)
+
+    if args.command == "approve-action":
+        return approve_action_command(args, config)
 
     if args.command == "action-logs":
         storage = open_storage(config)
@@ -107,12 +102,81 @@ def main() -> int:
             print("暂无处置动作日志。")
             return 0
         for row in rows:
-            print(f"[{row['created_at']}] {row['status']} {row['action_type']} {row['title']}")
+            line = f"#{row['id']} [{row['created_at']}] {row['status']} {row['action_type']} {row['title']}"
+            if row.get("approved_by"):
+                line += f" approved_by={row['approved_by']}"
+            print(line)
             if row.get("error"):
                 print(f"  error: {row['error']}")
         return 0
 
     return 2
+
+
+def run_action_command(args: argparse.Namespace, config: AppConfig) -> int:
+    action = build_cli_action(args)
+    storage = open_storage(config)
+
+    if action.action_type in MUTATING_ACTIONS and not args.execute:
+        action_id = storage.save_action_log(
+            action.action_type,
+            action.title,
+            action.risk,
+            "pending_approval",
+            action.reason,
+            action.params,
+            "等待人工确认。执行 approve-action --id 后才会尝试执行。",
+            "",
+        )
+        storage.close()
+        print(f"动作已进入待确认队列: #{action_id}")
+        print(format_action_plan([action]))
+        return 0
+
+    result = execute_action(action, config, dry_run=not args.execute, approved=False)
+    storage.save_action_log(
+        action.action_type,
+        action.title,
+        action.risk,
+        result.status,
+        action.reason,
+        action.params,
+        result.output,
+        result.error,
+    )
+    storage.close()
+    print(format_action_plan([action], [result]))
+    return 0 if result.status in {"dry_run", "executed"} else 1
+
+
+def approve_action_command(args: argparse.Namespace, config: AppConfig) -> int:
+    if not args.execute:
+        print("确认执行必须显式加 --execute。")
+        return 1
+
+    storage = open_storage(config)
+    row = storage.get_action_log(args.id)
+    if not row:
+        storage.close()
+        print(f"动作不存在: #{args.id}")
+        return 1
+    if row["status"] not in {"pending_approval", "skipped", "failed"}:
+        storage.close()
+        print(f"动作当前状态不允许确认执行: {row['status']}")
+        return 1
+
+    action = action_from_log(row)
+    result = execute_action(action, config, dry_run=False, approved=True)
+    storage.update_action_log(
+        args.id,
+        result.status,
+        result.output,
+        result.error,
+        approved_by=args.by,
+    )
+    storage.close()
+    print(format_action_plan([action], [result]))
+    return 0 if result.status == "executed" else 1
 
 
 def open_storage(config: AppConfig) -> Storage:
@@ -137,12 +201,43 @@ def build_cli_action(args: argparse.Namespace) -> RemediationAction:
             params={"command": args.diagnostic_command},
             auto_execute=True,
         )
+    if args.type == "restart_service":
+        return RemediationAction(
+            action_type="restart_service",
+            title=f"重启服务 {args.service}",
+            reason="人工请求重启 systemd 服务。",
+            risk="medium",
+            params={"service": args.service},
+        )
+    if args.type == "restart_docker_container":
+        return RemediationAction(
+            action_type="restart_docker_container",
+            title=f"重启容器 {args.container}",
+            reason="人工请求重启 Docker 容器。",
+            risk="medium",
+            params={"container": args.container},
+        )
     return RemediationAction(
         action_type=args.type,
         title=f"手动动作 {args.type}",
         reason="手动执行处置动作。",
         risk="medium",
         params={},
+    )
+
+
+def action_from_log(row: dict) -> RemediationAction:
+    try:
+        params = json.loads(row.get("params_json") or "{}")
+    except json.JSONDecodeError:
+        params = {}
+    return RemediationAction(
+        action_type=str(row["action_type"]),
+        title=str(row["title"]),
+        reason=str(row["reason"]),
+        risk=str(row["risk"]),  # type: ignore[arg-type]
+        params=params,
+        auto_execute=True,
     )
 
 

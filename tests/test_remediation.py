@@ -56,6 +56,22 @@ class RemediationTest(unittest.TestCase):
         self.assertEqual("skipped", result.status)
         self.assertIn("非只读命令", result.error)
 
+    def test_restart_service_requires_allowlist_even_when_approved(self) -> None:
+        config = AppConfig(
+            raw={"remediation": {"allowed_actions": ["restart_service"], "allowed_services": []}},
+            base_dir=Path("."),
+        )
+        action = RemediationAction(
+            action_type="restart_service",
+            title="Restart app",
+            reason="Manual test",
+            risk="medium",
+            params={"service": "app"},
+        )
+        result = execute_action(action, config, dry_run=False, approved=True)
+        self.assertEqual("skipped", result.status)
+        self.assertIn("allowed_services", result.error)
+
     def test_storage_records_action_logs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")
@@ -71,6 +87,24 @@ class RemediationTest(unittest.TestCase):
             storage.close()
         self.assertEqual(1, len(rows))
         self.assertEqual("check_port", rows[0]["action_type"])
+
+    def test_storage_updates_action_log_after_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            action_id = storage.save_action_log(
+                "restart_service",
+                "重启服务",
+                "medium",
+                "pending_approval",
+                "test",
+                {"service": "app"},
+            )
+            storage.update_action_log(action_id, "skipped", error="not allowed", approved_by="tester")
+            row = storage.get_action_log(action_id)
+            storage.close()
+        self.assertIsNotNone(row)
+        self.assertEqual("skipped", row["status"])
+        self.assertEqual("tester", row["approved_by"])
 
 
 if __name__ == "__main__":

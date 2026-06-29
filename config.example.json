@@ -56,6 +56,8 @@
     "enabled": true,
     "mode": "suggest",
     "allowed_actions": ["check_port", "check_process", "run_diagnostic_command"],
+    "allowed_services": [],
+    "allowed_containers": [],
     "command_timeout_seconds": 8,
     "max_command_output_chars": 4000,
     "actions": {

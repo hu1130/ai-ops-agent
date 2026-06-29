@@ -101,6 +101,7 @@ python -m ops_agent.cli --config .\config.json validate-config
 - 默认 `suggest` 模式，只建议和 dry-run，不直接修改系统
 - 支持端口检查、进程检查、只读诊断命令
 - 重启服务、重启容器、清理临时文件、轮转日志已建模，但默认需要人工确认
+- 重启服务和重启容器必须配置白名单后才能执行
 - 所有动作都会写入 `action_logs` 审计日志
 
 生成处置计划：
@@ -126,6 +127,20 @@ python -m ops_agent.cli --config .\config.json run-action --type check_port --ho
 ```powershell
 python -m ops_agent.cli --config .\config.json action-logs
 ```
+
+需要人工确认的动作会先生成一个动作 ID：
+
+```powershell
+python -m ops_agent.cli --config .\config.json run-action --type restart_service --service ops-agent
+```
+
+确认执行时必须显式带上动作 ID 和 `--execute`：
+
+```powershell
+python -m ops_agent.cli --config .\config.json approve-action --id 1 --by owner --execute
+```
+
+只有在 `remediation.allowed_services` 或 `remediation.allowed_containers` 白名单中的服务/容器才会被真正重启。
 
 ## 可选 AI 分析
 

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 RiskLevel = Literal["low", "medium", "high"]
-ActionStatus = Literal["planned", "dry_run", "executed", "skipped", "failed"]
+ActionStatus = Literal["planned", "pending_approval", "approved", "dry_run", "executed", "skipped", "failed"]
 
 
 @dataclass(frozen=True)
