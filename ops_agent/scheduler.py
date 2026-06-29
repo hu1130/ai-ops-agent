@@ -15,6 +15,8 @@ from ops_agent.monitors.http_monitor import run_http_checks
 from ops_agent.monitors.json_api_monitor import run_json_checks
 from ops_agent.monitors.log_monitor import run_log_checks
 from ops_agent.monitors.server_monitor import run_server_checks
+from ops_agent.remediation.executor import execute_action, format_action_plan
+from ops_agent.remediation.planner import build_remediation_plan
 from ops_agent.storage import Storage
 
 
@@ -76,7 +78,10 @@ class OpsScheduler:
             analysis = analyze_incident(new_alerts, self.config.ai)
             diagnostics = format_snapshot(collect_diagnostics(new_alerts, self.config))
             suggestions = build_action_suggestions(new_alerts)
-            analysis = f"{analysis}{suggestions}{diagnostics}"
+            action_plan = build_remediation_plan(new_alerts, self.config)
+            action_results = self.process_remediation_actions(action_plan)
+            remediation_text = format_action_plan(action_plan, action_results)
+            analysis = f"{analysis}{suggestions}{diagnostics}{remediation_text}"
             self.storage.save_incident(severity, title, analysis, new_alerts)
             self.notifier.send(title, analysis, dedupe_key=problem_key(new_alerts))
 
@@ -85,6 +90,34 @@ class OpsScheduler:
             text = build_recovery_message(recoveries)
             self.storage.save_incident("ok", title, text, recoveries)
             self.notifier.send(title, text, dedupe_key="recovered:" + problem_key(recoveries))
+
+    def process_remediation_actions(self, actions):
+        if not actions:
+            return []
+
+        remediation = dict(self.config.raw.get("remediation", {}))
+        mode = str(remediation.get("mode", "suggest"))
+        dry_run = mode != "auto"
+        results = []
+        for action in actions:
+            if mode == "off":
+                result = execute_action(action, self.config, dry_run=True)
+            elif dry_run or not action.auto_execute:
+                result = execute_action(action, self.config, dry_run=True)
+            else:
+                result = execute_action(action, self.config, dry_run=False)
+            self.storage.save_action_log(
+                action.action_type,
+                action.title,
+                action.risk,
+                result.status,
+                action.reason,
+                action.params,
+                result.output,
+                result.error,
+            )
+            results.append(result)
+        return results
 
     def send_daily_report_if_due(self) -> None:
         report_config = self.config.alerts.get("daily_report", {})
@@ -142,7 +175,7 @@ def check_key(result: CheckResult) -> str:
 
 
 def build_recovery_message(results: list[CheckResult]) -> str:
-    lines = ["以下监控项已经恢复正常：", ""]
+    lines = ["以下监控项已经恢复正常:", ""]
     for result in results:
         lines.append(f"- {result.source}/{result.name}: {result.summary}")
     return "\n".join(lines)
@@ -160,10 +193,10 @@ def build_daily_report(rows: list[dict]) -> str:
     lines = [
         "AI 运维监控日报",
         "",
-        f"过去 24 小时巡检记录：{total} 条",
-        f"正常：{ok} 条；警告：{warnings} 条；严重：{critical} 条",
+        f"过去 24 小时巡检记录: {total} 条",
+        f"正常: {ok} 条; 警告: {warnings} 条; 严重: {critical} 条",
         "",
-        "当前最近状态：",
+        "当前最近状态:",
     ]
     for key, row in sorted(latest.items()):
         lines.append(f"- [{row.get('status')}] {key}: {row.get('summary')}")

@@ -6,7 +6,7 @@ from ops_agent.events import CheckResult
 def build_action_suggestions(results: list[CheckResult]) -> str:
     suggestions: list[str] = []
 
-    if any(result.source == "json" for result in results):
+    if any(result.source in {"json", "json_api"} for result in results):
         suggestions.append("AI 客服慢或失败时，先看接口日志、模型供应商响应时间、数据库连接和最近发布。")
     if any(result.source == "http" for result in results):
         suggestions.append("官网/API 不通时，先确认域名解析、Nginx 反代、容器状态和应用健康接口。")

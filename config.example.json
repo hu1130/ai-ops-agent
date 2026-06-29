@@ -52,6 +52,33 @@
     "enabled": true,
     "max_log_chars": 4000
   },
+  "remediation": {
+    "enabled": true,
+    "mode": "suggest",
+    "allowed_actions": ["check_port", "check_process", "run_diagnostic_command"],
+    "command_timeout_seconds": 8,
+    "max_command_output_chars": 4000,
+    "actions": {
+      "check_port": {
+        "auto_execute": true
+      },
+      "run_diagnostic_command": {
+        "auto_execute": false
+      },
+      "restart_service": {
+        "auto_execute": false
+      },
+      "restart_docker_container": {
+        "auto_execute": false
+      },
+      "cleanup_temp_files": {
+        "auto_execute": false
+      },
+      "rotate_large_log": {
+        "auto_execute": false
+      }
+    }
+  },
   "alerts": {
     "webhook_url": "",
     "cooldown_seconds": 300,

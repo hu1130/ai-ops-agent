@@ -21,6 +21,9 @@ def start_dashboard(storage: Storage, host: str, port: int) -> ThreadingHTTPServ
             if path == "/api/incidents":
                 self.send_json(storage.latest_incidents())
                 return
+            if path == "/api/action-logs":
+                self.send_json(storage.latest_action_logs())
+                return
             self.send_html(render_page(storage))
 
         def send_json(self, payload: object) -> None:

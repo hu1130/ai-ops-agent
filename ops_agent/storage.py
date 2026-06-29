@@ -40,6 +40,19 @@ class Storage:
                     analysis text not null,
                     results_json text not null
                 );
+
+                create table if not exists action_logs (
+                    id integer primary key autoincrement,
+                    created_at text not null,
+                    action_type text not null,
+                    title text not null,
+                    risk text not null,
+                    status text not null,
+                    reason text not null,
+                    params_json text not null,
+                    output text not null,
+                    error text not null
+                );
                 """
             )
             self.connection.commit()
@@ -100,6 +113,50 @@ class Storage:
             rows = self.connection.execute(
                 """
                 select * from incidents
+                order by id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_action_log(
+        self,
+        action_type: str,
+        title: str,
+        risk: str,
+        status: str,
+        reason: str,
+        params: dict,
+        output: str = "",
+        error: str = "",
+    ) -> int:
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                insert into action_logs (created_at, action_type, title, risk, status, reason, params_json, output, error)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    utc_now_iso(),
+                    action_type,
+                    title,
+                    risk,
+                    status,
+                    reason,
+                    json.dumps(params, ensure_ascii=False),
+                    output,
+                    error,
+                ),
+            )
+            self.connection.commit()
+            return int(cursor.lastrowid)
+
+    def latest_action_logs(self, limit: int = 50) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                """
+                select * from action_logs
                 order by id desc
                 limit ?
                 """,

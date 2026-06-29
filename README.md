@@ -93,6 +93,40 @@ python -m ops_agent.cli --config .\config.json validate-config
 }
 ```
 
+## 自动处置后端
+
+当前已支持自动处置引擎的安全骨架：
+
+- 根据异常自动生成处置计划
+- 默认 `suggest` 模式，只建议和 dry-run，不直接修改系统
+- 支持端口检查、进程检查、只读诊断命令
+- 重启服务、重启容器、清理临时文件、轮转日志已建模，但默认需要人工确认
+- 所有动作都会写入 `action_logs` 审计日志
+
+生成处置计划：
+
+```powershell
+python -m ops_agent.cli --config .\config.json remediation-plan --source json_api --name "AI 客服" --status warning --summary "Slow response" --url https://example.com/v1/chat
+```
+
+试运行一个动作：
+
+```powershell
+python -m ops_agent.cli --config .\config.json run-action --type check_port --host 127.0.0.1 --port 8765
+```
+
+真正执行安全动作时加 `--execute`。会修改系统状态的动作当前仍只做计划，不会直接执行：
+
+```powershell
+python -m ops_agent.cli --config .\config.json run-action --type check_port --host 127.0.0.1 --port 8765 --execute
+```
+
+查看动作审计日志：
+
+```powershell
+python -m ops_agent.cli --config .\config.json action-logs
+```
+
 ## 可选 AI 分析
 
 默认没有配置模型时，会使用内置规则分析。需要接入 OpenAI 兼容接口时设置环境变量：
@@ -129,6 +163,7 @@ ops-agent/
     storage.py
     dashboard.py
     diagnostics/
+    remediation/
     monitors/
     ai/
     alerts/
