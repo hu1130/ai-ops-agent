@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
 
@@ -117,6 +118,58 @@ class Storage:
                 (since_iso,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def recent_incidents(self, since_iso: str, limit: int = 100) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                """
+                select * from incidents
+                where created_at >= ?
+                order by id desc
+                limit ?
+                """,
+                (since_iso, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def dashboard_summary(self, hours: int = 24) -> dict:
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        rows = self.recent_results(since.isoformat())
+        incidents = self.recent_incidents(since.isoformat())
+        latest: dict[str, dict] = {}
+        counts = {"ok": 0, "warning": 0, "critical": 0}
+        source_counts: dict[str, int] = {}
+
+        for row in rows:
+            status = str(row.get("status", ""))
+            if status in counts:
+                counts[status] += 1
+            source = str(row.get("source", "unknown"))
+            source_counts[source] = source_counts.get(source, 0) + 1
+            latest[f"{row.get('source')}/{row.get('name')}"] = row
+
+        problem_targets = [
+            row for row in latest.values() if row.get("status") in {"warning", "critical"}
+        ]
+        total = len(rows)
+        ok_rate = round((counts["ok"] / total) * 100, 1) if total else 100.0
+        current_status = "critical" if any(row.get("status") == "critical" for row in latest.values()) else (
+            "warning" if problem_targets else "ok"
+        )
+
+        return {
+            "hours": hours,
+            "total_checks": total,
+            "ok": counts["ok"],
+            "warning": counts["warning"],
+            "critical": counts["critical"],
+            "ok_rate": ok_rate,
+            "current_status": current_status,
+            "active_problem_count": len(problem_targets),
+            "incident_count": len(incidents),
+            "source_counts": source_counts,
+            "latest_targets": list(latest.values()),
+        }
 
     def close(self) -> None:
         with self.lock:
