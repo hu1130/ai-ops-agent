@@ -5,12 +5,14 @@ import json
 import sys
 from urllib.parse import urlparse
 
+from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig, load_config
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.events import CheckResult
 from ops_agent.remediation.actions import RemediationAction
 from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action, format_action_plan
 from ops_agent.remediation.planner import build_remediation_plan
+from ops_agent.remediation.verifier import VerificationResult, verify_after_action
 from ops_agent.storage import Storage
 
 
@@ -37,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     run_parser.add_argument("--service", default="", help="Service name for restart_service")
     run_parser.add_argument("--container", default="", help="Container name for restart_docker_container")
     run_parser.add_argument("--execute", action="store_true", help="Actually execute safe actions; default is dry-run")
+    add_verify_args(run_parser)
 
     approve_parser = subparsers.add_parser("approve-action", help="Approve and execute a pending action")
     approve_parser.add_argument("--id", type=int, required=True, help="Action log id")
@@ -45,6 +48,15 @@ def parse_args() -> argparse.Namespace:
 
     subparsers.add_parser("action-logs", help="Show latest remediation action audit logs")
     return parser.parse_args()
+
+
+def add_verify_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--verify-url", default="", help="HTTP URL to check after successful execution")
+    parser.add_argument("--verify-expected-status", type=int, default=200, help="Expected verification HTTP status")
+    parser.add_argument("--verify-wait-seconds", type=float, default=0, help="Seconds to wait before verification")
+    parser.add_argument("--verify-retries", type=int, default=1, help="Verification retry count")
+    parser.add_argument("--verify-interval-seconds", type=float, default=1, help="Seconds between verification retries")
+    parser.add_argument("--verify-timeout-seconds", type=float, default=5, help="HTTP verification timeout")
 
 
 def main() -> int:
@@ -105,9 +117,13 @@ def main() -> int:
             line = f"#{row['id']} [{row['created_at']}] {row['status']} {row['action_type']} {row['title']}"
             if row.get("approved_by"):
                 line += f" approved_by={row['approved_by']}"
+            if row.get("verify_status"):
+                line += f" verify={row['verify_status']}"
             print(line)
             if row.get("error"):
                 print(f"  error: {row['error']}")
+            if row.get("verify_output"):
+                print(f"  verify: {row['verify_output']}")
         return 0
 
     return 2
@@ -134,7 +150,7 @@ def run_action_command(args: argparse.Namespace, config: AppConfig) -> int:
         return 0
 
     result = execute_action(action, config, dry_run=not args.execute, approved=False)
-    storage.save_action_log(
+    action_id = storage.save_action_log(
         action.action_type,
         action.title,
         action.risk,
@@ -144,9 +160,11 @@ def run_action_command(args: argparse.Namespace, config: AppConfig) -> int:
         result.output,
         result.error,
     )
+    verification = verify_and_record(action_id, action, result.status, config, storage)
     storage.close()
     print(format_action_plan([action], [result]))
-    return 0 if result.status in {"dry_run", "executed"} else 1
+    print(format_verification(verification))
+    return 0 if final_success(result.status, verification) else 1
 
 
 def approve_action_command(args: argparse.Namespace, config: AppConfig) -> int:
@@ -174,9 +192,70 @@ def approve_action_command(args: argparse.Namespace, config: AppConfig) -> int:
         result.error,
         approved_by=args.by,
     )
+    verification = verify_and_record(args.id, action, result.status, config, storage)
     storage.close()
     print(format_action_plan([action], [result]))
-    return 0 if result.status == "executed" else 1
+    print(format_verification(verification))
+    return 0 if final_success(result.status, verification) else 1
+
+
+def verify_and_record(
+    action_id: int,
+    action: RemediationAction,
+    action_status: str,
+    config: AppConfig,
+    storage: Storage,
+) -> VerificationResult | None:
+    if action_status != "executed":
+        return None
+    verification = verify_after_action(action, config)
+    if verification.status != "verify_skipped":
+        output = verification.output or verification.error
+        storage.update_action_verification(action_id, verification.status, output)
+        notify_verification_result(config, action, verification)
+    return verification
+
+
+def notify_verification_result(config: AppConfig, action: RemediationAction, verification: VerificationResult) -> None:
+    if action.action_type not in MUTATING_ACTIONS:
+        return
+    verification_config = dict(config.raw.get("remediation", {}).get("verification", {}))
+    if not verification_config.get("notify", True):
+        return
+    title = "Ops Agent self-heal verified" if verification.status == "verified_ok" else "Ops Agent self-heal failed"
+    text = (
+        f"动作: {action.title}\n"
+        f"状态: {verification.status}\n"
+        f"输出: {verification.output}\n"
+        f"错误: {verification.error}"
+    )
+    notifier = Notifier(
+        webhook_url=str(config.alerts.get("webhook_url", "")),
+        cooldown_seconds=int(config.alerts.get("cooldown_seconds", 300)),
+        email=dict(config.alerts.get("email", {})),
+    )
+    notifier.send(title, text, dedupe_key=f"verification:{action.action_type}:{action.title}:{verification.status}")
+
+
+def final_success(action_status: str, verification: VerificationResult | None) -> bool:
+    if action_status != "executed":
+        return False
+    if verification and verification.status == "verified_failed":
+        return False
+    return True
+
+
+def format_verification(verification: VerificationResult | None) -> str:
+    if verification is None:
+        return ""
+    if verification.status == "verify_skipped":
+        return f"\n执行后验证: {verification.output}"
+    lines = [f"\n执行后验证: {verification.status}"]
+    if verification.output:
+        lines.append(f"输出: {verification.output}")
+    if verification.error:
+        lines.append(f"错误: {verification.error}")
+    return "\n".join(lines)
 
 
 def open_storage(config: AppConfig) -> Storage:
@@ -185,12 +264,13 @@ def open_storage(config: AppConfig) -> Storage:
 
 
 def build_cli_action(args: argparse.Namespace) -> RemediationAction:
+    verify_after = build_verify_after(args)
     if args.type == "check_port":
         return RemediationAction(
             action_type="check_port",
             title=f"检查端口连通性 {args.host}:{args.port}",
             reason="手动执行端口检查。",
-            params={"host": args.host, "port": args.port},
+            params=with_verify({"host": args.host, "port": args.port}, verify_after),
             auto_execute=True,
         )
     if args.type == "run_diagnostic_command":
@@ -198,7 +278,7 @@ def build_cli_action(args: argparse.Namespace) -> RemediationAction:
             action_type="run_diagnostic_command",
             title="执行只读诊断命令",
             reason="手动执行只读诊断命令。",
-            params={"command": args.diagnostic_command},
+            params=with_verify({"command": args.diagnostic_command}, verify_after),
             auto_execute=True,
         )
     if args.type == "restart_service":
@@ -207,7 +287,7 @@ def build_cli_action(args: argparse.Namespace) -> RemediationAction:
             title=f"重启服务 {args.service}",
             reason="人工请求重启 systemd 服务。",
             risk="medium",
-            params={"service": args.service},
+            params=with_verify({"service": args.service}, verify_after),
         )
     if args.type == "restart_docker_container":
         return RemediationAction(
@@ -215,15 +295,35 @@ def build_cli_action(args: argparse.Namespace) -> RemediationAction:
             title=f"重启容器 {args.container}",
             reason="人工请求重启 Docker 容器。",
             risk="medium",
-            params={"container": args.container},
+            params=with_verify({"container": args.container}, verify_after),
         )
     return RemediationAction(
         action_type=args.type,
         title=f"手动动作 {args.type}",
         reason="手动执行处置动作。",
         risk="medium",
-        params={},
+        params=with_verify({}, verify_after),
     )
+
+
+def build_verify_after(args: argparse.Namespace) -> dict | None:
+    if not getattr(args, "verify_url", ""):
+        return None
+    return {
+        "type": "http",
+        "url": args.verify_url,
+        "expected_status": args.verify_expected_status,
+        "wait_seconds": args.verify_wait_seconds,
+        "retries": args.verify_retries,
+        "interval_seconds": args.verify_interval_seconds,
+        "timeout_seconds": args.verify_timeout_seconds,
+    }
+
+
+def with_verify(params: dict, verify_after: dict | None) -> dict:
+    if verify_after:
+        params["verify_after"] = verify_after
+    return params
 
 
 def action_from_log(row: dict) -> RemediationAction:

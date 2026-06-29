@@ -54,7 +54,10 @@ class Storage:
                     output text not null,
                     error text not null,
                     approved_by text,
-                    approved_at text
+                    approved_at text,
+                    verify_status text,
+                    verify_output text,
+                    verified_at text
                 );
                 """
             )
@@ -70,6 +73,9 @@ class Storage:
             "updated_at": "alter table action_logs add column updated_at text",
             "approved_by": "alter table action_logs add column approved_by text",
             "approved_at": "alter table action_logs add column approved_at text",
+            "verify_status": "alter table action_logs add column verify_status text",
+            "verify_output": "alter table action_logs add column verify_output text",
+            "verified_at": "alter table action_logs add column verified_at text",
         }
         for column, statement in additions.items():
             if column not in columns:
@@ -93,6 +99,27 @@ class Storage:
                     )
                     for result in results
                 ],
+            )
+            self.connection.commit()
+
+    def update_action_verification(
+        self,
+        action_id: int,
+        verify_status: str,
+        verify_output: str = "",
+    ) -> None:
+        with self.lock:
+            self.connection.execute(
+                """
+                update action_logs
+                set updated_at = ?,
+                    status = ?,
+                    verify_status = ?,
+                    verify_output = ?,
+                    verified_at = ?
+                where id = ?
+                """,
+                (utc_now_iso(), verify_status, verify_status, verify_output, utc_now_iso(), action_id),
             )
             self.connection.commit()
 

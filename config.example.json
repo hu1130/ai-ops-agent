@@ -60,6 +60,14 @@
     "allowed_containers": [],
     "command_timeout_seconds": 8,
     "max_command_output_chars": 4000,
+    "verification": {
+      "enabled": true,
+      "notify": true,
+      "default_wait_seconds": 30,
+      "retries": 3,
+      "interval_seconds": 5,
+      "timeout_seconds": 5
+    },
     "actions": {
       "check_port": {
         "auto_execute": true

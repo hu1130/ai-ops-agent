@@ -1,12 +1,15 @@
 import tempfile
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 
 from ops_agent.config import AppConfig
 from ops_agent.events import CheckResult
 from ops_agent.remediation.actions import RemediationAction
 from ops_agent.remediation.executor import execute_action
 from ops_agent.remediation.planner import build_remediation_plan
+from ops_agent.remediation.verifier import verify_after_action
 from ops_agent.storage import Storage
 
 
@@ -105,6 +108,91 @@ class RemediationTest(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual("skipped", row["status"])
         self.assertEqual("tester", row["approved_by"])
+
+    def test_verify_after_action_http_success(self) -> None:
+        server = start_test_server(200)
+        try:
+            port = server.server_address[1]
+            action = RemediationAction(
+                action_type="check_port",
+                title="Check",
+                reason="test",
+                params={
+                    "verify_after": {
+                        "type": "http",
+                        "url": f"http://127.0.0.1:{port}/health",
+                        "wait_seconds": 0,
+                        "retries": 1,
+                        "timeout_seconds": 2,
+                    }
+                },
+            )
+            config = AppConfig(raw={"remediation": {"verification": {"enabled": True}}}, base_dir=Path("."))
+            result = verify_after_action(action, config)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual("verified_ok", result.status)
+
+    def test_verify_after_action_http_failure(self) -> None:
+        server = start_test_server(503)
+        try:
+            port = server.server_address[1]
+            action = RemediationAction(
+                action_type="check_port",
+                title="Check",
+                reason="test",
+                params={
+                    "verify_after": {
+                        "type": "http",
+                        "url": f"http://127.0.0.1:{port}/health",
+                        "expected_status": 200,
+                        "wait_seconds": 0,
+                        "retries": 1,
+                        "timeout_seconds": 2,
+                    }
+                },
+            )
+            config = AppConfig(raw={"remediation": {"verification": {"enabled": True}}}, base_dir=Path("."))
+            result = verify_after_action(action, config)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual("verified_failed", result.status)
+
+    def test_storage_records_verification_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            action_id = storage.save_action_log(
+                "check_port",
+                "检查端口",
+                "low",
+                "executed",
+                "test",
+                {"host": "127.0.0.1", "port": 80},
+            )
+            storage.update_action_verification(action_id, "verified_ok", "HTTP 200")
+            row = storage.get_action_log(action_id)
+            storage.close()
+        self.assertIsNotNone(row)
+        self.assertEqual("verified_ok", row["status"])
+        self.assertEqual("verified_ok", row["verify_status"])
+
+
+def start_test_server(status_code: int) -> ThreadingHTTPServer:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(status_code)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
 
 
 if __name__ == "__main__":

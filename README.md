@@ -142,6 +142,20 @@ python -m ops_agent.cli --config .\config.json approve-action --id 1 --by owner 
 
 只有在 `remediation.allowed_services` 或 `remediation.allowed_containers` 白名单中的服务/容器才会被真正重启。
 
+执行后验证可以在创建动作时指定健康接口：
+
+```powershell
+python -m ops_agent.cli --config .\config.json run-action --type restart_docker_container --container ai-customer-service-api-1 --verify-url https://agent.setdx.com/health --verify-wait-seconds 30 --verify-retries 3
+```
+
+确认执行后，系统会在动作成功时自动请求该健康接口：
+
+- 返回预期状态码：审计状态变为 `verified_ok`
+- 仍然失败：审计状态变为 `verified_failed`
+- 没有配置验证：保持执行结果，并记录 `verify_skipped`
+
+真正的重启类动作验证完成后，会按告警配置发送自愈结果通知。
+
 ## 可选 AI 分析
 
 默认没有配置模型时，会使用内置规则分析。需要接入 OpenAI 兼容接口时设置环境变量：
