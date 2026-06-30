@@ -73,11 +73,15 @@ class StorageContextTest(unittest.TestCase):
             storage = Storage(db_path)
             storage.save_results([CheckResult(source="http", name="Site", status="ok", summary="HTTP 200")])
             rows = storage.latest_results()
+            incident_events_exists = storage.connection.execute(
+                "select name from sqlite_master where type = 'table' and name = 'incident_events'"
+            ).fetchone()
             storage.close()
 
         self.assertEqual("prod", rows[0]["environment"])
         self.assertEqual("normal", rows[0]["run_type"])
         self.assertIn("trace_id", rows[0])
+        self.assertIsNotNone(incident_events_exists)
 
 
 if __name__ == "__main__":

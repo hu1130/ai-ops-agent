@@ -62,6 +62,32 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertTrue(any(row["run_type"] == "synthetic_test" for row in rows))
         self.assertTrue(any(row["trace_id"] == "trace-1" for row in rows))
 
+    def test_recovery_resolves_open_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 1, "recovery_enabled": True},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            scheduler = OpsScheduler(config, storage, Notifier())
+            scheduler.process_alert_states(
+                [CheckResult(source="http", name="Site", status="critical", summary="Request failed")]
+            )
+            open_incident = storage.latest_incidents(1)[0]
+            scheduler.process_alert_states(
+                [CheckResult(source="http", name="Site", status="ok", summary="HTTP 200")]
+            )
+            resolved = storage.get_incident(open_incident["id"])
+            events = storage.latest_incident_events(open_incident["id"])
+            storage.close()
+
+        self.assertEqual("resolved", resolved["status"])
+        self.assertIn("resolved", [event["to_status"] for event in events])
+
 
 if __name__ == "__main__":
     unittest.main()

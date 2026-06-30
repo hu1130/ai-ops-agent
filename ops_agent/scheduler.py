@@ -15,7 +15,7 @@ from ops_agent.monitors.http_monitor import run_http_checks
 from ops_agent.monitors.json_api_monitor import run_json_checks
 from ops_agent.monitors.log_monitor import run_log_checks
 from ops_agent.monitors.server_monitor import run_server_checks
-from ops_agent.remediation.executor import execute_action, format_action_plan
+from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action, format_action_plan
 from ops_agent.remediation.planner import build_remediation_plan
 from ops_agent.retention import format_retention_result, run_retention_cleanup
 from ops_agent.storage import Storage
@@ -26,6 +26,7 @@ class IssueState:
     failure_count: int = 0
     is_open: bool = False
     last_summary: str = ""
+    incident_id: int | None = None
 
 
 class OpsScheduler:
@@ -59,6 +60,7 @@ class OpsScheduler:
         recovery_enabled = bool(self.config.alerts.get("recovery_enabled", True))
         new_alerts: list[CheckResult] = []
         recoveries: list[CheckResult] = []
+        recovery_incident_ids: set[int] = set()
 
         for result in results:
             key = check_key(result)
@@ -72,9 +74,12 @@ class OpsScheduler:
             else:
                 if state.is_open and recovery_enabled:
                     recoveries.append(result)
+                    if state.incident_id:
+                        recovery_incident_ids.add(state.incident_id)
                 state.failure_count = 0
                 state.is_open = False
                 state.last_summary = result.summary
+                state.incident_id = None
 
         if new_alerts:
             severity = "critical" if any(item.status == "critical" for item in new_alerts) else "warning"
@@ -86,13 +91,32 @@ class OpsScheduler:
             action_results = self.process_remediation_actions(action_plan, new_alerts)
             remediation_text = format_action_plan(action_plan, action_results)
             analysis = f"{analysis}{suggestions}{diagnostics}{remediation_text}"
-            self.storage.save_incident(severity, title, analysis, new_alerts)
+            incident_id = self.storage.save_incident(severity, title, analysis, new_alerts)
+            for result in new_alerts:
+                self._issues[check_key(result)].incident_id = incident_id
+            next_status = incident_status_from_action_results(action_results)
+            if next_status:
+                self.storage.transition_incident(
+                    incident_id,
+                    next_status,
+                    actor="scheduler",
+                    note="remediation action processed",
+                    metadata={"action_statuses": [item.status for item in action_results]},
+                )
             self.notifier.send(title, analysis, dedupe_key=problem_key(new_alerts))
 
         if recoveries:
             title = f"Ops Agent recovered {len(recoveries)} issue(s)"
             text = build_recovery_message(recoveries)
             self.storage.save_incident("ok", title, text, recoveries)
+            for incident_id in sorted(recovery_incident_ids):
+                self.storage.transition_incident(
+                    incident_id,
+                    "resolved",
+                    actor="scheduler",
+                    note="monitor recovered",
+                    metadata={"recovered_checks": [check_key(result) for result in recoveries]},
+                )
             self.notifier.send(title, text, dedupe_key="recovered:" + problem_key(recoveries))
 
     def process_remediation_actions(self, actions, context_results: list[CheckResult] | None = None):
@@ -229,6 +253,19 @@ def common_context_value(values: list[str], default: str) -> str:
 def clean_context_value(value: object, default: str) -> str:
     text = str(value or "").strip()
     return text or default
+
+
+def incident_status_from_action_results(action_results) -> str:
+    if not action_results:
+        return ""
+    if any(result.status == "executed" and result.action.action_type in MUTATING_ACTIONS for result in action_results):
+        return "verifying"
+    if any(
+        result.status not in {"dry_run", "skipped"} and result.action.action_type in MUTATING_ACTIONS
+        for result in action_results
+    ):
+        return "remediating"
+    return ""
 
 
 def build_recovery_message(results: list[CheckResult]) -> str:

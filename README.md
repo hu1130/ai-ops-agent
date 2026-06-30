@@ -185,6 +185,65 @@ python -m ops_agent.cli --config .\config.json run-action --type restart_docker_
 
 真正的重启类动作验证完成后，会按告警配置发送自愈结果通知。
 
+## 事件闭环
+
+告警事件不再只是静态记录。`incidents` 会保存当前生命周期状态，`incident_events` 会保存每次状态变化审计。
+
+当前状态：
+
+- `open`: 新告警已创建
+- `acknowledged`: 已人工确认
+- `remediating`: 已进入处置过程
+- `verifying`: 已执行变更，等待验证
+- `resolved`: 监控已恢复
+- `closed`: 事件已关闭归档
+
+查看事件列表：
+
+```powershell
+python -m ops_agent.cli --config .\config.json incidents
+```
+
+查看事件流转历史：
+
+```powershell
+python -m ops_agent.cli --config .\config.json incident-events --id 1
+```
+
+人工确认事件：
+
+```powershell
+python -m ops_agent.cli --config .\config.json incident-transition --id 1 --status acknowledged --actor owner --note "开始处理"
+```
+
+关闭事件：
+
+```powershell
+python -m ops_agent.cli --config .\config.json incident-transition --id 1 --status closed --actor owner --note "已复盘归档"
+```
+
+本地 API 也支持事件流转：
+
+```text
+GET  /api/incidents
+GET  /api/incidents/1
+GET  /api/incidents/1/events
+POST /api/incidents/1/ack
+POST /api/incidents/1/resolve
+POST /api/incidents/1/close
+POST /api/incidents/1/transition
+```
+
+`POST /api/incidents/1/transition` 的 JSON 示例：
+
+```json
+{
+  "status": "acknowledged",
+  "actor": "owner",
+  "note": "开始处理"
+}
+```
+
 ## 环境和测试数据标记
 
 所有巡检、告警事件和处置动作都会写入以下上下文字段：

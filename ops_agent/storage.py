@@ -8,6 +8,12 @@ from threading import RLock
 from typing import Sequence
 
 from ops_agent.events import CheckResult, utc_now_iso
+from ops_agent.incident_lifecycle import (
+    initial_incident_status,
+    lifecycle_payload,
+    validate_incident_status,
+    validate_transition,
+)
 
 
 class Storage:
@@ -39,13 +45,31 @@ class Storage:
                 create table if not exists incidents (
                     id integer primary key autoincrement,
                     created_at text not null,
+                    updated_at text,
                     environment text not null default 'prod',
                     run_type text not null default 'normal',
                     trace_id text not null default '',
+                    status text not null default 'open',
                     severity text not null,
                     title text not null,
                     analysis text not null,
-                    results_json text not null
+                    results_json text not null,
+                    acknowledged_at text,
+                    acknowledged_by text,
+                    resolved_at text,
+                    closed_at text,
+                    closed_reason text
+                );
+
+                create table if not exists incident_events (
+                    id integer primary key autoincrement,
+                    incident_id integer not null,
+                    created_at text not null,
+                    from_status text not null,
+                    to_status text not null,
+                    actor text not null,
+                    note text not null,
+                    metadata_json text not null
                 );
 
                 create table if not exists action_logs (
@@ -72,6 +96,7 @@ class Storage:
                 """
             )
             self.ensure_context_columns()
+            self.ensure_incident_lifecycle_columns()
             self.ensure_action_log_columns()
             self.connection.commit()
 
@@ -89,6 +114,24 @@ class Storage:
             for column, definition in defaults.items():
                 if column not in columns:
                     self.connection.execute(f"alter table {table} add column {column} {definition}")
+
+    def ensure_incident_lifecycle_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("pragma table_info(incidents)").fetchall()
+        }
+        additions = {
+            "updated_at": "alter table incidents add column updated_at text",
+            "status": "alter table incidents add column status text not null default 'open'",
+            "acknowledged_at": "alter table incidents add column acknowledged_at text",
+            "acknowledged_by": "alter table incidents add column acknowledged_by text",
+            "resolved_at": "alter table incidents add column resolved_at text",
+            "closed_at": "alter table incidents add column closed_at text",
+            "closed_reason": "alter table incidents add column closed_reason text",
+        }
+        for column, statement in additions.items():
+            if column not in columns:
+                self.connection.execute(statement)
 
     def ensure_action_log_columns(self) -> None:
         columns = {
@@ -154,26 +197,51 @@ class Storage:
             )
             self.connection.commit()
 
-    def save_incident(self, severity: str, title: str, analysis: str, results: list[CheckResult]) -> int:
+    def save_incident(
+        self,
+        severity: str,
+        title: str,
+        analysis: str,
+        results: list[CheckResult],
+        status: str | None = None,
+    ) -> int:
+        incident_status = validate_incident_status(status or initial_incident_status(severity))
+        created_at = utc_now_iso()
         with self.lock:
             cursor = self.connection.execute(
                 """
-                insert into incidents (created_at, environment, run_type, trace_id, severity, title, analysis, results_json)
-                values (?, ?, ?, ?, ?, ?, ?, ?)
+                insert into incidents (
+                    created_at, updated_at, environment, run_type, trace_id, status,
+                    severity, title, analysis, results_json, resolved_at
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    utc_now_iso(),
+                    created_at,
+                    created_at,
                     common_value([result.environment for result in results], "prod"),
                     common_value([result.run_type for result in results], "normal"),
                     common_value([result.trace_id for result in results], ""),
+                    incident_status,
                     severity,
                     title,
                     analysis,
                     json.dumps([result.__dict__ for result in results], ensure_ascii=False),
+                    created_at if incident_status == "resolved" else None,
                 ),
             )
+            incident_id = int(cursor.lastrowid)
+            self.record_incident_event(
+                incident_id,
+                "",
+                incident_status,
+                "system",
+                "incident created",
+                {"severity": severity},
+                commit=False,
+            )
             self.connection.commit()
-            return int(cursor.lastrowid)
+            return incident_id
 
     def latest_results(self, limit: int = 50) -> list[dict]:
         with self.lock:
@@ -198,6 +266,139 @@ class Storage:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_incident(self, incident_id: int) -> dict | None:
+        with self.lock:
+            row = self.connection.execute(
+                """
+                select * from incidents
+                where id = ?
+                """,
+                (incident_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_incident_events(self, incident_id: int, limit: int = 100) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                """
+                select * from incident_events
+                where incident_id = ?
+                order by id asc
+                limit ?
+                """,
+                (incident_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def transition_incident(
+        self,
+        incident_id: int,
+        to_status: str,
+        actor: str = "system",
+        note: str = "",
+        metadata: dict | None = None,
+    ) -> dict:
+        with self.lock:
+            row = self.connection.execute(
+                "select * from incidents where id = ?",
+                (incident_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"incident not found: {incident_id}")
+
+            current = str(row["status"])
+            from_status, target = validate_transition(current, to_status)
+            if from_status == target:
+                return dict(row)
+
+            payload = lifecycle_payload(actor, note, metadata)
+            now = utc_now_iso()
+            acknowledged_at = row["acknowledged_at"]
+            acknowledged_by = row["acknowledged_by"]
+            resolved_at = row["resolved_at"]
+            closed_at = row["closed_at"]
+            closed_reason = row["closed_reason"]
+
+            if target == "acknowledged":
+                acknowledged_at = acknowledged_at or now
+                acknowledged_by = acknowledged_by or payload["actor"]
+            if target == "resolved":
+                resolved_at = resolved_at or now
+            if target == "closed":
+                closed_at = closed_at or now
+                closed_reason = payload["note"] or closed_reason
+
+            self.connection.execute(
+                """
+                update incidents
+                set status = ?,
+                    updated_at = ?,
+                    acknowledged_at = ?,
+                    acknowledged_by = ?,
+                    resolved_at = ?,
+                    closed_at = ?,
+                    closed_reason = ?
+                where id = ?
+                """,
+                (
+                    target,
+                    now,
+                    acknowledged_at,
+                    acknowledged_by,
+                    resolved_at,
+                    closed_at,
+                    closed_reason,
+                    incident_id,
+                ),
+            )
+            self.record_incident_event(
+                incident_id,
+                from_status,
+                target,
+                payload["actor"],
+                payload["note"],
+                payload["metadata"],
+                commit=False,
+            )
+            self.connection.commit()
+            updated = self.connection.execute(
+                "select * from incidents where id = ?",
+                (incident_id,),
+            ).fetchone()
+        return dict(updated)
+
+    def record_incident_event(
+        self,
+        incident_id: int,
+        from_status: str,
+        to_status: str,
+        actor: str,
+        note: str = "",
+        metadata: dict | None = None,
+        commit: bool = True,
+    ) -> int:
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                insert into incident_events (
+                    incident_id, created_at, from_status, to_status, actor, note, metadata_json
+                )
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    incident_id,
+                    utc_now_iso(),
+                    from_status,
+                    to_status,
+                    actor,
+                    note,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+            if commit:
+                self.connection.commit()
+            return int(cursor.lastrowid)
 
     def save_action_log(
         self,
@@ -457,6 +658,9 @@ class Storage:
             "current_status": current_status,
             "active_problem_count": len(problem_targets),
             "incident_count": len(incidents),
+            "open_incident_count": sum(
+                1 for row in incidents if row.get("status", "open") not in {"resolved", "closed"}
+            ),
             "source_counts": source_counts,
             "latest_targets": list(latest.values()),
         }

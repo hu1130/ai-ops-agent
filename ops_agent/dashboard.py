@@ -21,14 +21,63 @@ def start_dashboard(storage: Storage, host: str, port: int) -> ThreadingHTTPServ
             if path == "/api/incidents":
                 self.send_json(storage.latest_incidents())
                 return
+            incident_request = parse_incident_api_path(path)
+            if incident_request:
+                incident_id, action = incident_request
+                if action == "":
+                    incident = storage.get_incident(incident_id)
+                    if not incident:
+                        self.send_json({"error": "incident not found"}, status=404)
+                        return
+                    self.send_json(incident)
+                    return
+                if action == "events":
+                    self.send_json(storage.latest_incident_events(incident_id))
+                    return
             if path == "/api/action-logs":
                 self.send_json(storage.latest_action_logs())
                 return
             self.send_html(render_page(storage))
 
-        def send_json(self, payload: object) -> None:
+        def do_POST(self) -> None:  # noqa: N802
+            path = self.path.split("?", 1)[0]
+            incident_request = parse_incident_api_path(path)
+            if not incident_request:
+                self.send_json({"error": "not found"}, status=404)
+                return
+
+            incident_id, action = incident_request
+            try:
+                body = self.read_json_body()
+                to_status = status_from_incident_action(action, body)
+                updated = storage.transition_incident(
+                    incident_id,
+                    to_status,
+                    actor=str(body.get("actor") or "api"),
+                    note=str(body.get("note") or body.get("reason") or ""),
+                    metadata={"api_action": action},
+                )
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=500)
+                return
+            self.send_json(updated)
+
+        def read_json_body(self) -> dict:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            if length <= 0:
+                return {}
+            raw = self.rfile.read(length).decode("utf-8", errors="replace")
+            if not raw.strip():
+                return {}
+            payload = json.loads(raw)
+            return payload if isinstance(payload, dict) else {}
+
+        def send_json(self, payload: object, status: int = 200) -> None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -191,7 +240,7 @@ def render_page(storage: Storage) -> str:
       cursor: pointer;
       padding: 12px 16px;
       display: grid;
-      grid-template-columns: 126px 76px minmax(0, 1fr);
+      grid-template-columns: 126px 156px minmax(0, 1fr);
       gap: 10px;
       align-items: center;
       list-style: none;
@@ -312,11 +361,12 @@ def render_result_row(row: dict) -> str:
 
 def render_incident_row(row: dict) -> str:
     severity = safe(row.get("severity", ""))
+    lifecycle_status = safe(row.get("status", "open"))
     return (
         "<details>"
         "<summary>"
         f"<span class='time'>{safe(row.get('created_at', ''))}</span>"
-        f"<span class='status {severity}'>{severity}</span>"
+        f"<span class='status {severity}'>{severity}/{lifecycle_status}</span>"
         f"<strong>{safe(row.get('title', ''))}</strong>"
         "</summary>"
         f"<pre>{safe(row.get('analysis', ''))}</pre>"
@@ -326,6 +376,34 @@ def render_incident_row(row: dict) -> str:
 
 def status_rank(value: str) -> int:
     return {"critical": 0, "warning": 1, "ok": 2}.get(value, 3)
+
+
+def parse_incident_api_path(path: str) -> tuple[int, str] | None:
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 3 or parts[0] != "api" or parts[1] != "incidents":
+        return None
+    try:
+        incident_id = int(parts[2])
+    except ValueError:
+        return None
+    action = parts[3] if len(parts) >= 4 else ""
+    return incident_id, action
+
+
+def status_from_incident_action(action: str, body: dict) -> str:
+    if action == "ack":
+        return "acknowledged"
+    if action in {"remediate", "remediating"}:
+        return "remediating"
+    if action == "verify":
+        return "verifying"
+    if action == "resolve":
+        return "resolved"
+    if action == "close":
+        return "closed"
+    if action == "transition":
+        return str(body.get("status", ""))
+    raise ValueError(f"unsupported incident action: {action}")
 
 
 def safe(value: object) -> str:

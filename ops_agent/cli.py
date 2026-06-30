@@ -9,6 +9,7 @@ from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig, load_config
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.events import CheckResult, RunContext
+from ops_agent.incident_lifecycle import INCIDENT_STATUSES
 from ops_agent.remediation.actions import RemediationAction
 from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action, format_action_plan
 from ops_agent.remediation.planner import build_remediation_plan
@@ -49,6 +50,15 @@ def parse_args() -> argparse.Namespace:
 
     retention_parser = subparsers.add_parser("retention-cleanup", help="Preview or execute retention cleanup")
     retention_parser.add_argument("--execute", action="store_true", help="Actually delete expired records")
+
+    subparsers.add_parser("incidents", help="Show latest incidents")
+    incident_events_parser = subparsers.add_parser("incident-events", help="Show incident lifecycle events")
+    incident_events_parser.add_argument("--id", type=int, required=True, help="Incident id")
+    transition_parser = subparsers.add_parser("incident-transition", help="Transition incident lifecycle status")
+    transition_parser.add_argument("--id", type=int, required=True, help="Incident id")
+    transition_parser.add_argument("--status", required=True, choices=sorted(INCIDENT_STATUSES), help="Target status")
+    transition_parser.add_argument("--actor", default="operator", help="Actor name")
+    transition_parser.add_argument("--note", default="", help="Transition note")
 
     subparsers.add_parser("action-logs", help="Show latest remediation action audit logs")
     return parser.parse_args()
@@ -117,6 +127,15 @@ def main() -> int:
         print(format_retention_result(result))
         return 0
 
+    if args.command == "incidents":
+        return incidents_command(config)
+
+    if args.command == "incident-events":
+        return incident_events_command(args, config)
+
+    if args.command == "incident-transition":
+        return incident_transition_command(args, config)
+
     if args.command == "action-logs":
         storage = open_storage(config)
         rows = storage.latest_action_logs(20)
@@ -183,6 +202,57 @@ def run_action_command(args: argparse.Namespace, config: AppConfig) -> int:
     print(format_action_plan([action], [result]))
     print(format_verification(verification))
     return 0 if final_success(result.status, verification) else 1
+
+
+def incidents_command(config: AppConfig) -> int:
+    storage = open_storage(config)
+    rows = storage.latest_incidents(30)
+    storage.close()
+    if not rows:
+        print("No incidents.")
+        return 0
+    for row in rows:
+        print(
+            f"#{row['id']} [{row.get('status', 'open')}] {row['severity']} "
+            f"{row['title']} trace={row.get('trace_id', '')}"
+        )
+    return 0
+
+
+def incident_events_command(args: argparse.Namespace, config: AppConfig) -> int:
+    storage = open_storage(config)
+    incident = storage.get_incident(args.id)
+    rows = storage.latest_incident_events(args.id)
+    storage.close()
+    if not incident:
+        print(f"Incident not found: #{args.id}")
+        return 1
+    print(f"#{incident['id']} [{incident.get('status', 'open')}] {incident['title']}")
+    for row in rows:
+        print(
+            f"- [{row['created_at']}] {row['from_status']} -> {row['to_status']} "
+            f"actor={row['actor']} note={row['note']}"
+        )
+    return 0
+
+
+def incident_transition_command(args: argparse.Namespace, config: AppConfig) -> int:
+    storage = open_storage(config)
+    try:
+        row = storage.transition_incident(
+            args.id,
+            args.status,
+            actor=args.actor,
+            note=args.note,
+            metadata={"source": "cli"},
+        )
+    except ValueError as exc:
+        storage.close()
+        print(str(exc))
+        return 1
+    storage.close()
+    print(f"Incident #{row['id']} status={row['status']}")
+    return 0
 
 
 def approve_action_command(args: argparse.Namespace, config: AppConfig) -> int:
