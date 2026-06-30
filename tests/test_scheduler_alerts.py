@@ -29,6 +29,7 @@ class SchedulerAlertsTest(unittest.TestCase):
             config = AppConfig(
                 raw={
                     "alerts": {"consecutive_failures": 1},
+                    "app": {"environment": "staging", "run_type": "synthetic_test"},
                     "ai": {"enabled": False},
                     "remediation": {
                         "enabled": True,
@@ -48,12 +49,18 @@ class SchedulerAlertsTest(unittest.TestCase):
                         status="critical",
                         summary="Request failed",
                         details={"url": "https://example.com"},
+                        environment="staging",
+                        run_type="synthetic_test",
+                        trace_id="trace-1",
                     )
                 ]
             )
             rows = storage.latest_action_logs()
             storage.close()
         self.assertTrue(any(row["action_type"] == "check_port" for row in rows))
+        self.assertTrue(any(row["environment"] == "staging" for row in rows))
+        self.assertTrue(any(row["run_type"] == "synthetic_test" for row in rows))
+        self.assertTrue(any(row["trace_id"] == "trace-1" for row in rows))
 
 
 if __name__ == "__main__":

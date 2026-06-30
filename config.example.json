@@ -1,6 +1,9 @@
 {
   "app": {
     "name": "internal-ops-agent",
+    "environment": "prod",
+    "run_type": "normal",
+    "cli_run_type": "manual",
     "interval_seconds": 60,
     "database_path": "data/ops_agent.db",
     "dashboard_host": "127.0.0.1",
@@ -51,6 +54,11 @@
     "problem_results_days": 90,
     "incidents_days": 90,
     "action_logs_days": 90,
+    "test_results_days": 7,
+    "test_incidents_days": 7,
+    "test_action_logs_days": 7,
+    "test_environments": ["test"],
+    "test_run_types": ["manual_test", "synthetic_test"],
     "cleanup_hour": 3,
     "vacuum": false
   },

@@ -5,6 +5,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
+from typing import Sequence
 
 from ops_agent.events import CheckResult, utc_now_iso
 
@@ -25,6 +26,9 @@ class Storage:
                 create table if not exists check_results (
                     id integer primary key autoincrement,
                     created_at text not null,
+                    environment text not null default 'prod',
+                    run_type text not null default 'normal',
+                    trace_id text not null default '',
                     source text not null,
                     name text not null,
                     status text not null,
@@ -35,6 +39,9 @@ class Storage:
                 create table if not exists incidents (
                     id integer primary key autoincrement,
                     created_at text not null,
+                    environment text not null default 'prod',
+                    run_type text not null default 'normal',
+                    trace_id text not null default '',
                     severity text not null,
                     title text not null,
                     analysis text not null,
@@ -45,6 +52,9 @@ class Storage:
                     id integer primary key autoincrement,
                     created_at text not null,
                     updated_at text,
+                    environment text not null default 'prod',
+                    run_type text not null default 'normal',
+                    trace_id text not null default '',
                     action_type text not null,
                     title text not null,
                     risk text not null,
@@ -61,8 +71,24 @@ class Storage:
                 );
                 """
             )
+            self.ensure_context_columns()
             self.ensure_action_log_columns()
             self.connection.commit()
+
+    def ensure_context_columns(self) -> None:
+        defaults = {
+            "environment": "text not null default 'prod'",
+            "run_type": "text not null default 'normal'",
+            "trace_id": "text not null default ''",
+        }
+        for table in ("check_results", "incidents", "action_logs"):
+            columns = {
+                row["name"]
+                for row in self.connection.execute(f"pragma table_info({table})").fetchall()
+            }
+            for column, definition in defaults.items():
+                if column not in columns:
+                    self.connection.execute(f"alter table {table} add column {column} {definition}")
 
     def ensure_action_log_columns(self) -> None:
         columns = {
@@ -85,12 +111,17 @@ class Storage:
         with self.lock:
             self.connection.executemany(
                 """
-                insert into check_results (created_at, source, name, status, summary, details_json)
-                values (?, ?, ?, ?, ?, ?)
+                insert into check_results (
+                    created_at, environment, run_type, trace_id, source, name, status, summary, details_json
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         result.created_at,
+                        result.environment or "prod",
+                        result.run_type or "normal",
+                        result.trace_id or "",
                         result.source,
                         result.name,
                         result.status,
@@ -127,11 +158,14 @@ class Storage:
         with self.lock:
             cursor = self.connection.execute(
                 """
-                insert into incidents (created_at, severity, title, analysis, results_json)
-                values (?, ?, ?, ?, ?)
+                insert into incidents (created_at, environment, run_type, trace_id, severity, title, analysis, results_json)
+                values (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     utc_now_iso(),
+                    common_value([result.environment for result in results], "prod"),
+                    common_value([result.run_type for result in results], "normal"),
+                    common_value([result.trace_id for result in results], ""),
                     severity,
                     title,
                     analysis,
@@ -175,15 +209,23 @@ class Storage:
         params: dict,
         output: str = "",
         error: str = "",
+        environment: str = "prod",
+        run_type: str = "normal",
+        trace_id: str = "",
     ) -> int:
         with self.lock:
             cursor = self.connection.execute(
                 """
-                insert into action_logs (created_at, action_type, title, risk, status, reason, params_json, output, error)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                insert into action_logs (
+                    created_at, environment, run_type, trace_id, action_type, title, risk, status, reason, params_json, output, error
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     utc_now_iso(),
+                    environment or "prod",
+                    run_type or "normal",
+                    trace_id or "",
                     action_type,
                     title,
                     risk,
@@ -251,23 +293,47 @@ class Storage:
         problem_cutoff: str,
         incident_cutoff: str,
         action_cutoff: str,
+        test_check_cutoff: str = "",
+        test_incident_cutoff: str = "",
+        test_action_cutoff: str = "",
+        test_environments: Sequence[str] | None = None,
+        test_run_types: Sequence[str] | None = None,
     ) -> dict[str, int]:
+        test_environments = test_environments or []
+        test_run_types = test_run_types or []
+        check_where, check_params = build_retention_where(
+            "(created_at < ? and status = 'ok') or (created_at < ? and status in ('warning', 'critical'))",
+            [check_cutoff, problem_cutoff],
+            test_check_cutoff,
+            test_environments,
+            test_run_types,
+        )
+        incident_where, incident_params = build_retention_where(
+            "created_at < ?",
+            [incident_cutoff],
+            test_incident_cutoff,
+            test_environments,
+            test_run_types,
+        )
+        action_where, action_params = build_retention_where(
+            "created_at < ?",
+            [action_cutoff],
+            test_action_cutoff,
+            test_environments,
+            test_run_types,
+        )
         with self.lock:
             check_results = self.connection.execute(
-                """
-                select count(*) from check_results
-                where (created_at < ? and status = 'ok')
-                   or (created_at < ? and status in ('warning', 'critical'))
-                """,
-                (check_cutoff, problem_cutoff),
+                f"select count(*) from check_results where {check_where}",
+                check_params,
             ).fetchone()[0]
             incidents = self.connection.execute(
-                "select count(*) from incidents where created_at < ?",
-                (incident_cutoff,),
+                f"select count(*) from incidents where {incident_where}",
+                incident_params,
             ).fetchone()[0]
             action_logs = self.connection.execute(
-                "select count(*) from action_logs where created_at < ?",
-                (action_cutoff,),
+                f"select count(*) from action_logs where {action_where}",
+                action_params,
             ).fetchone()[0]
         return {"check_results": int(check_results), "incidents": int(incidents), "action_logs": int(action_logs)}
 
@@ -277,19 +343,53 @@ class Storage:
         problem_cutoff: str,
         incident_cutoff: str,
         action_cutoff: str,
+        test_check_cutoff: str = "",
+        test_incident_cutoff: str = "",
+        test_action_cutoff: str = "",
+        test_environments: Sequence[str] | None = None,
+        test_run_types: Sequence[str] | None = None,
     ) -> dict[str, int]:
+        test_environments = test_environments or []
+        test_run_types = test_run_types or []
+        check_where, check_params = build_retention_where(
+            "(created_at < ? and status = 'ok') or (created_at < ? and status in ('warning', 'critical'))",
+            [check_cutoff, problem_cutoff],
+            test_check_cutoff,
+            test_environments,
+            test_run_types,
+        )
+        incident_where, incident_params = build_retention_where(
+            "created_at < ?",
+            [incident_cutoff],
+            test_incident_cutoff,
+            test_environments,
+            test_run_types,
+        )
+        action_where, action_params = build_retention_where(
+            "created_at < ?",
+            [action_cutoff],
+            test_action_cutoff,
+            test_environments,
+            test_run_types,
+        )
         with self.lock:
-            before = self.count_retention_candidates(check_cutoff, problem_cutoff, incident_cutoff, action_cutoff)
-            self.connection.execute(
-                """
-                delete from check_results
-                where (created_at < ? and status = 'ok')
-                   or (created_at < ? and status in ('warning', 'critical'))
-                """,
-                (check_cutoff, problem_cutoff),
+            before = self.count_retention_candidates(
+                check_cutoff,
+                problem_cutoff,
+                incident_cutoff,
+                action_cutoff,
+                test_check_cutoff,
+                test_incident_cutoff,
+                test_action_cutoff,
+                test_environments,
+                test_run_types,
             )
-            self.connection.execute("delete from incidents where created_at < ?", (incident_cutoff,))
-            self.connection.execute("delete from action_logs where created_at < ?", (action_cutoff,))
+            self.connection.execute(
+                f"delete from check_results where {check_where}",
+                check_params,
+            )
+            self.connection.execute(f"delete from incidents where {incident_where}", incident_params)
+            self.connection.execute(f"delete from action_logs where {action_where}", action_params)
             self.connection.commit()
         return before
 
@@ -364,3 +464,43 @@ class Storage:
     def close(self) -> None:
         with self.lock:
             self.connection.close()
+
+
+def common_value(values: list[str], default: str) -> str:
+    cleaned = [value for value in values if value]
+    if not cleaned:
+        return default
+    first = cleaned[0]
+    if all(value == first for value in cleaned):
+        return first
+    return "mixed"
+
+
+def build_retention_where(
+    normal_where: str,
+    normal_params: list[str],
+    test_cutoff: str,
+    test_environments: Sequence[str],
+    test_run_types: Sequence[str],
+) -> tuple[str, list[str]]:
+    test_clause, test_params = build_test_clause(test_environments, test_run_types)
+    if not test_clause or not test_cutoff:
+        return f"({normal_where})", normal_params
+    return (
+        f"(({test_clause}) and created_at < ?) or (not ({test_clause}) and ({normal_where}))",
+        [*test_params, test_cutoff, *test_params, *normal_params],
+    )
+
+
+def build_test_clause(test_environments: Sequence[str], test_run_types: Sequence[str]) -> tuple[str, list[str]]:
+    clauses: list[str] = []
+    params: list[str] = []
+    environments = [value for value in test_environments if value]
+    run_types = [value for value in test_run_types if value]
+    if environments:
+        clauses.append(f"environment in ({','.join('?' for _ in environments)})")
+        params.extend(environments)
+    if run_types:
+        clauses.append(f"run_type in ({','.join('?' for _ in run_types)})")
+        params.extend(run_types)
+    return " or ".join(clauses), params

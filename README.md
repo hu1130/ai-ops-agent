@@ -13,6 +13,8 @@
 - 连续失败后再报警，恢复后发送恢复通知
 - 每日发送巡检日报
 - 使用 SQLite 保存巡检和事件记录
+- 给巡检、事件、处置动作打上环境、运行类型和 trace_id 标记
+- 按生产/测试数据分别执行保留和自动清理
 - 提供本地 Web 面板查看健康概览、当前监控目标、事件中心和最近巡检
 
 ## 快速开始
@@ -156,6 +158,36 @@ python -m ops_agent.cli --config .\config.json run-action --type restart_docker_
 
 真正的重启类动作验证完成后，会按告警配置发送自愈结果通知。
 
+## 环境和测试数据标记
+
+所有巡检、告警事件和处置动作都会写入以下上下文字段：
+
+- `environment`: 默认 `prod`
+- `run_type`: 定时巡检默认 `normal`
+- `trace_id`: 每轮巡检自动生成，用于串联同一轮产生的巡检、事件和动作日志
+
+推荐在生产配置中保持：
+
+```json
+"app": {
+  "environment": "prod",
+  "run_type": "normal",
+  "cli_run_type": "manual"
+}
+```
+
+如果要跑测试环境，可以单独配置：
+
+```json
+"app": {
+  "environment": "test",
+  "run_type": "manual_test",
+  "cli_run_type": "manual_test"
+}
+```
+
+这样测试数据和生产数据不会混在一起，后续查询、清理、权限隔离和前端筛选都会更清楚。
+
 ## 数据保留和自动清理
 
 长期运行时，巡检记录会持续写入 SQLite。可以用 `retention` 配置自动清理过期数据：
@@ -167,6 +199,11 @@ python -m ops_agent.cli --config .\config.json run-action --type restart_docker_
   "problem_results_days": 90,
   "incidents_days": 90,
   "action_logs_days": 90,
+  "test_results_days": 7,
+  "test_incidents_days": 7,
+  "test_action_logs_days": 7,
+  "test_environments": ["test"],
+  "test_run_types": ["manual_test", "synthetic_test"],
   "cleanup_hour": 3,
   "vacuum": false
 }
@@ -178,6 +215,7 @@ python -m ops_agent.cli --config .\config.json run-action --type restart_docker_
 - warning/critical 巡检记录保留 90 天
 - 告警事件保留 90 天
 - 处置动作审计保留 90 天
+- `environment=test` 或 `run_type=manual_test/synthetic_test` 的测试数据保留 7 天
 - 每天 03:00 自动执行一次
 
 手动预览将删除多少数据：

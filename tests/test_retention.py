@@ -52,6 +52,30 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(0, result.deleted_check_results)
         self.assertEqual(1, len(rows))
 
+    def test_test_results_use_shorter_retention_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            insert_check(storage, "warning", days_ago=8, environment="test", run_type="manual_test")
+            insert_check(storage, "warning", days_ago=8, environment="prod", run_type="normal")
+            result = run_retention_cleanup(
+                storage,
+                {
+                    "enabled": True,
+                    "check_results_days": 30,
+                    "problem_results_days": 90,
+                    "test_results_days": 7,
+                    "test_environments": ["test"],
+                    "test_run_types": ["manual_test"],
+                },
+                dry_run=False,
+            )
+            rows = storage.latest_results(10)
+            storage.close()
+
+        self.assertEqual(1, result.deleted_check_results)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("prod", rows[0]["environment"])
+
     def test_retention_deletes_old_incidents_and_action_logs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")
@@ -85,14 +109,63 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual([], incidents)
         self.assertEqual([], actions)
 
+    def test_test_incidents_and_actions_use_shorter_retention_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            old = iso_days_ago(8)
+            storage.connection.execute(
+                """
+                insert into incidents (created_at, environment, run_type, trace_id, severity, title, analysis, results_json)
+                values (?, 'test', 'manual_test', 'trace-a', 'warning', 'old', 'old', '[]')
+                """,
+                (old,),
+            )
+            storage.connection.execute(
+                """
+                insert into action_logs (
+                    created_at, environment, run_type, trace_id, action_type, title, risk, status, reason, params_json, output, error
+                )
+                values (?, 'test', 'manual_test', 'trace-a', 'check_port', 'old', 'low', 'executed', 'old', '{}', '', '')
+                """,
+                (old,),
+            )
+            storage.connection.commit()
+            result = run_retention_cleanup(
+                storage,
+                {
+                    "enabled": True,
+                    "incidents_days": 90,
+                    "action_logs_days": 90,
+                    "test_incidents_days": 7,
+                    "test_action_logs_days": 7,
+                    "test_environments": ["test"],
+                    "test_run_types": ["manual_test"],
+                },
+                dry_run=False,
+            )
+            incidents = storage.latest_incidents()
+            actions = storage.latest_action_logs()
+            storage.close()
 
-def insert_check(storage: Storage, status: str, days_ago: int) -> None:
+        self.assertEqual(1, result.deleted_incidents)
+        self.assertEqual(1, result.deleted_action_logs)
+        self.assertEqual([], incidents)
+        self.assertEqual([], actions)
+
+
+def insert_check(
+    storage: Storage,
+    status: str,
+    days_ago: int,
+    environment: str = "prod",
+    run_type: str = "normal",
+) -> None:
     storage.connection.execute(
         """
-        insert into check_results (created_at, source, name, status, summary, details_json)
-        values (?, 'http', 'site', ?, 'summary', '{}')
+        insert into check_results (created_at, environment, run_type, trace_id, source, name, status, summary, details_json)
+        values (?, ?, ?, 'trace-a', 'http', 'site', ?, 'summary', '{}')
         """,
-        (iso_days_ago(days_ago), status),
+        (iso_days_ago(days_ago), environment, run_type, status),
     )
     storage.connection.commit()
 

@@ -29,6 +29,19 @@ class CliTest(unittest.TestCase):
         )
         self.assertEqual([], validate_config(config))
 
+    def test_validate_config_reports_bad_context_config(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60, "environment": "prod cn"},
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+                "retention": {"test_environments": "test"},
+            },
+            base_dir=Path("."),
+        )
+        errors = validate_config(config)
+        self.assertTrue(any("app.environment" in error for error in errors))
+        self.assertTrue(any("retention.test_environments" in error for error in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,7 +10,7 @@ from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.diagnostics.suggestions import build_action_suggestions
-from ops_agent.events import CheckResult
+from ops_agent.events import CheckResult, RunContext, apply_context
 from ops_agent.monitors.http_monitor import run_http_checks
 from ops_agent.monitors.json_api_monitor import run_json_checks
 from ops_agent.monitors.log_monitor import run_log_checks
@@ -40,11 +40,13 @@ class OpsScheduler:
 
     def run_once(self, respect_intervals: bool = False) -> list[CheckResult]:
         cycle_started_at = time.time()
+        context = build_run_context(self.config)
         results: list[CheckResult] = []
         results.extend(run_http_checks(self.due_checks("http", self.config.http_checks, respect_intervals, cycle_started_at)))
         results.extend(run_json_checks(self.due_checks("json", self.config.json_checks, respect_intervals, cycle_started_at)))
         results.extend(run_server_checks(self.config.server_checks, self.config.base_dir))
         results.extend(run_log_checks(self.due_checks("log", self.config.log_checks, respect_intervals, cycle_started_at), self.config.base_dir))
+        apply_context(results, context)
         if results:
             self.storage.save_results(results)
 
@@ -81,7 +83,7 @@ class OpsScheduler:
             diagnostics = format_snapshot(collect_diagnostics(new_alerts, self.config))
             suggestions = build_action_suggestions(new_alerts)
             action_plan = build_remediation_plan(new_alerts, self.config)
-            action_results = self.process_remediation_actions(action_plan)
+            action_results = self.process_remediation_actions(action_plan, new_alerts)
             remediation_text = format_action_plan(action_plan, action_results)
             analysis = f"{analysis}{suggestions}{diagnostics}{remediation_text}"
             self.storage.save_incident(severity, title, analysis, new_alerts)
@@ -93,13 +95,14 @@ class OpsScheduler:
             self.storage.save_incident("ok", title, text, recoveries)
             self.notifier.send(title, text, dedupe_key="recovered:" + problem_key(recoveries))
 
-    def process_remediation_actions(self, actions):
+    def process_remediation_actions(self, actions, context_results: list[CheckResult] | None = None):
         if not actions:
             return []
 
         remediation = dict(self.config.raw.get("remediation", {}))
         mode = str(remediation.get("mode", "suggest"))
         dry_run = mode != "auto"
+        context = context_from_results(context_results or [])
         results = []
         for action in actions:
             if mode == "off":
@@ -117,6 +120,9 @@ class OpsScheduler:
                 action.params,
                 result.output,
                 result.error,
+                environment=context.environment,
+                run_type=context.run_type,
+                trace_id=context.trace_id,
             )
             results.append(result)
         return results
@@ -190,6 +196,39 @@ def problem_key(problems: list[CheckResult]) -> str:
 
 def check_key(result: CheckResult) -> str:
     return f"{result.source}:{result.name}"
+
+
+def build_run_context(config: AppConfig) -> RunContext:
+    app = dict(config.app)
+    return RunContext(
+        environment=clean_context_value(app.get("environment"), "prod"),
+        run_type=clean_context_value(app.get("run_type"), "normal"),
+    )
+
+
+def context_from_results(results: list[CheckResult]) -> RunContext:
+    if not results:
+        return RunContext(trace_id="")
+    return RunContext(
+        environment=common_context_value([result.environment for result in results], "prod"),
+        run_type=common_context_value([result.run_type for result in results], "normal"),
+        trace_id=common_context_value([result.trace_id for result in results], ""),
+    )
+
+
+def common_context_value(values: list[str], default: str) -> str:
+    cleaned = [value for value in values if value]
+    if not cleaned:
+        return default
+    first = cleaned[0]
+    if all(value == first for value in cleaned):
+        return first
+    return "mixed"
+
+
+def clean_context_value(value: object, default: str) -> str:
+    text = str(value or "").strip()
+    return text or default
 
 
 def build_recovery_message(results: list[CheckResult]) -> str:

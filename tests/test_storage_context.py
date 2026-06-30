@@ -1,0 +1,84 @@
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+from ops_agent.events import CheckResult
+from ops_agent.storage import Storage
+
+
+class StorageContextTest(unittest.TestCase):
+    def test_save_results_persists_context_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            storage.save_results(
+                [
+                    CheckResult(
+                        source="http",
+                        name="Site",
+                        status="ok",
+                        summary="HTTP 200",
+                        environment="staging",
+                        run_type="synthetic_test",
+                        trace_id="trace-1",
+                    )
+                ]
+            )
+            rows = storage.latest_results()
+            storage.close()
+
+        self.assertEqual("staging", rows[0]["environment"])
+        self.assertEqual("synthetic_test", rows[0]["run_type"])
+        self.assertEqual("trace-1", rows[0]["trace_id"])
+
+    def test_existing_database_is_migrated_with_context_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ops.db"
+            connection = sqlite3.connect(db_path)
+            connection.executescript(
+                """
+                create table check_results (
+                    id integer primary key autoincrement,
+                    created_at text not null,
+                    source text not null,
+                    name text not null,
+                    status text not null,
+                    summary text not null,
+                    details_json text not null
+                );
+                create table incidents (
+                    id integer primary key autoincrement,
+                    created_at text not null,
+                    severity text not null,
+                    title text not null,
+                    analysis text not null,
+                    results_json text not null
+                );
+                create table action_logs (
+                    id integer primary key autoincrement,
+                    created_at text not null,
+                    action_type text not null,
+                    title text not null,
+                    risk text not null,
+                    status text not null,
+                    reason text not null,
+                    params_json text not null,
+                    output text not null,
+                    error text not null
+                );
+                """
+            )
+            connection.close()
+
+            storage = Storage(db_path)
+            storage.save_results([CheckResult(source="http", name="Site", status="ok", summary="HTTP 200")])
+            rows = storage.latest_results()
+            storage.close()
+
+        self.assertEqual("prod", rows[0]["environment"])
+        self.assertEqual("normal", rows[0]["run_type"])
+        self.assertIn("trace_id", rows[0])
+
+
+if __name__ == "__main__":
+    unittest.main()

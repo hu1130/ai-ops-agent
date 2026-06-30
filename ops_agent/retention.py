@@ -42,9 +42,27 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
     configured_problem_days = int(config.get("problem_results_days", max(90, check_days)))
     keep_problem_days = max(check_days, configured_problem_days)
     problem_cutoff = cutoff(now, keep_problem_days)
+    test_results_days = int(config.get("test_results_days", 7))
+    test_incidents_days = int(config.get("test_incidents_days", max(7, test_results_days)))
+    test_action_logs_days = int(config.get("test_action_logs_days", max(7, test_results_days)))
+    test_check_cutoff = cutoff(now, test_results_days)
+    test_incident_cutoff = cutoff(now, test_incidents_days)
+    test_action_cutoff = cutoff(now, test_action_logs_days)
+    test_environments = string_list(config.get("test_environments", ["test"]))
+    test_run_types = string_list(config.get("test_run_types", ["manual_test", "synthetic_test"]))
 
     if dry_run:
-        counts = storage.count_retention_candidates(check_cutoff, problem_cutoff, incident_cutoff, action_cutoff)
+        counts = storage.count_retention_candidates(
+            check_cutoff,
+            problem_cutoff,
+            incident_cutoff,
+            action_cutoff,
+            test_check_cutoff,
+            test_incident_cutoff,
+            test_action_cutoff,
+            test_environments,
+            test_run_types,
+        )
         return RetentionResult(
             deleted_check_results=counts["check_results"],
             deleted_incidents=counts["incidents"],
@@ -52,7 +70,17 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
             dry_run=True,
         )
 
-    deleted = storage.delete_retention_candidates(check_cutoff, problem_cutoff, incident_cutoff, action_cutoff)
+    deleted = storage.delete_retention_candidates(
+        check_cutoff,
+        problem_cutoff,
+        incident_cutoff,
+        action_cutoff,
+        test_check_cutoff,
+        test_incident_cutoff,
+        test_action_cutoff,
+        test_environments,
+        test_run_types,
+    )
     vacuumed = bool(config.get("vacuum", False)) and sum(deleted.values()) > 0
     if vacuumed:
         storage.vacuum()
@@ -67,6 +95,14 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
 
 def cutoff(now: datetime, days: int) -> str:
     return (now - timedelta(days=max(1, days))).isoformat()
+
+
+def string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return []
 
 
 def format_retention_result(result: RetentionResult) -> str:

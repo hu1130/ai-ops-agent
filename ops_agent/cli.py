@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig, load_config
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
-from ops_agent.events import CheckResult
+from ops_agent.events import CheckResult, RunContext
 from ops_agent.remediation.actions import RemediationAction
 from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action, format_action_plan
 from ops_agent.remediation.planner import build_remediation_plan
@@ -143,6 +143,7 @@ def main() -> int:
 def run_action_command(args: argparse.Namespace, config: AppConfig) -> int:
     action = build_cli_action(args)
     storage = open_storage(config)
+    context = build_cli_context(config)
 
     if action.action_type in MUTATING_ACTIONS and not args.execute:
         action_id = storage.save_action_log(
@@ -154,6 +155,9 @@ def run_action_command(args: argparse.Namespace, config: AppConfig) -> int:
             action.params,
             "等待人工确认。执行 approve-action --id 后才会尝试执行。",
             "",
+            environment=context.environment,
+            run_type=context.run_type,
+            trace_id=context.trace_id,
         )
         storage.close()
         print(f"动作已进入待确认队列: #{action_id}")
@@ -170,6 +174,9 @@ def run_action_command(args: argparse.Namespace, config: AppConfig) -> int:
         action.params,
         result.output,
         result.error,
+        environment=context.environment,
+        run_type=context.run_type,
+        trace_id=context.trace_id,
     )
     verification = verify_and_record(action_id, action, result.status, config, storage)
     storage.close()
@@ -274,6 +281,14 @@ def open_storage(config: AppConfig) -> Storage:
     return Storage(database_path)
 
 
+def build_cli_context(config: AppConfig) -> RunContext:
+    app = dict(config.app)
+    return RunContext(
+        environment=str(app.get("environment") or "prod").strip() or "prod",
+        run_type=str(app.get("cli_run_type") or "manual").strip() or "manual",
+    )
+
+
 def build_cli_action(args: argparse.Namespace) -> RemediationAction:
     verify_after = build_verify_after(args)
     if args.type == "check_port":
@@ -355,6 +370,10 @@ def action_from_log(row: dict) -> RemediationAction:
 def validate_config(config: AppConfig) -> list[str]:
     errors: list[str] = []
     validate_positive_int(config.app.get("interval_seconds", 60), "app.interval_seconds", errors)
+    validate_context_name(config.app.get("environment", "prod"), "app.environment", errors)
+    validate_context_name(config.app.get("run_type", "normal"), "app.run_type", errors)
+    if config.app.get("cli_run_type"):
+        validate_context_name(config.app.get("cli_run_type"), "app.cli_run_type", errors)
 
     for index, check in enumerate(config.http_checks):
         validate_url(str(check.get("url", "")), f"http_checks[{index}].url", errors)
@@ -398,6 +417,11 @@ def validate_config(config: AppConfig) -> list[str]:
         validate_positive_int(retention.get("problem_results_days", 90), "retention.problem_results_days", errors)
         validate_positive_int(retention.get("incidents_days", 90), "retention.incidents_days", errors)
         validate_positive_int(retention.get("action_logs_days", 90), "retention.action_logs_days", errors)
+        validate_positive_int(retention.get("test_results_days", 7), "retention.test_results_days", errors)
+        validate_positive_int(retention.get("test_incidents_days", 7), "retention.test_incidents_days", errors)
+        validate_positive_int(retention.get("test_action_logs_days", 7), "retention.test_action_logs_days", errors)
+        validate_string_list(retention.get("test_environments", ["test"]), "retention.test_environments", errors)
+        validate_string_list(retention.get("test_run_types", ["manual_test", "synthetic_test"]), "retention.test_run_types", errors)
         try:
             cleanup_hour = int(retention.get("cleanup_hour", 3))
         except (TypeError, ValueError):
@@ -430,6 +454,23 @@ def validate_positive_int(value: object, field: str, errors: list[str]) -> None:
         return
     if number <= 0:
         errors.append(f"{field} 必须大于 0")
+
+
+def validate_context_name(value: object, field: str, errors: list[str]) -> None:
+    text = str(value or "").strip()
+    if not text:
+        errors.append(f"{field} 不能为空")
+        return
+    if any(char.isspace() for char in text):
+        errors.append(f"{field} 不能包含空格")
+
+
+def validate_string_list(value: object, field: str, errors: list[str]) -> None:
+    if not isinstance(value, list):
+        errors.append(f"{field} 必须是数组")
+        return
+    if any(not str(item).strip() for item in value):
+        errors.append(f"{field} 不能包含空值")
 
 
 if __name__ == "__main__":
