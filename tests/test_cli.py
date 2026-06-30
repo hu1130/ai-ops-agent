@@ -42,6 +42,17 @@ class CliTest(unittest.TestCase):
         self.assertTrue(any("app.environment" in error for error in errors))
         self.assertTrue(any("retention.test_environments" in error for error in errors))
 
+    def test_validate_config_accepts_container_log_check(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60},
+                "log_checks": [{"name": "api", "container": "api-1"}],
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+            },
+            base_dir=Path("."),
+        )
+        self.assertEqual([], validate_config(config))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -389,9 +389,13 @@ def validate_config(config: AppConfig) -> list[str]:
         )
 
     for index, check in enumerate(config.log_checks):
+        container_value = str(check.get("container", "")).strip()
+        if container_value:
+            validate_context_name(container_value, f"log_checks[{index}].container", errors)
+            continue
         path_value = str(check.get("path", ""))
         if not path_value:
-            errors.append(f"log_checks[{index}].path 不能为空")
+            errors.append(f"log_checks[{index}].path 或 container 不能为空")
             continue
         path = config.resolve_path(path_value)
         if not path.exists():

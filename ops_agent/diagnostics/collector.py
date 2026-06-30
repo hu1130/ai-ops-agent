@@ -96,6 +96,18 @@ def collect_relevant_logs(results: list[CheckResult], config: AppConfig, options
         name = str(check.get("name", "log"))
         if log_names and name not in log_names:
             continue
+        container = str(check.get("container", "")).strip()
+        if container:
+            output = run_command(
+                ["docker", "logs", "--tail", str(max_lines), container],
+                int(options.get("command_timeout_seconds", 5)),
+            )
+            if not output:
+                lines.append(f"{name}: docker logs 为空 {container}")
+                continue
+            lines.append(f"{name} (container={container}) 最近 {min(max_lines, len(output.splitlines()))} 行")
+            lines.extend(indent_lines(output.splitlines()[-max_lines:]))
+            continue
         path_value = str(check.get("path", ""))
         if not path_value:
             continue

@@ -52,6 +52,33 @@ http://127.0.0.1:8765
 - 事件中心，可展开查看报警分析和诊断内容
 - 最近巡检记录
 
+## Docker 日志监控
+
+推荐按容器名配置 Docker 日志，不要写死 `/var/lib/docker/containers/...` 里的容器 ID 路径。容器重建后 ID 会变，容器名通常保持稳定。
+
+```json
+"log_checks": [
+  {
+    "name": "AI customer service API docker log",
+    "container": "ai-customer-service-api-1",
+    "tail_lines": 120,
+    "only_new": true,
+    "keywords": ["ERROR", "Exception", "Traceback", "timeout", "failed", "CRITICAL"]
+  }
+]
+```
+
+普通文件日志仍然可以继续用 `path`：
+
+```json
+{
+  "name": "Application log",
+  "path": "/opt/app/logs/server.log",
+  "tail_lines": 120,
+  "only_new": true
+}
+```
+
 只跑一次巡检：
 
 ```powershell
