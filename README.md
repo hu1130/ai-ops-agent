@@ -156,6 +156,42 @@ python -m ops_agent.cli --config .\config.json run-action --type restart_docker_
 
 真正的重启类动作验证完成后，会按告警配置发送自愈结果通知。
 
+## 数据保留和自动清理
+
+长期运行时，巡检记录会持续写入 SQLite。可以用 `retention` 配置自动清理过期数据：
+
+```json
+"retention": {
+  "enabled": true,
+  "check_results_days": 30,
+  "problem_results_days": 90,
+  "incidents_days": 90,
+  "action_logs_days": 90,
+  "cleanup_hour": 3,
+  "vacuum": false
+}
+```
+
+默认策略：
+
+- 正常巡检记录保留 30 天
+- warning/critical 巡检记录保留 90 天
+- 告警事件保留 90 天
+- 处置动作审计保留 90 天
+- 每天 03:00 自动执行一次
+
+手动预览将删除多少数据：
+
+```powershell
+python -m ops_agent.cli --config .\config.json retention-cleanup
+```
+
+真正执行清理：
+
+```powershell
+python -m ops_agent.cli --config .\config.json retention-cleanup --execute
+```
+
 ## 可选 AI 分析
 
 默认没有配置模型时，会使用内置规则分析。需要接入 OpenAI 兼容接口时设置环境变量：

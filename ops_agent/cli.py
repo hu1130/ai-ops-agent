@@ -13,6 +13,7 @@ from ops_agent.remediation.actions import RemediationAction
 from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action, format_action_plan
 from ops_agent.remediation.planner import build_remediation_plan
 from ops_agent.remediation.verifier import VerificationResult, verify_after_action
+from ops_agent.retention import format_retention_result, run_retention_cleanup
 from ops_agent.storage import Storage
 
 
@@ -45,6 +46,9 @@ def parse_args() -> argparse.Namespace:
     approve_parser.add_argument("--id", type=int, required=True, help="Action log id")
     approve_parser.add_argument("--by", default="operator", help="Approver name")
     approve_parser.add_argument("--execute", action="store_true", help="Required to execute after approval")
+
+    retention_parser = subparsers.add_parser("retention-cleanup", help="Preview or execute retention cleanup")
+    retention_parser.add_argument("--execute", action="store_true", help="Actually delete expired records")
 
     subparsers.add_parser("action-logs", help="Show latest remediation action audit logs")
     return parser.parse_args()
@@ -105,6 +109,13 @@ def main() -> int:
 
     if args.command == "approve-action":
         return approve_action_command(args, config)
+
+    if args.command == "retention-cleanup":
+        storage = open_storage(config)
+        result = run_retention_cleanup(storage, dict(config.raw.get("retention", {})), dry_run=not args.execute)
+        storage.close()
+        print(format_retention_result(result))
+        return 0
 
     if args.command == "action-logs":
         storage = open_storage(config)
@@ -380,6 +391,20 @@ def validate_config(config: AppConfig) -> list[str]:
         allowed_actions = remediation.get("allowed_actions", [])
         if allowed_actions and not isinstance(allowed_actions, list):
             errors.append("remediation.allowed_actions 必须是数组")
+
+    retention = dict(config.raw.get("retention", {}))
+    if retention:
+        validate_positive_int(retention.get("check_results_days", 30), "retention.check_results_days", errors)
+        validate_positive_int(retention.get("problem_results_days", 90), "retention.problem_results_days", errors)
+        validate_positive_int(retention.get("incidents_days", 90), "retention.incidents_days", errors)
+        validate_positive_int(retention.get("action_logs_days", 90), "retention.action_logs_days", errors)
+        try:
+            cleanup_hour = int(retention.get("cleanup_hour", 3))
+        except (TypeError, ValueError):
+            errors.append("retention.cleanup_hour 必须是数字")
+        else:
+            if cleanup_hour < 0 or cleanup_hour > 23:
+                errors.append("retention.cleanup_hour 必须在 0-23 之间")
 
     email = dict(alerts.get("email", {}))
     if email.get("enabled", False):

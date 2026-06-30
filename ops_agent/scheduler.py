@@ -17,6 +17,7 @@ from ops_agent.monitors.log_monitor import run_log_checks
 from ops_agent.monitors.server_monitor import run_server_checks
 from ops_agent.remediation.executor import execute_action, format_action_plan
 from ops_agent.remediation.planner import build_remediation_plan
+from ops_agent.retention import format_retention_result, run_retention_cleanup
 from ops_agent.storage import Storage
 
 
@@ -35,6 +36,7 @@ class OpsScheduler:
         self._last_run: dict[str, float] = {}
         self._issues: dict[str, IssueState] = {}
         self._last_daily_report_date: str = ""
+        self._last_retention_cleanup_date: str = ""
 
     def run_once(self, respect_intervals: bool = False) -> list[CheckResult]:
         cycle_started_at = time.time()
@@ -136,6 +138,21 @@ class OpsScheduler:
         self.notifier.send(title, build_daily_report(rows), dedupe_key=f"daily-report:{today}")
         self._last_daily_report_date = today
 
+    def run_retention_cleanup_if_due(self) -> None:
+        retention = dict(self.config.raw.get("retention", {}))
+        if not retention.get("enabled", False):
+            return
+
+        now = datetime.now()
+        cleanup_hour = int(retention.get("cleanup_hour", 3))
+        today = now.date().isoformat()
+        if now.hour != cleanup_hour or self._last_retention_cleanup_date == today:
+            return
+
+        result = run_retention_cleanup(self.storage, retention, dry_run=False)
+        print(format_retention_result(result))
+        self._last_retention_cleanup_date = today
+
     def due_checks(self, source: str, checks: list[dict], respect_intervals: bool, now: float) -> list[dict]:
         if not respect_intervals:
             return checks
@@ -159,6 +176,7 @@ class OpsScheduler:
             try:
                 results = self.run_once(respect_intervals=True)
                 self.send_daily_report_if_due()
+                self.run_retention_cleanup_if_due()
                 print(f"Check complete: {len(results)} result(s).")
             except Exception as exc:
                 print(f"Scheduler error: {exc}")

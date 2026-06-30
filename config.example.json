@@ -40,17 +40,19 @@
     "memory_percent_warn": 85,
     "disk_percent_warn": 90
   },
-  "log_checks": [
-    {
-      "name": "Application log",
-      "path": "logs/app.log",
-      "tail_lines": 200,
-      "keywords": ["ERROR", "Exception", "Traceback", "timeout", "failed"]
-    }
-  ],
+  "log_checks": [],
   "ai": {
     "enabled": true,
     "max_log_chars": 4000
+  },
+  "retention": {
+    "enabled": true,
+    "check_results_days": 30,
+    "problem_results_days": 90,
+    "incidents_days": 90,
+    "action_logs_days": 90,
+    "cleanup_hour": 3,
+    "vacuum": false
   },
   "remediation": {
     "enabled": true,

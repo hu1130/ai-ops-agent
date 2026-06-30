@@ -245,6 +245,58 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def count_retention_candidates(
+        self,
+        check_cutoff: str,
+        problem_cutoff: str,
+        incident_cutoff: str,
+        action_cutoff: str,
+    ) -> dict[str, int]:
+        with self.lock:
+            check_results = self.connection.execute(
+                """
+                select count(*) from check_results
+                where (created_at < ? and status = 'ok')
+                   or (created_at < ? and status in ('warning', 'critical'))
+                """,
+                (check_cutoff, problem_cutoff),
+            ).fetchone()[0]
+            incidents = self.connection.execute(
+                "select count(*) from incidents where created_at < ?",
+                (incident_cutoff,),
+            ).fetchone()[0]
+            action_logs = self.connection.execute(
+                "select count(*) from action_logs where created_at < ?",
+                (action_cutoff,),
+            ).fetchone()[0]
+        return {"check_results": int(check_results), "incidents": int(incidents), "action_logs": int(action_logs)}
+
+    def delete_retention_candidates(
+        self,
+        check_cutoff: str,
+        problem_cutoff: str,
+        incident_cutoff: str,
+        action_cutoff: str,
+    ) -> dict[str, int]:
+        with self.lock:
+            before = self.count_retention_candidates(check_cutoff, problem_cutoff, incident_cutoff, action_cutoff)
+            self.connection.execute(
+                """
+                delete from check_results
+                where (created_at < ? and status = 'ok')
+                   or (created_at < ? and status in ('warning', 'critical'))
+                """,
+                (check_cutoff, problem_cutoff),
+            )
+            self.connection.execute("delete from incidents where created_at < ?", (incident_cutoff,))
+            self.connection.execute("delete from action_logs where created_at < ?", (action_cutoff,))
+            self.connection.commit()
+        return before
+
+    def vacuum(self) -> None:
+        with self.lock:
+            self.connection.execute("vacuum")
+
     def recent_results(self, since_iso: str) -> list[dict]:
         with self.lock:
             rows = self.connection.execute(
