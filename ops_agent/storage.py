@@ -132,6 +132,22 @@ class Storage:
         for column, statement in additions.items():
             if column not in columns:
                 self.connection.execute(statement)
+        self.connection.execute(
+            """
+            update incidents
+            set status = 'resolved',
+                updated_at = coalesce(updated_at, created_at),
+                resolved_at = coalesce(resolved_at, created_at)
+            where severity = 'ok' and status = 'open'
+            """
+        )
+        self.connection.execute(
+            """
+            update incidents
+            set updated_at = coalesce(updated_at, created_at)
+            where updated_at is null
+            """
+        )
 
     def ensure_action_log_columns(self) -> None:
         columns = {

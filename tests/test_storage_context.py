@@ -54,6 +54,8 @@ class StorageContextTest(unittest.TestCase):
                     analysis text not null,
                     results_json text not null
                 );
+                insert into incidents (created_at, severity, title, analysis, results_json)
+                values ('2026-01-01T00:00:00+00:00', 'ok', 'recovered', 'ok', '[]');
                 create table action_logs (
                     id integer primary key autoincrement,
                     created_at text not null,
@@ -73,6 +75,7 @@ class StorageContextTest(unittest.TestCase):
             storage = Storage(db_path)
             storage.save_results([CheckResult(source="http", name="Site", status="ok", summary="HTTP 200")])
             rows = storage.latest_results()
+            recovered_incident = storage.latest_incidents(1)[0]
             incident_events_exists = storage.connection.execute(
                 "select name from sqlite_master where type = 'table' and name = 'incident_events'"
             ).fetchone()
@@ -81,6 +84,7 @@ class StorageContextTest(unittest.TestCase):
         self.assertEqual("prod", rows[0]["environment"])
         self.assertEqual("normal", rows[0]["run_type"])
         self.assertIn("trace_id", rows[0])
+        self.assertEqual("resolved", recovered_incident["status"])
         self.assertIsNotNone(incident_events_exists)
 
 
