@@ -114,7 +114,9 @@ class OpsScheduler:
         for incident_id, repeated_results in repeated_by_incident.items():
             updated = self.update_existing_incident(incident_id, repeated_results)
             if updated:
-                self.send_repeated_alert_if_due(updated, repeated_results)
+                escalated = self.send_escalation_alert_if_due(updated, repeated_results)
+                if not escalated:
+                    self.send_repeated_alert_if_due(updated, repeated_results)
 
         if new_alerts:
             severity = "critical" if any(item.status == "critical" for item in new_alerts) else "warning"
@@ -127,7 +129,9 @@ class OpsScheduler:
                 for result in new_alerts:
                     self._issues[check_key(result)].incident_id = incident_id
                 if updated:
-                    self.send_repeated_alert_if_due(updated, new_alerts)
+                    escalated = self.send_escalation_alert_if_due(updated, new_alerts)
+                    if not escalated:
+                        self.send_repeated_alert_if_due(updated, new_alerts)
                 new_alerts = []
 
         if new_alerts:
@@ -163,6 +167,7 @@ class OpsScheduler:
                     metadata={"action_statuses": [item.status for item in action_results]},
                 )
             self.notifier.send(title, analysis, dedupe_key=problem_key(new_alerts))
+            self.send_action_failure_escalation_if_needed(incident_id, action_results, new_alerts)
 
         if recoveries:
             title = f"Ops Agent recovered {len(recoveries)} issue(s)"
@@ -200,22 +205,78 @@ class OpsScheduler:
         except ValueError:
             return None
 
-    def send_repeated_alert_if_due(self, incident: dict, results: list[CheckResult]) -> None:
+    def send_repeated_alert_if_due(self, incident: dict, results: list[CheckResult]) -> bool:
         alerts = self.config.alerts
         if not alerts.get("repeat_notification_enabled", True):
-            return
+            return False
         interval_seconds = int(alerts.get("repeat_notification_interval_seconds", 3600))
         if interval_seconds <= 0:
-            return
+            return False
         now = datetime.now(timezone.utc)
         if not incident_notification_due(incident, interval_seconds, now):
-            return
+            return False
 
         incident_id = int(incident["id"])
         title = f"Ops Agent repeated issue reminder #{incident_id}"
         text = build_repeated_alert_message(incident, results, interval_seconds)
         if self.notifier.send(title, text, dedupe_key=f"repeated:{incident_id}"):
             self.storage.update_incident_notification(incident_id, kind="repeat")
+            return True
+        return False
+
+    def send_escalation_alert_if_due(self, incident: dict, results: list[CheckResult]) -> bool:
+        alerts = self.config.alerts
+        if not alerts.get("escalation_enabled", True):
+            return False
+        decision = escalation_decision(incident, alerts)
+        if not decision:
+            return False
+
+        incident_id = int(incident["id"])
+        title = f"[升级] Ops Agent incident #{incident_id} requires attention"
+        text = build_escalation_message(incident, results, decision)
+        if not self.notifier.send(title, text, dedupe_key=f"escalation:{incident_id}:{decision['level']}"):
+            return False
+        self.storage.escalate_incident(
+            incident_id,
+            int(decision["level"]),
+            str(decision["reason"]),
+            metadata=decision,
+        )
+        return True
+
+    def send_action_failure_escalation_if_needed(
+        self,
+        incident_id: int,
+        action_results: list[ActionResult],
+        context_results: list[CheckResult],
+    ) -> bool:
+        if not self.config.alerts.get("escalation_enabled", True):
+            return False
+        failed_results = [result for result in action_results if action_failed(result)]
+        if not failed_results:
+            return False
+        incident = self.storage.get_incident(incident_id)
+        if not incident or int(incident.get("escalation_level") or 0) >= 1:
+            return False
+        decision = {
+            "level": 1,
+            "reason": f"{len(failed_results)} remediation action(s) failed",
+            "rule": "remediation_action_failed",
+            "failed_actions": [result.action.title for result in failed_results],
+            "action_statuses": [result.status for result in action_results],
+        }
+        title = f"[升级] Ops Agent incident #{incident_id} requires attention"
+        text = build_action_failure_escalation_message(incident, context_results, failed_results, decision)
+        if not self.notifier.send(title, text, dedupe_key=f"escalation:{incident_id}:action-failure"):
+            return False
+        self.storage.escalate_incident(
+            incident_id,
+            int(decision["level"]),
+            str(decision["reason"]),
+            metadata=decision,
+        )
+        return True
 
     def process_remediation_actions(
         self,
@@ -546,6 +607,91 @@ def build_repeated_alert_message(incident: dict, results: list[CheckResult], int
     ]
     for result in results:
         lines.append(f"- [{result.status.upper()}] {result.source}/{result.name}: {result.summary}")
+    return "\n".join(lines)
+
+
+def escalation_decision(
+    incident: dict,
+    alerts: dict,
+    now: datetime | None = None,
+) -> dict | None:
+    if int(incident.get("escalation_level") or 0) >= 1:
+        return None
+
+    now = now or datetime.now(timezone.utc)
+    first_seen = parse_datetime(str(incident.get("first_seen_at") or incident.get("created_at") or ""))
+    age_seconds = int((now - first_seen).total_seconds()) if first_seen else 0
+    age_threshold = int(alerts.get("escalation_after_seconds", 1800))
+    if age_threshold > 0 and age_seconds >= age_threshold:
+        return {
+            "level": 1,
+            "reason": f"incident active for {age_seconds} seconds",
+            "rule": "active_duration",
+            "age_seconds": age_seconds,
+            "threshold_seconds": age_threshold,
+        }
+
+    critical_threshold = int(alerts.get("escalation_critical_occurrences", 10))
+    occurrence_count = int(incident.get("occurrence_count") or 0)
+    if (
+        critical_threshold > 0
+        and str(incident.get("severity") or "") == "critical"
+        and occurrence_count >= critical_threshold
+    ):
+        return {
+            "level": 1,
+            "reason": f"critical incident occurred {occurrence_count} times",
+            "rule": "critical_occurrences",
+            "occurrence_count": occurrence_count,
+            "threshold_count": critical_threshold,
+        }
+    return None
+
+
+def build_escalation_message(incident: dict, results: list[CheckResult], decision: dict) -> str:
+    lines = [
+        "事件升级提醒",
+        "",
+        f"事件: #{incident.get('id')} {incident.get('title', '')}",
+        f"升级级别: L{decision.get('level')}",
+        f"升级原因: {decision.get('reason')}",
+        f"严重级别: {incident.get('severity', '')}",
+        f"当前状态: {incident.get('status', '')}",
+        f"累计出现次数: {incident.get('occurrence_count', 0)}",
+        f"首次出现: {incident.get('first_seen_at', '')}",
+        f"最近出现: {incident.get('last_seen_at', '')}",
+        f"最近摘要: {incident.get('last_summary', '')}",
+        "",
+        "本轮异常:",
+    ]
+    for result in results:
+        lines.append(f"- [{result.status.upper()}] {result.source}/{result.name}: {result.summary}")
+    lines.extend(
+        [
+            "",
+            "建议处理:",
+            "1. 优先人工确认影响范围和最近发布/配置变更。",
+            "2. 查看事件关联的处置动作和验证结果。",
+            "3. 如果确认是生产影响，按内部流程处理并在事件中心记录状态。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_action_failure_escalation_message(
+    incident: dict,
+    results: list[CheckResult],
+    failed_results: list[ActionResult],
+    decision: dict,
+) -> str:
+    lines = build_escalation_message(incident, results, decision).splitlines()
+    lines.extend(["", "失败动作:"])
+    for result in failed_results:
+        lines.append(f"- [{result.status}] {result.action.title}")
+        if result.error:
+            lines.append(f"  错误: {result.error}")
+        if result.output:
+            lines.append(f"  输出: {result.output}")
     return "\n".join(lines)
 
 

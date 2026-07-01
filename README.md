@@ -288,8 +288,17 @@ python -m ops_agent.cli --config .\config.json run-action --type restart_docker_
 - `last_seen_at`: 最近出现时间
 - `last_summary`: 最近一次异常摘要
 - `last_notification_at`: 最近一次对该事件发出通知的时间
+- `escalated_at`: 最近一次升级时间
+- `escalation_level`: 当前升级级别
 
 持续异常不会每轮都打扰。默认只在首次创建事件时通知，之后同一事件继续异常时，每隔 `alerts.repeat_notification_interval_seconds` 秒最多发送一次持续异常提醒。
+
+升级策略不要求新通知渠道。没有飞书、短信或电话时，会继续使用当前邮件/webhook，只是标题改为 `[升级] ...`，并把升级记录写入 `incident_events`。默认规则：
+
+- 同一 active 事件持续 30 分钟未恢复，升级提醒
+- `critical` 事件累计出现 10 次，升级提醒
+- 自动处置动作失败，升级提醒
+- 每个事件同一级别只升级一次，避免重复打扰
 
 恢复闭环不只依赖进程内存。服务重启后，如果数据库里还有 active 事件，调度器会用事件指纹匹配当前健康结果；只有该事件关联的所有监控目标都在本轮恢复正常时，才会自动转为 `resolved` 并发送恢复通知。
 
@@ -543,13 +552,18 @@ $env:OPENAI_MODEL="gpt-4.1-mini"
   "consecutive_failures": 2,
   "recovery_enabled": true,
   "repeat_notification_enabled": true,
-  "repeat_notification_interval_seconds": 3600
+  "repeat_notification_interval_seconds": 3600,
+  "escalation_enabled": true,
+  "escalation_after_seconds": 1800,
+  "escalation_critical_occurrences": 10
 }
 ```
 
 - `cooldown_seconds`: 通知器层面的同类消息冷却时间
 - `consecutive_failures`: 连续失败多少次才创建告警事件
 - `repeat_notification_interval_seconds`: 同一 active 事件持续异常时，至少间隔多久再次提醒
+- `escalation_after_seconds`: 同一 active 事件持续多久未恢复后升级
+- `escalation_critical_occurrences`: `critical` 事件累计出现多少次后升级
 
 ## 目录
 

@@ -229,6 +229,181 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertEqual(2, updated["occurrence_count"])
         self.assertEqual("initial", updated["last_notification_kind"])
 
+    def test_repeated_problem_escalates_after_active_duration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {
+                        "consecutive_failures": 1,
+                        "recovery_enabled": True,
+                        "repeat_notification_enabled": True,
+                        "repeat_notification_interval_seconds": 60,
+                        "escalation_enabled": True,
+                        "escalation_after_seconds": 300,
+                        "escalation_critical_occurrences": 10,
+                    },
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            problem = CheckResult(source="http", name="Site", status="warning", summary="Slow")
+            scheduler.process_alert_states([problem])
+            incident = storage.latest_incidents(1)[0]
+            old_first_seen = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+            storage.connection.execute(
+                """
+                update incidents
+                set first_seen_at = ?, last_notification_at = ?
+                where id = ?
+                """,
+                (old_first_seen, old_first_seen, incident["id"]),
+            )
+            storage.connection.commit()
+
+            scheduler.process_alert_states([problem])
+            escalated = storage.get_incident(incident["id"])
+            events = storage.latest_incident_events(incident["id"])
+            storage.close()
+
+        self.assertEqual(2, len(notifier.sent))
+        self.assertEqual("[升级] Ops Agent incident #1 requires attention", notifier.sent[1][0])
+        self.assertIn("事件升级提醒", notifier.sent[1][1])
+        self.assertEqual(1, escalated["escalation_level"])
+        self.assertEqual("escalation", escalated["last_notification_kind"])
+        self.assertTrue(any(event["note"] == "incident escalated" for event in events))
+
+    def test_critical_repeated_problem_escalates_by_occurrence_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {
+                        "consecutive_failures": 1,
+                        "recovery_enabled": True,
+                        "repeat_notification_enabled": True,
+                        "repeat_notification_interval_seconds": 60,
+                        "escalation_enabled": True,
+                        "escalation_after_seconds": 86400,
+                        "escalation_critical_occurrences": 3,
+                    },
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            problem = CheckResult(source="http", name="Site", status="critical", summary="Request failed")
+            scheduler.process_alert_states([problem])
+            incident = storage.latest_incidents(1)[0]
+            old_notification = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+            storage.connection.execute(
+                """
+                update incidents
+                set occurrence_count = 2, last_notification_at = ?
+                where id = ?
+                """,
+                (old_notification, incident["id"]),
+            )
+            storage.connection.commit()
+
+            scheduler.process_alert_states([problem])
+            escalated = storage.get_incident(incident["id"])
+            storage.close()
+
+        self.assertEqual(2, len(notifier.sent))
+        self.assertIn("critical incident occurred 3 times", notifier.sent[1][1])
+        self.assertEqual(1, escalated["escalation_level"])
+        self.assertIn("critical incident occurred 3 times", escalated["escalation_reason"])
+
+    def test_escalation_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {
+                        "consecutive_failures": 1,
+                        "recovery_enabled": True,
+                        "repeat_notification_enabled": False,
+                        "escalation_enabled": False,
+                        "escalation_after_seconds": 300,
+                        "escalation_critical_occurrences": 3,
+                    },
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            problem = CheckResult(source="http", name="Site", status="critical", summary="Request failed")
+            scheduler.process_alert_states([problem])
+            incident = storage.latest_incidents(1)[0]
+            old_first_seen = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+            storage.connection.execute(
+                "update incidents set first_seen_at = ?, occurrence_count = 9 where id = ?",
+                (old_first_seen, incident["id"]),
+            )
+            storage.connection.commit()
+            scheduler.process_alert_states([problem])
+            not_escalated = storage.get_incident(incident["id"])
+            storage.close()
+
+        self.assertEqual(1, len(notifier.sent))
+        self.assertEqual(0, not_escalated["escalation_level"])
+
+    def test_failed_auto_remediation_escalates_on_same_notifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {
+                        "consecutive_failures": 1,
+                        "recovery_enabled": True,
+                        "escalation_enabled": True,
+                    },
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {"enabled": False},
+                    "remediation": {
+                        "enabled": True,
+                        "mode": "auto",
+                        "allowed_actions": ["check_port"],
+                        "actions": {"check_port": {"auto_execute": True}},
+                    },
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            scheduler.process_alert_states(
+                [
+                    CheckResult(
+                        source="http",
+                        name="Site",
+                        status="critical",
+                        summary="Request failed",
+                        details={"url": "http://127.0.0.1:1"},
+                    )
+                ]
+            )
+            incident = storage.latest_incidents(1)[0]
+            events = storage.latest_incident_events(incident["id"])
+            storage.close()
+
+        self.assertEqual(2, len(notifier.sent))
+        self.assertEqual("Ops Agent detected 1 issue(s)", notifier.sent[0][0])
+        self.assertEqual("[升级] Ops Agent incident #1 requires attention", notifier.sent[1][0])
+        self.assertIn("remediation action(s) failed", notifier.sent[1][1])
+        self.assertEqual(1, incident["escalation_level"])
+        self.assertTrue(any(event["note"] == "incident escalated" for event in events))
+
     def test_existing_open_incident_is_merged_after_scheduler_restart(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AppConfig(

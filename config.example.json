@@ -263,6 +263,9 @@
     "recovery_enabled": true,
     "repeat_notification_enabled": true,
     "repeat_notification_interval_seconds": 3600,
+    "escalation_enabled": true,
+    "escalation_after_seconds": 1800,
+    "escalation_critical_occurrences": 10,
     "daily_report": {
       "enabled": true,
       "hour": 9,

@@ -56,6 +56,9 @@ class Storage:
                     last_summary text not null default '',
                     last_notification_at text,
                     last_notification_kind text not null default '',
+                    escalated_at text,
+                    escalation_level integer not null default 0,
+                    escalation_reason text not null default '',
                     status text not null default 'open',
                     severity text not null,
                     title text not null,
@@ -167,6 +170,9 @@ class Storage:
             "last_summary": "alter table incidents add column last_summary text not null default ''",
             "last_notification_at": "alter table incidents add column last_notification_at text",
             "last_notification_kind": "alter table incidents add column last_notification_kind text not null default ''",
+            "escalated_at": "alter table incidents add column escalated_at text",
+            "escalation_level": "alter table incidents add column escalation_level integer not null default 0",
+            "escalation_reason": "alter table incidents add column escalation_reason text not null default ''",
             "status": "alter table incidents add column status text not null default 'open'",
             "acknowledged_at": "alter table incidents add column acknowledged_at text",
             "acknowledged_by": "alter table incidents add column acknowledged_by text",
@@ -458,6 +464,54 @@ class Storage:
         if not row:
             raise ValueError(f"incident not found: {incident_id}")
         return dict(row)
+
+    def escalate_incident(
+        self,
+        incident_id: int,
+        level: int,
+        reason: str,
+        metadata: dict | None = None,
+    ) -> dict:
+        now = utc_now_iso()
+        with self.lock:
+            row = self.connection.execute(
+                "select * from incidents where id = ?",
+                (incident_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"incident not found: {incident_id}")
+            current_level = int(row["escalation_level"] or 0)
+            if current_level >= level:
+                return dict(row)
+            current_status = str(row["status"])
+            self.connection.execute(
+                """
+                update incidents
+                set updated_at = ?,
+                    escalated_at = ?,
+                    escalation_level = ?,
+                    escalation_reason = ?,
+                    last_notification_at = ?,
+                    last_notification_kind = 'escalation'
+                where id = ?
+                """,
+                (now, now, level, reason, now, incident_id),
+            )
+            self.record_incident_event(
+                incident_id,
+                current_status,
+                current_status,
+                "scheduler",
+                "incident escalated",
+                {"level": level, "reason": reason, **(metadata or {})},
+                commit=False,
+            )
+            self.connection.commit()
+            updated = self.connection.execute(
+                "select * from incidents where id = ?",
+                (incident_id,),
+            ).fetchone()
+        return dict(updated)
 
     def latest_results(self, limit: int = 50) -> list[dict]:
         with self.lock:
