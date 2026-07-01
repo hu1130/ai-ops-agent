@@ -54,6 +54,8 @@ class Storage:
                     first_seen_at text,
                     last_seen_at text,
                     last_summary text not null default '',
+                    last_notification_at text,
+                    last_notification_kind text not null default '',
                     status text not null default 'open',
                     severity text not null,
                     title text not null,
@@ -163,6 +165,8 @@ class Storage:
             "first_seen_at": "alter table incidents add column first_seen_at text",
             "last_seen_at": "alter table incidents add column last_seen_at text",
             "last_summary": "alter table incidents add column last_summary text not null default ''",
+            "last_notification_at": "alter table incidents add column last_notification_at text",
+            "last_notification_kind": "alter table incidents add column last_notification_kind text not null default ''",
             "status": "alter table incidents add column status text not null default 'open'",
             "acknowledged_at": "alter table incidents add column acknowledged_at text",
             "acknowledged_by": "alter table incidents add column acknowledged_by text",
@@ -194,7 +198,8 @@ class Storage:
             update incidents
             set first_seen_at = coalesce(first_seen_at, created_at),
                 last_seen_at = coalesce(last_seen_at, updated_at, created_at),
-                last_summary = coalesce(nullif(last_summary, ''), title)
+                last_summary = coalesce(nullif(last_summary, ''), title),
+                last_notification_at = coalesce(last_notification_at, created_at)
             """
         )
 
@@ -286,10 +291,11 @@ class Storage:
                 """
                 insert into incidents (
                     created_at, updated_at, environment, run_type, trace_id,
-                    fingerprint, occurrence_count, first_seen_at, last_seen_at, last_summary, status,
+                    fingerprint, occurrence_count, first_seen_at, last_seen_at, last_summary,
+                    last_notification_at, last_notification_kind, status,
                     severity, title, analysis, results_json, resolved_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     created_at,
@@ -302,6 +308,8 @@ class Storage:
                     created_at,
                     created_at,
                     last_summary,
+                    created_at,
+                    "initial",
                     incident_status,
                     severity,
                     title,
@@ -428,6 +436,28 @@ class Storage:
                 (incident_id,),
             ).fetchone()
         return dict(updated)
+
+    def update_incident_notification(self, incident_id: int, kind: str = "repeat") -> dict:
+        now = utc_now_iso()
+        with self.lock:
+            self.connection.execute(
+                """
+                update incidents
+                set updated_at = ?,
+                    last_notification_at = ?,
+                    last_notification_kind = ?
+                where id = ?
+                """,
+                (now, now, kind, incident_id),
+            )
+            self.connection.commit()
+            row = self.connection.execute(
+                "select * from incidents where id = ?",
+                (incident_id,),
+            ).fetchone()
+        if not row:
+            raise ValueError(f"incident not found: {incident_id}")
+        return dict(row)
 
     def latest_results(self, limit: int = 50) -> list[dict]:
         with self.lock:

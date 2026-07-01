@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ops_agent.alerts.notifier import Notifier
@@ -124,6 +125,109 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertEqual(1, len(incidents))
         self.assertEqual(2, incidents[0]["occurrence_count"])
         self.assertEqual(1, len(notifier.sent))
+
+    def test_repeated_problem_sends_reminder_after_repeat_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {
+                        "consecutive_failures": 1,
+                        "recovery_enabled": True,
+                        "repeat_notification_enabled": True,
+                        "repeat_notification_interval_seconds": 60,
+                    },
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            problem = CheckResult(source="http", name="Site", status="critical", summary="Request failed")
+            scheduler.process_alert_states([problem])
+            incident = storage.latest_incidents(1)[0]
+            old_notification = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+            storage.connection.execute(
+                "update incidents set last_notification_at = ? where id = ?",
+                (old_notification, incident["id"]),
+            )
+            storage.connection.commit()
+
+            scheduler.process_alert_states([problem])
+            updated = storage.get_incident(incident["id"])
+            storage.close()
+
+        self.assertEqual(2, len(notifier.sent))
+        self.assertEqual("Ops Agent repeated issue reminder #1", notifier.sent[1][0])
+        self.assertIn("累计出现次数: 2", notifier.sent[1][1])
+        self.assertEqual("repeat", updated["last_notification_kind"])
+
+    def test_repeated_problem_does_not_send_reminder_before_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {
+                        "consecutive_failures": 1,
+                        "recovery_enabled": True,
+                        "repeat_notification_enabled": True,
+                        "repeat_notification_interval_seconds": 3600,
+                    },
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            problem = CheckResult(source="http", name="Site", status="critical", summary="Request failed")
+            scheduler.process_alert_states([problem])
+            scheduler.process_alert_states([problem])
+            updated = storage.latest_incidents(1)[0]
+            storage.close()
+
+        self.assertEqual(1, len(notifier.sent))
+        self.assertEqual(2, updated["occurrence_count"])
+        self.assertEqual("initial", updated["last_notification_kind"])
+
+    def test_repeated_problem_reminder_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {
+                        "consecutive_failures": 1,
+                        "recovery_enabled": True,
+                        "repeat_notification_enabled": False,
+                        "repeat_notification_interval_seconds": 60,
+                    },
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            problem = CheckResult(source="http", name="Site", status="critical", summary="Request failed")
+            scheduler.process_alert_states([problem])
+            incident = storage.latest_incidents(1)[0]
+            old_notification = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+            storage.connection.execute(
+                "update incidents set last_notification_at = ? where id = ?",
+                (old_notification, incident["id"]),
+            )
+            storage.connection.commit()
+            scheduler.process_alert_states([problem])
+            updated = storage.get_incident(incident["id"])
+            storage.close()
+
+        self.assertEqual(1, len(notifier.sent))
+        self.assertEqual(2, updated["occurrence_count"])
+        self.assertEqual("initial", updated["last_notification_kind"])
 
     def test_existing_open_incident_is_merged_after_scheduler_restart(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

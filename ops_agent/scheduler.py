@@ -112,7 +112,9 @@ class OpsScheduler:
                             existing_recovery_keys.add(target_key)
 
         for incident_id, repeated_results in repeated_by_incident.items():
-            self.update_existing_incident(incident_id, repeated_results)
+            updated = self.update_existing_incident(incident_id, repeated_results)
+            if updated:
+                self.send_repeated_alert_if_due(updated, repeated_results)
 
         if new_alerts:
             severity = "critical" if any(item.status == "critical" for item in new_alerts) else "warning"
@@ -121,9 +123,11 @@ class OpsScheduler:
             existing = self.storage.find_active_incident_by_fingerprint(fingerprint)
             if existing:
                 incident_id = int(existing["id"])
-                self.update_existing_incident(incident_id, new_alerts, severity=severity, title=title)
+                updated = self.update_existing_incident(incident_id, new_alerts, severity=severity, title=title)
                 for result in new_alerts:
                     self._issues[check_key(result)].incident_id = incident_id
+                if updated:
+                    self.send_repeated_alert_if_due(updated, new_alerts)
                 new_alerts = []
 
         if new_alerts:
@@ -180,13 +184,13 @@ class OpsScheduler:
         results: list[CheckResult],
         severity: str = "",
         title: str = "",
-    ) -> None:
+    ) -> dict | None:
         if not results:
-            return
+            return None
         merged_severity = severity or ("critical" if any(item.status == "critical" for item in results) else "warning")
         merged_title = title or f"Ops Agent detected {len(results)} issue(s)"
         try:
-            self.storage.update_incident_occurrence(
+            return self.storage.update_incident_occurrence(
                 incident_id,
                 merged_severity,
                 merged_title,
@@ -194,7 +198,24 @@ class OpsScheduler:
                 increment=len(results),
             )
         except ValueError:
+            return None
+
+    def send_repeated_alert_if_due(self, incident: dict, results: list[CheckResult]) -> None:
+        alerts = self.config.alerts
+        if not alerts.get("repeat_notification_enabled", True):
             return
+        interval_seconds = int(alerts.get("repeat_notification_interval_seconds", 3600))
+        if interval_seconds <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        if not incident_notification_due(incident, interval_seconds, now):
+            return
+
+        incident_id = int(incident["id"])
+        title = f"Ops Agent repeated issue reminder #{incident_id}"
+        text = build_repeated_alert_message(incident, results, interval_seconds)
+        if self.notifier.send(title, text, dedupe_key=f"repeated:{incident_id}"):
+            self.storage.update_incident_notification(incident_id, kind="repeat")
 
     def process_remediation_actions(
         self,
@@ -488,6 +509,44 @@ def incident_status_from_action_results(action_results) -> str:
 
 def action_failed(result: ActionResult) -> bool:
     return result.status in {"failed", "verified_failed"}
+
+
+def incident_notification_due(incident: dict, interval_seconds: int, now: datetime | None = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    last = parse_datetime(str(incident.get("last_notification_at") or incident.get("created_at") or ""))
+    if not last:
+        return True
+    return (now - last).total_seconds() >= interval_seconds
+
+
+def parse_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def build_repeated_alert_message(incident: dict, results: list[CheckResult], interval_seconds: int) -> str:
+    lines = [
+        "持续异常提醒",
+        "",
+        f"事件: #{incident.get('id')} {incident.get('title', '')}",
+        f"严重级别: {incident.get('severity', '')}",
+        f"当前状态: {incident.get('status', '')}",
+        f"累计出现次数: {incident.get('occurrence_count', 0)}",
+        f"最近摘要: {incident.get('last_summary', '')}",
+        f"提醒间隔: {interval_seconds} 秒",
+        "",
+        "本轮异常:",
+    ]
+    for result in results:
+        lines.append(f"- [{result.status.upper()}] {result.source}/{result.name}: {result.summary}")
+    return "\n".join(lines)
 
 
 def build_recovery_message(results: list[CheckResult]) -> str:

@@ -581,6 +581,11 @@ def validate_config(config: AppConfig) -> list[str]:
     alerts = config.alerts
     validate_positive_int(alerts.get("consecutive_failures", 2), "alerts.consecutive_failures", errors)
     validate_positive_int(alerts.get("cooldown_seconds", 300), "alerts.cooldown_seconds", errors)
+    validate_positive_int(
+        alerts.get("repeat_notification_interval_seconds", 3600),
+        "alerts.repeat_notification_interval_seconds",
+        errors,
+    )
 
     remediation = dict(config.raw.get("remediation", {}))
     if remediation:

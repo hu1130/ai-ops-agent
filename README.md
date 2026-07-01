@@ -287,6 +287,9 @@ python -m ops_agent.cli --config .\config.json run-action --type restart_docker_
 - `first_seen_at`: 首次出现时间
 - `last_seen_at`: 最近出现时间
 - `last_summary`: 最近一次异常摘要
+- `last_notification_at`: 最近一次对该事件发出通知的时间
+
+持续异常不会每轮都打扰。默认只在首次创建事件时通知，之后同一事件继续异常时，每隔 `alerts.repeat_notification_interval_seconds` 秒最多发送一次持续异常提醒。
 
 恢复闭环不只依赖进程内存。服务重启后，如果数据库里还有 active 事件，调度器会用事件指纹匹配当前健康结果；只有该事件关联的所有监控目标都在本轮恢复正常时，才会自动转为 `resolved` 并发送恢复通知。
 
@@ -531,6 +534,22 @@ $env:OPENAI_MODEL="gpt-4.1-mini"
 支持普通 JSON webhook。飞书、企业微信、钉钉可以通过机器人 webhook 接入。
 
 也支持 SMTP 邮件告警，QQ 邮箱需要使用 SMTP 授权码，不要使用登录密码。真实密码和授权码不要提交到 Git 仓库。
+
+告警降噪配置：
+
+```json
+"alerts": {
+  "cooldown_seconds": 300,
+  "consecutive_failures": 2,
+  "recovery_enabled": true,
+  "repeat_notification_enabled": true,
+  "repeat_notification_interval_seconds": 3600
+}
+```
+
+- `cooldown_seconds`: 通知器层面的同类消息冷却时间
+- `consecutive_failures`: 连续失败多少次才创建告警事件
+- `repeat_notification_interval_seconds`: 同一 active 事件持续异常时，至少间隔多久再次提醒
 
 ## 目录
 
