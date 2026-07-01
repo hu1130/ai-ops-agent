@@ -66,6 +66,8 @@ def parse_args() -> argparse.Namespace:
 
     action_logs_parser = subparsers.add_parser("action-logs", help="Show latest remediation action audit logs")
     action_logs_parser.add_argument("--incident-id", type=int, default=0, help="Filter by incident id")
+    audit_logs_parser = subparsers.add_parser("audit-logs", help="Show latest API operation audit logs")
+    audit_logs_parser.add_argument("--limit", type=int, default=20, help="Number of audit rows to show")
     return parser.parse_args()
 
 
@@ -165,6 +167,26 @@ def main() -> int:
                 print(f"  error: {row['error']}")
             if row.get("verify_output"):
                 print(f"  verify: {row['verify_output']}")
+        return 0
+
+    if args.command == "audit-logs":
+        storage = open_storage(config)
+        rows = storage.latest_api_audit_logs(args.limit)
+        storage.close()
+        if not rows:
+            print("暂无 API 操作审计日志。")
+            return 0
+        for row in rows:
+            target = row.get("target_type") or "-"
+            if row.get("target_id") is not None:
+                target = f"{target}#{row['target_id']}"
+            print(
+                f"#{row['id']} [{row['created_at']}] {row['outcome']} "
+                f"{row['method']} {row['operation']} target={target} "
+                f"actor={row['actor'] or '-'} ip={row['source_ip'] or '-'} status={row['status_code']}"
+            )
+            if row.get("message"):
+                print(f"  message: {row['message']}")
         return 0
 
     return 2
@@ -576,9 +598,15 @@ def validate_config(config: AppConfig) -> list[str]:
         validate_positive_int(retention.get("problem_results_days", 90), "retention.problem_results_days", errors)
         validate_positive_int(retention.get("incidents_days", 90), "retention.incidents_days", errors)
         validate_positive_int(retention.get("action_logs_days", 90), "retention.action_logs_days", errors)
+        validate_positive_int(retention.get("api_audit_logs_days", 180), "retention.api_audit_logs_days", errors)
         validate_positive_int(retention.get("test_results_days", 7), "retention.test_results_days", errors)
         validate_positive_int(retention.get("test_incidents_days", 7), "retention.test_incidents_days", errors)
         validate_positive_int(retention.get("test_action_logs_days", 7), "retention.test_action_logs_days", errors)
+        validate_positive_int(
+            retention.get("test_api_audit_logs_days", 7),
+            "retention.test_api_audit_logs_days",
+            errors,
+        )
         validate_string_list(retention.get("test_environments", ["test"]), "retention.test_environments", errors)
         validate_string_list(retention.get("test_run_types", ["manual_test", "synthetic_test"]), "retention.test_run_types", errors)
         try:

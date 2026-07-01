@@ -355,6 +355,7 @@ Authorization: Bearer replace-with-a-long-random-token
 
 ```text
 GET  /api/action-logs
+GET  /api/audit-logs
 GET  /api/actions/pending
 GET  /api/actions/1
 POST /api/actions/1/approve
@@ -377,6 +378,14 @@ POST /api/actions/1/reject
 ```
 
 `approve` 会真正执行该动作，并写回执行结果、审批人和执行后验证状态。`reject` 不会执行动作，只会把动作状态更新为 `rejected`，并写入拒绝人和原因。
+
+操作审计：
+
+```powershell
+python -m ops_agent.cli --config .\config.json audit-logs
+```
+
+所有 `POST /api/*` 写接口都会记录到 `api_audit_logs`，包括成功、失败和未授权请求。记录字段包括操作者、来源 IP、HTTP 方法、路径、操作名、目标对象、状态码和结果摘要。
 
 `POST /api/incidents/1/transition` 的 JSON 示例：
 

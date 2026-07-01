@@ -162,6 +162,46 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual([], incidents)
         self.assertEqual([], actions)
 
+    def test_retention_deletes_old_api_audit_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            old = iso_days_ago(200)
+            recent = iso_days_ago(10)
+            storage.connection.execute(
+                """
+                insert into api_audit_logs (
+                    created_at, environment, run_type, actor, source_ip, method, path,
+                    operation, target_type, target_id, status_code, outcome, message, metadata_json
+                )
+                values (?, 'prod', 'api', 'owner', '127.0.0.1', 'POST', '/api/incidents/1/ack',
+                        'incident.ack', 'incident', 1, 200, 'success', 'old', '{}')
+                """,
+                (old,),
+            )
+            storage.connection.execute(
+                """
+                insert into api_audit_logs (
+                    created_at, environment, run_type, actor, source_ip, method, path,
+                    operation, target_type, target_id, status_code, outcome, message, metadata_json
+                )
+                values (?, 'prod', 'api', 'owner', '127.0.0.1', 'POST', '/api/incidents/1/ack',
+                        'incident.ack', 'incident', 1, 200, 'success', 'recent', '{}')
+                """,
+                (recent,),
+            )
+            storage.connection.commit()
+            result = run_retention_cleanup(
+                storage,
+                {"enabled": True, "api_audit_logs_days": 180},
+                dry_run=False,
+            )
+            rows = storage.latest_api_audit_logs()
+            storage.close()
+
+        self.assertEqual(1, result.deleted_api_audit_logs)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("recent", rows[0]["message"])
+
 
 def insert_check(
     storage: Storage,

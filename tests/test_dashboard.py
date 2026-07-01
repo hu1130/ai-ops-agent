@@ -262,6 +262,73 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(401, raised.exception.code)
         self.assertIn("current_status", body)
 
+    def test_post_api_records_success_audit_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="json", name="AI", status="warning", summary="Slow")
+            incident_id = storage.save_incident("warning", "Ops Agent detected 1 issue(s)", "analysis", [result])
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/ack",
+                    data=b'{"actor":"tester","note":"checking"}',
+                    method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Forwarded-For": "203.0.113.10",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=5):
+                    pass
+                with urllib.request.urlopen(f"http://{host}:{port}/api/audit-logs", timeout=5) as response:
+                    api_rows = json.loads(response.read().decode("utf-8"))
+                rows = storage.latest_api_audit_logs()
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual(rows[0]["id"], api_rows[0]["id"])
+        self.assertEqual("incident.ack", rows[0]["operation"])
+        self.assertEqual("incident", rows[0]["target_type"])
+        self.assertEqual(incident_id, rows[0]["target_id"])
+        self.assertEqual("tester", rows[0]["actor"])
+        self.assertEqual("203.0.113.10", rows[0]["source_ip"])
+        self.assertEqual(200, rows[0]["status_code"])
+        self.assertEqual("success", rows[0]["outcome"])
+
+    def test_unauthorized_post_records_audit_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="json", name="AI", status="warning", summary="Slow")
+            incident_id = storage.save_incident("warning", "Ops Agent detected 1 issue(s)", "analysis", [result])
+            config = AppConfig(raw={"app": {"api_token": "secret-token"}}, base_dir=Path(tmp))
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/ack",
+                    data=b'{"actor":"tester"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=5)
+                rows = storage.latest_api_audit_logs()
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(401, raised.exception.code)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("incident.ack", rows[0]["operation"])
+        self.assertEqual(incident_id, rows[0]["target_id"])
+        self.assertEqual(401, rows[0]["status_code"])
+        self.assertEqual("unauthorized", rows[0]["outcome"])
+
 
 if __name__ == "__main__":
     unittest.main()

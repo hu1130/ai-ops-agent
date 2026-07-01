@@ -94,6 +94,24 @@ class Storage:
                     verify_output text,
                     verified_at text
                 );
+
+                create table if not exists api_audit_logs (
+                    id integer primary key autoincrement,
+                    created_at text not null,
+                    environment text not null default 'prod',
+                    run_type text not null default 'api',
+                    actor text not null,
+                    source_ip text not null,
+                    method text not null,
+                    path text not null,
+                    operation text not null,
+                    target_type text not null,
+                    target_id integer,
+                    status_code integer not null,
+                    outcome text not null,
+                    message text not null,
+                    metadata_json text not null
+                );
                 """
             )
             self.ensure_context_columns()
@@ -115,6 +133,18 @@ class Storage:
             for column, definition in defaults.items():
                 if column not in columns:
                     self.connection.execute(f"alter table {table} add column {column} {definition}")
+
+        audit_columns = {
+            row["name"]
+            for row in self.connection.execute("pragma table_info(api_audit_logs)").fetchall()
+        }
+        audit_defaults = {
+            "environment": "text not null default 'prod'",
+            "run_type": "text not null default 'api'",
+        }
+        for column, definition in audit_defaults.items():
+            if column not in audit_columns:
+                self.connection.execute(f"alter table api_audit_logs add column {column} {definition}")
 
     def ensure_incident_lifecycle_columns(self) -> None:
         columns = {
@@ -571,6 +601,63 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def record_api_audit(
+        self,
+        actor: str = "",
+        source_ip: str = "",
+        method: str = "",
+        path: str = "",
+        operation: str = "",
+        target_type: str = "",
+        target_id: int | None = None,
+        status_code: int = 0,
+        outcome: str = "",
+        message: str = "",
+        metadata: dict | None = None,
+        environment: str = "prod",
+        run_type: str = "api",
+    ) -> int:
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                insert into api_audit_logs (
+                    created_at, environment, run_type, actor, source_ip, method, path,
+                    operation, target_type, target_id, status_code, outcome, message, metadata_json
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    utc_now_iso(),
+                    environment or "prod",
+                    run_type or "api",
+                    actor or "",
+                    source_ip or "",
+                    method or "",
+                    path or "",
+                    operation or "",
+                    target_type or "",
+                    target_id,
+                    int(status_code),
+                    outcome or "",
+                    message or "",
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+            self.connection.commit()
+            return int(cursor.lastrowid)
+
+    def latest_api_audit_logs(self, limit: int = 50) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                """
+                select * from api_audit_logs
+                order by id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def update_incident_analysis(self, incident_id: int, analysis: str) -> None:
         with self.lock:
             self.connection.execute(
@@ -595,6 +682,8 @@ class Storage:
         test_action_cutoff: str = "",
         test_environments: Sequence[str] | None = None,
         test_run_types: Sequence[str] | None = None,
+        api_audit_cutoff: str = "",
+        test_api_audit_cutoff: str = "",
     ) -> dict[str, int]:
         test_environments = test_environments or []
         test_run_types = test_run_types or []
@@ -616,6 +705,13 @@ class Storage:
             "created_at < ?",
             [action_cutoff],
             test_action_cutoff,
+            test_environments,
+            test_run_types,
+        )
+        api_audit_where, api_audit_params = build_retention_where(
+            "created_at < ?",
+            [api_audit_cutoff or action_cutoff],
+            test_api_audit_cutoff,
             test_environments,
             test_run_types,
         )
@@ -632,7 +728,16 @@ class Storage:
                 f"select count(*) from action_logs where {action_where}",
                 action_params,
             ).fetchone()[0]
-        return {"check_results": int(check_results), "incidents": int(incidents), "action_logs": int(action_logs)}
+            api_audit_logs = self.connection.execute(
+                f"select count(*) from api_audit_logs where {api_audit_where}",
+                api_audit_params,
+            ).fetchone()[0]
+        return {
+            "check_results": int(check_results),
+            "incidents": int(incidents),
+            "action_logs": int(action_logs),
+            "api_audit_logs": int(api_audit_logs),
+        }
 
     def delete_retention_candidates(
         self,
@@ -645,6 +750,8 @@ class Storage:
         test_action_cutoff: str = "",
         test_environments: Sequence[str] | None = None,
         test_run_types: Sequence[str] | None = None,
+        api_audit_cutoff: str = "",
+        test_api_audit_cutoff: str = "",
     ) -> dict[str, int]:
         test_environments = test_environments or []
         test_run_types = test_run_types or []
@@ -669,6 +776,13 @@ class Storage:
             test_environments,
             test_run_types,
         )
+        api_audit_where, api_audit_params = build_retention_where(
+            "created_at < ?",
+            [api_audit_cutoff or action_cutoff],
+            test_api_audit_cutoff,
+            test_environments,
+            test_run_types,
+        )
         with self.lock:
             before = self.count_retention_candidates(
                 check_cutoff,
@@ -680,6 +794,8 @@ class Storage:
                 test_action_cutoff,
                 test_environments,
                 test_run_types,
+                api_audit_cutoff=api_audit_cutoff,
+                test_api_audit_cutoff=test_api_audit_cutoff,
             )
             self.connection.execute(
                 f"delete from check_results where {check_where}",
@@ -696,6 +812,7 @@ class Storage:
             )
             self.connection.execute(f"delete from incidents where {incident_where}", incident_params)
             self.connection.execute(f"delete from action_logs where {action_where}", action_params)
+            self.connection.execute(f"delete from api_audit_logs where {api_audit_where}", api_audit_params)
             self.connection.commit()
         return before
 

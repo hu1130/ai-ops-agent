@@ -22,11 +22,13 @@ def start_dashboard(
 ) -> ThreadingHTTPServer:
     api_token = configured_api_token(config)
     protect_reads = bool(config.app.get("api_auth_required_for_reads", False)) if config else False
+    app_context = dict(config.app) if config else {}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
             if path.startswith("/api/") and protect_reads and not self.is_authorized(api_token):
+                self.record_audit(path, 401, "unauthorized", "missing or invalid token")
                 self.send_auth_error()
                 return
             if path == "/api/summary":
@@ -57,6 +59,9 @@ def start_dashboard(
             if path == "/api/action-logs":
                 self.send_json(storage.latest_action_logs())
                 return
+            if path == "/api/audit-logs":
+                self.send_json(storage.latest_api_audit_logs())
+                return
             if path == "/api/actions/pending":
                 self.send_json(storage.latest_action_logs(100, status="pending_approval"))
                 return
@@ -75,6 +80,7 @@ def start_dashboard(
         def do_POST(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
             if not self.is_authorized(api_token):
+                self.record_audit(path, 401, "unauthorized", "missing or invalid token")
                 self.send_auth_error()
                 return
 
@@ -85,50 +91,71 @@ def start_dashboard(
 
             incident_request = parse_incident_api_path(path)
             if not incident_request:
+                self.record_audit(path, 404, "not_found", "unsupported api path")
                 self.send_json({"error": "not found"}, status=404)
                 return
 
             incident_id, action = incident_request
+            actor = "api"
             try:
                 body = self.read_json_body()
+                actor = str(body.get("actor") or "api")
                 to_status = status_from_incident_action(action, body)
                 updated = storage.transition_incident(
                     incident_id,
                     to_status,
-                    actor=str(body.get("actor") or "api"),
+                    actor=actor,
                     note=str(body.get("note") or body.get("reason") or ""),
                     metadata={"api_action": action},
                 )
             except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor)
                 self.send_json({"error": str(exc)}, status=400)
                 return
             except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor)
                 self.send_json({"error": str(exc)}, status=500)
                 return
+            self.record_audit(path, 200, "success", f"incident status={updated.get('status')}", actor=actor)
             self.send_json(updated)
 
         def handle_action_post(self, action_request: tuple[int, str]) -> None:
             action_id, action = action_request
-            body = self.read_json_body()
-            actor = str(body.get("actor") or "api")
-            note = str(body.get("note") or body.get("reason") or "")
+            path = self.path.split("?", 1)[0]
+            actor = "api"
             try:
+                body = self.read_json_body()
+                actor = str(body.get("actor") or "api")
+                note = str(body.get("note") or body.get("reason") or "")
                 if action == "approve":
                     if config is None:
+                        self.record_audit(path, 503, "error", "approval execution is not configured", actor=actor)
                         self.send_json({"error": "approval execution is not configured"}, status=503)
                         return
                     result = approve_action_log(storage, config, action_id, actor=actor, notifier=notifier)
+                    self.record_audit(
+                        path,
+                        200,
+                        "success",
+                        f"action status={result.result.status}",
+                        actor=actor,
+                    )
                     self.send_json(result.to_dict())
                     return
                 if action == "reject":
-                    self.send_json(reject_action_log(storage, action_id, actor=actor, note=note))
+                    rejected = reject_action_log(storage, action_id, actor=actor, note=note)
+                    self.record_audit(path, 200, "success", "action rejected", actor=actor)
+                    self.send_json(rejected)
                     return
             except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor)
                 self.send_json({"error": str(exc)}, status=400)
                 return
             except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor)
                 self.send_json({"error": str(exc)}, status=500)
                 return
+            self.record_audit(path, 404, "not_found", f"unsupported action operation: {action}", actor=actor)
             self.send_json({"error": f"unsupported action operation: {action}"}, status=404)
 
         def read_json_body(self) -> dict:
@@ -159,6 +186,40 @@ def start_dashboard(
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+
+        def record_audit(
+            self,
+            path: str,
+            status_code: int,
+            outcome: str,
+            message: str,
+            actor: str = "",
+        ) -> None:
+            operation, target_type, target_id = audit_target_from_path(path)
+            try:
+                storage.record_api_audit(
+                    actor=actor or self.headers.get("X-Ops-Agent-Actor", ""),
+                    source_ip=self.client_ip(),
+                    method=self.command,
+                    path=path,
+                    operation=operation,
+                    target_type=target_type,
+                    target_id=target_id,
+                    status_code=status_code,
+                    outcome=outcome,
+                    message=message,
+                    metadata={"user_agent": self.headers.get("User-Agent", "")},
+                    environment=str(app_context.get("environment") or "prod"),
+                    run_type="api",
+                )
+            except Exception:
+                return
+
+        def client_ip(self) -> str:
+            forwarded_for = self.headers.get("X-Forwarded-For", "")
+            if forwarded_for.strip():
+                return forwarded_for.split(",", 1)[0].strip()
+            return str(self.client_address[0]) if self.client_address else ""
 
         def send_json(self, payload: object, status: int = 200) -> None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -485,6 +546,30 @@ def parse_action_api_path(path: str) -> tuple[int, str] | None:
         return None
     action = parts[3] if len(parts) >= 4 else ""
     return action_id, action
+
+
+def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
+    action_request = parse_action_api_path(path)
+    if action_request:
+        action_id, action = action_request
+        operation = f"action.{action or 'read'}"
+        return operation, "action", action_id
+
+    incident_request = parse_incident_api_path(path)
+    if incident_request:
+        incident_id, action = incident_request
+        operation = f"incident.{action or 'read'}"
+        return operation, "incident", incident_id
+
+    mapping = {
+        "/api/audit-logs": ("audit.list", "audit", None),
+        "/api/action-logs": ("action.list", "action", None),
+        "/api/actions/pending": ("action.pending", "action", None),
+        "/api/incidents": ("incident.list", "incident", None),
+        "/api/summary": ("summary.read", "summary", None),
+        "/api/results": ("result.list", "result", None),
+    }
+    return mapping.get(path, ("api.unknown", "", None))
 
 
 def configured_api_token(config: AppConfig | None) -> str:
