@@ -345,14 +345,19 @@ python -m ops_agent.cli --config .\config.json incident-transition --id 1 --stat
 
 ```text
 GET  /api/incidents
+GET  /api/incidents/escalated
 GET  /api/incidents/1
+GET  /api/incidents/1/detail
 GET  /api/incidents/1/events
 GET  /api/incidents/1/actions
+GET  /api/incidents/1/failed-actions
 POST /api/incidents/1/ack
 POST /api/incidents/1/resolve
 POST /api/incidents/1/close
 POST /api/incidents/1/transition
 ```
+
+`GET /api/incidents/1/detail` 会一次返回事件本体、事件流、关联动作、失败动作和摘要字段，方便后续前端直接展示处理闭环和升级原因。
 
 API 鉴权：
 
@@ -396,6 +401,7 @@ Authorization: Bearer replace-with-operator-token
 GET  /api/action-logs
 GET  /api/audit-logs
 GET  /api/actions/pending
+GET  /api/actions/failed
 GET  /api/actions/1
 POST /api/actions/1/approve
 POST /api/actions/1/reject

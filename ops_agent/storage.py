@@ -548,6 +548,42 @@ class Storage:
             ).fetchone()
         return dict(row) if row else None
 
+    def incident_detail(self, incident_id: int) -> dict | None:
+        incident = self.get_incident(incident_id)
+        if not incident:
+            return None
+        events = self.latest_incident_events(incident_id)
+        actions = self.latest_action_logs(100, incident_id=incident_id)
+        failed_actions = self.latest_failed_action_logs(100, incident_id=incident_id)
+        return {
+            "incident": incident,
+            "events": events,
+            "actions": actions,
+            "failed_actions": failed_actions,
+            "summary": {
+                "is_escalated": int(incident.get("escalation_level") or 0) > 0,
+                "escalation_level": int(incident.get("escalation_level") or 0),
+                "event_count": len(events),
+                "action_count": len(actions),
+                "failed_action_count": len(failed_actions),
+                "status": incident.get("status", ""),
+                "severity": incident.get("severity", ""),
+            },
+        }
+
+    def latest_escalated_incidents(self, limit: int = 20) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                """
+                select * from incidents
+                where escalation_level > 0
+                order by coalesce(escalated_at, updated_at, created_at) desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def latest_incident_events(self, incident_id: int, limit: int = 100) -> list[dict]:
         with self.lock:
             rows = self.connection.execute(
@@ -812,6 +848,28 @@ class Storage:
                 f"""
                 select * from action_logs
                 {where_sql}
+                order by id desc
+                limit ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def latest_failed_action_logs(
+        self,
+        limit: int = 50,
+        incident_id: int | None = None,
+    ) -> list[dict]:
+        with self.lock:
+            where = ["status in ('failed', 'verified_failed')"]
+            params: list[object] = []
+            if incident_id is not None:
+                where.append("incident_id = ?")
+                params.append(incident_id)
+            rows = self.connection.execute(
+                f"""
+                select * from action_logs
+                where {' and '.join(where)}
                 order by id desc
                 limit ?
                 """,

@@ -39,6 +39,9 @@ def start_dashboard(
             if path == "/api/incidents":
                 self.send_json(storage.latest_incidents())
                 return
+            if path == "/api/incidents/escalated":
+                self.send_json(storage.latest_escalated_incidents())
+                return
             incident_request = parse_incident_api_path(path)
             if incident_request:
                 incident_id, action = incident_request
@@ -49,11 +52,21 @@ def start_dashboard(
                         return
                     self.send_json(incident)
                     return
+                if action == "detail":
+                    detail = storage.incident_detail(incident_id)
+                    if not detail:
+                        self.send_json({"error": "incident not found"}, status=404)
+                        return
+                    self.send_json(detail)
+                    return
                 if action == "events":
                     self.send_json(storage.latest_incident_events(incident_id))
                     return
                 if action == "actions":
                     self.send_json(storage.latest_action_logs(100, incident_id=incident_id))
+                    return
+                if action == "failed-actions":
+                    self.send_json(storage.latest_failed_action_logs(100, incident_id=incident_id))
                     return
             if path == "/api/action-logs":
                 self.send_json(storage.latest_action_logs())
@@ -63,6 +76,9 @@ def start_dashboard(
                 return
             if path == "/api/actions/pending":
                 self.send_json(storage.latest_action_logs(100, status="pending_approval"))
+                return
+            if path == "/api/actions/failed":
+                self.send_json(storage.latest_failed_action_logs())
                 return
             action_request = parse_action_api_path(path)
             if action_request:
@@ -613,8 +629,10 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
     mapping = {
         "/api/audit-logs": ("audit.list", "audit", None),
         "/api/action-logs": ("action.list", "action", None),
+        "/api/actions/failed": ("action.failed", "action", None),
         "/api/actions/pending": ("action.pending", "action", None),
         "/api/incidents": ("incident.list", "incident", None),
+        "/api/incidents/escalated": ("incident.escalated", "incident", None),
         "/api/summary": ("summary.read", "summary", None),
         "/api/results": ("result.list", "result", None),
     }

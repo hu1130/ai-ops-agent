@@ -88,6 +88,117 @@ class DashboardTest(unittest.TestCase):
         self.assertIn('"to_status": "acknowledged"', events_body)
         self.assertIn('"incident_id":', actions_body)
 
+    def test_incident_detail_api_includes_escalation_and_failed_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="json_api", name="AI", status="warning", summary="Slow")
+            incident_id = storage.save_incident("warning", "Ops Agent detected 1 issue(s)", "analysis", [result])
+            storage.escalate_incident(incident_id, 1, "failed remediation", metadata={"rule": "test"})
+            storage.save_action_log(
+                "check_port",
+                "Check port",
+                "low",
+                "failed",
+                "diagnose",
+                {"host": "example.com", "port": 443},
+                error="connection failed",
+                incident_id=incident_id,
+            )
+            storage.save_action_log(
+                "http_probe",
+                "Probe health",
+                "low",
+                "dry_run",
+                "diagnose",
+                {"url": "https://example.com/health"},
+                incident_id=incident_id,
+            )
+            storage.save_action_log(
+                "check_port",
+                "Unrelated failed action",
+                "low",
+                "failed",
+                "diagnose",
+                {"host": "127.0.0.1", "port": 1},
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/detail",
+                    timeout=5,
+                ) as response:
+                    detail = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/failed-actions",
+                    timeout=5,
+                ) as response:
+                    failed_actions = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(incident_id, detail["incident"]["id"])
+        self.assertTrue(detail["summary"]["is_escalated"])
+        self.assertEqual(1, detail["summary"]["escalation_level"])
+        self.assertEqual(2, detail["summary"]["action_count"])
+        self.assertEqual(1, detail["summary"]["failed_action_count"])
+        self.assertEqual("failed remediation", detail["incident"]["escalation_reason"])
+        self.assertTrue(any(event["note"] == "incident escalated" for event in detail["events"]))
+        self.assertEqual("failed", detail["failed_actions"][0]["status"])
+        self.assertEqual(1, len(failed_actions))
+        self.assertEqual(incident_id, failed_actions[0]["incident_id"])
+
+    def test_escalated_and_failed_action_list_apis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            warning = CheckResult(source="http", name="Website", status="warning", summary="Slow")
+            critical = CheckResult(source="server", name="Disk", status="critical", summary="Full")
+            escalated_id = storage.save_incident("warning", "Website slow", "analysis", [warning])
+            normal_id = storage.save_incident("critical", "Disk full", "analysis", [critical])
+            storage.escalate_incident(escalated_id, 1, "still open")
+            failed_id = storage.save_action_log(
+                "restart_service",
+                "Restart website",
+                "medium",
+                "verified_failed",
+                "remediate",
+                {"service": "website"},
+                error="health check failed",
+                incident_id=escalated_id,
+            )
+            storage.save_action_log(
+                "check_port",
+                "Check disk agent",
+                "low",
+                "dry_run",
+                "diagnose",
+                {"host": "127.0.0.1", "port": 8765},
+                incident_id=normal_id,
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/incidents/escalated",
+                    timeout=5,
+                ) as response:
+                    escalated = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/actions/failed",
+                    timeout=5,
+                ) as response:
+                    failed_actions = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual([escalated_id], [row["id"] for row in escalated])
+        self.assertEqual([failed_id], [row["id"] for row in failed_actions])
+        self.assertEqual(escalated_id, failed_actions[0]["incident_id"])
+
     def test_action_approval_api_lists_and_rejects_pending_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")
