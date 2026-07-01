@@ -7,7 +7,9 @@
     "interval_seconds": 60,
     "database_path": "data/ops_agent.db",
     "dashboard_host": "127.0.0.1",
-    "dashboard_port": 8765
+    "dashboard_port": 8765,
+    "api_token": "",
+    "api_auth_required_for_reads": false
   },
   "http_checks": [
     {

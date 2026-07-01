@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import json
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -175,6 +176,91 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("failed", row["status"])
         self.assertEqual("approved", row["decision"])
         self.assertEqual("tester", row["approved_by"])
+
+    def test_post_api_requires_token_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="json", name="AI", status="warning", summary="Slow")
+            incident_id = storage.save_incident("warning", "Ops Agent detected 1 issue(s)", "analysis", [result])
+            config = AppConfig(
+                raw={"app": {"api_token": "secret-token"}},
+                base_dir=Path(tmp),
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/ack",
+                    data=b'{"actor":"tester"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=5)
+                row = storage.get_incident(incident_id)
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(401, raised.exception.code)
+        self.assertEqual("open", row["status"])
+
+    def test_post_api_accepts_bearer_token_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="json", name="AI", status="warning", summary="Slow")
+            incident_id = storage.save_incident("warning", "Ops Agent detected 1 issue(s)", "analysis", [result])
+            config = AppConfig(
+                raw={"app": {"api_token": "secret-token"}},
+                base_dir=Path(tmp),
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/ack",
+                    data=b'{"actor":"tester"}',
+                    method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer secret-token",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("acknowledged", body["status"])
+
+    def test_get_api_can_require_token_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={"app": {"api_token": "secret-token", "api_auth_required_for_reads": True}},
+                base_dir=Path(tmp),
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(f"http://{host}:{port}/api/summary", timeout=5)
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/summary",
+                    headers={"X-Ops-Agent-Token": "secret-token"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(401, raised.exception.code)
+        self.assertIn("current_status", body)
 
 
 if __name__ == "__main__":

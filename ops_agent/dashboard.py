@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import html
+import hmac
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
@@ -18,9 +20,15 @@ def start_dashboard(
     config: AppConfig | None = None,
     notifier: Notifier | None = None,
 ) -> ThreadingHTTPServer:
+    api_token = configured_api_token(config)
+    protect_reads = bool(config.app.get("api_auth_required_for_reads", False)) if config else False
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
+            if path.startswith("/api/") and protect_reads and not self.is_authorized(api_token):
+                self.send_auth_error()
+                return
             if path == "/api/summary":
                 self.send_json(storage.dashboard_summary())
                 return
@@ -66,6 +74,10 @@ def start_dashboard(
 
         def do_POST(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
+            if not self.is_authorized(api_token):
+                self.send_auth_error()
+                return
+
             action_request = parse_action_api_path(path)
             if action_request:
                 self.handle_action_post(action_request)
@@ -128,6 +140,25 @@ def start_dashboard(
                 return {}
             payload = json.loads(raw)
             return payload if isinstance(payload, dict) else {}
+
+        def is_authorized(self, expected_token: str) -> bool:
+            if not expected_token:
+                return True
+            provided = self.headers.get("X-Ops-Agent-Token", "").strip()
+            authorization = self.headers.get("Authorization", "").strip()
+            if authorization.lower().startswith("bearer "):
+                provided = authorization[7:].strip()
+            return hmac.compare_digest(provided, expected_token)
+
+        def send_auth_error(self) -> None:
+            payload = {"error": "unauthorized"}
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("WWW-Authenticate", 'Bearer realm="ops-agent"')
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
 
         def send_json(self, payload: object, status: int = 200) -> None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -454,6 +485,16 @@ def parse_action_api_path(path: str) -> tuple[int, str] | None:
         return None
     action = parts[3] if len(parts) >= 4 else ""
     return action_id, action
+
+
+def configured_api_token(config: AppConfig | None) -> str:
+    env_token = os.environ.get("OPS_AGENT_API_TOKEN", "").strip()
+    if env_token:
+        return env_token
+    if config is None:
+        return ""
+    app = config.app
+    return str(app.get("api_token") or app.get("dashboard_api_token") or "").strip()
 
 
 def status_from_incident_action(action: str, body: dict) -> str:

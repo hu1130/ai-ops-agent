@@ -332,6 +332,25 @@ POST /api/incidents/1/close
 POST /api/incidents/1/transition
 ```
 
+API 鉴权：
+
+```json
+{
+  "app": {
+    "api_token": "replace-with-a-long-random-token",
+    "api_auth_required_for_reads": false
+  }
+}
+```
+
+配置 `app.api_token` 后，所有 `POST` 接口都必须带 token：
+
+```text
+Authorization: Bearer replace-with-a-long-random-token
+```
+
+也可以使用请求头 `X-Ops-Agent-Token`。如果把 `api_auth_required_for_reads` 设为 `true`，`GET /api/*` 读接口也会要求 token。
+
 动作审批队列 API：
 
 ```text
