@@ -573,17 +573,21 @@ def recommendation_from_action_result(
     config: AppConfig,
     context: RunContext,
 ) -> dict:
+    status = "suggested" if result.status == "dry_run" else result.status
     recommendation = recommendation_from_action(
         position,
         result.action,
         config,
         context,
-        status=result.status,
+        status=status,
     )
     if result.output:
-        recommendation["metadata"]["output"] = result.output
+        key = "dry_run_output" if result.status == "dry_run" else "output"
+        recommendation["metadata"][key] = result.output
     if result.error:
         recommendation["metadata"]["error"] = result.error
+    if result.status == "dry_run":
+        recommendation["metadata"]["dry_run_status"] = result.status
     return recommendation
 
 

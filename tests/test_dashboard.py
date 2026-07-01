@@ -312,6 +312,113 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("approved", row["decision"])
         self.assertEqual("tester", row["approved_by"])
 
+    def test_recommendation_api_requests_approval_and_rejects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="http", name="Site", status="critical", summary="Down")
+            incident_id = storage.save_incident("critical", "Site down", "analysis", [result])
+            storage.save_incident_recommendations(
+                incident_id,
+                [
+                    {
+                        "position": 1,
+                        "category": "remediate",
+                        "action_type": "restart_service",
+                        "title": "Restart web service",
+                        "reason": "Site is unavailable",
+                        "risk": "medium",
+                        "approval_required": True,
+                        "status": "suggested",
+                        "params": {"service": "web"},
+                    }
+                ],
+            )
+            recommendation_id = storage.latest_incident_recommendations(incident_id)[0]["id"]
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/recommendations/{recommendation_id}/request-approval",
+                    data=b'{"actor":"tester","note":"please review"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    requested = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/recommendations/{recommendation_id}/reject",
+                    data=b'{"actor":"tester","note":"not now"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    rejected = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/recommendations/{recommendation_id}",
+                    timeout=5,
+                ) as response:
+                    current = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("pending_approval", requested["recommendation"]["status"])
+        self.assertEqual("pending_approval", requested["action"]["status"])
+        self.assertEqual(requested["action"]["id"], requested["recommendation"]["action_log_id"])
+        self.assertEqual("rejected", rejected["recommendation"]["status"])
+        self.assertEqual("rejected", rejected["action"]["status"])
+        self.assertEqual("tester", current["decision_by"])
+        self.assertEqual("not now", current["decision_note"])
+
+    def test_recommendation_approve_api_executes_bound_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="json_api", name="AI", status="warning", summary="Slow")
+            incident_id = storage.save_incident("warning", "AI slow", "analysis", [result])
+            storage.save_incident_recommendations(
+                incident_id,
+                [
+                    {
+                        "position": 1,
+                        "category": "diagnose",
+                        "action_type": "check_port",
+                        "title": "Check closed port",
+                        "reason": "Synthetic chat is slow",
+                        "risk": "low",
+                        "status": "suggested",
+                        "params": {"host": "127.0.0.1", "port": 1, "timeout_seconds": 0.05},
+                    }
+                ],
+            )
+            recommendation_id = storage.latest_incident_recommendations(incident_id)[0]["id"]
+            config = AppConfig(raw={"remediation": {"allowed_actions": ["check_port"]}}, base_dir=Path(tmp))
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/recommendations/{recommendation_id}/approve",
+                    data=b'{"actor":"tester","note":"run check"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    approved = json.loads(response.read().decode("utf-8"))
+                current = storage.get_incident_recommendation(recommendation_id)
+                action = storage.get_action_log(current["action_log_id"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("failed", approved["recommendation"]["status"])
+        self.assertEqual("failed", approved["action"]["result"]["status"])
+        self.assertEqual("approved", action["decision"])
+        self.assertEqual("tester", action["approved_by"])
+        self.assertEqual("tester", current["decision_by"])
+        self.assertEqual("run check", current["decision_note"])
+        self.assertEqual(action["id"], current["action_log_id"])
+
     def test_post_api_requires_token_when_configured(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

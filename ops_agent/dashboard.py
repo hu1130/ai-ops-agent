@@ -9,6 +9,11 @@ from ops_agent.alerts.notifier import Notifier
 from ops_agent.auth import AuthResult, authenticate_token, configured_api_tokens, has_role
 from ops_agent.config import AppConfig
 from ops_agent.remediation.approval import approve_action_log, reject_action_log
+from ops_agent.remediation.recommendations import (
+    approve_recommendation,
+    reject_recommendation,
+    request_recommendation_approval,
+)
 from ops_agent.storage import Storage
 
 
@@ -83,6 +88,16 @@ def start_dashboard(
             if path == "/api/actions/failed":
                 self.send_json(storage.latest_failed_action_logs())
                 return
+            recommendation_request = parse_recommendation_api_path(path)
+            if recommendation_request:
+                recommendation_id, action = recommendation_request
+                if action == "":
+                    row = storage.get_incident_recommendation(recommendation_id)
+                    if not row:
+                        self.send_json({"error": "recommendation not found"}, status=404)
+                        return
+                    self.send_json(row)
+                    return
             action_request = parse_action_api_path(path)
             if action_request:
                 action_id, action = action_request
@@ -99,6 +114,11 @@ def start_dashboard(
             path = self.path.split("?", 1)[0]
             auth = self.require_role(path, "operator")
             if auth is None:
+                return
+
+            recommendation_request = parse_recommendation_api_path(path)
+            if recommendation_request:
+                self.handle_recommendation_post(recommendation_request, auth)
                 return
 
             action_request = parse_action_api_path(path)
@@ -189,6 +209,72 @@ def start_dashboard(
                 auth=auth,
             )
             self.send_json({"error": f"unsupported action operation: {action}"}, status=404)
+
+        def handle_recommendation_post(self, recommendation_request: tuple[int, str], auth: AuthResult) -> None:
+            recommendation_id, action = recommendation_request
+            path = self.path.split("?", 1)[0]
+            actor = "api"
+            try:
+                body = self.read_json_body()
+                actor = self.actor_from_body(body, auth)
+                note = str(body.get("note") or body.get("reason") or "")
+                if action == "request-approval":
+                    result = request_recommendation_approval(storage, recommendation_id, actor=actor, note=note)
+                    self.record_audit(path, 200, "success", "recommendation pending approval", actor=actor, auth=auth)
+                    self.send_json(result)
+                    return
+                if action == "approve":
+                    if config is None:
+                        self.record_audit(
+                            path,
+                            503,
+                            "error",
+                            "recommendation approval is not configured",
+                            actor=actor,
+                            auth=auth,
+                        )
+                        self.send_json({"error": "recommendation approval is not configured"}, status=503)
+                        return
+                    result = approve_recommendation(
+                        storage,
+                        config,
+                        recommendation_id,
+                        actor=actor,
+                        note=note,
+                        notifier=notifier,
+                    )
+                    self.record_audit(
+                        path,
+                        200,
+                        "success",
+                        f"recommendation status={result['recommendation'].get('status')}",
+                        actor=actor,
+                        auth=auth,
+                    )
+                    self.send_json(result)
+                    return
+                if action == "reject":
+                    result = reject_recommendation(storage, recommendation_id, actor=actor, note=note)
+                    self.record_audit(path, 200, "success", "recommendation rejected", actor=actor, auth=auth)
+                    self.send_json(result)
+                    return
+            except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
+                return
+            self.record_audit(
+                path,
+                404,
+                "not_found",
+                f"unsupported recommendation operation: {action}",
+                actor=actor,
+                auth=auth,
+            )
+            self.send_json({"error": f"unsupported recommendation operation: {action}"}, status=404)
 
         def read_json_body(self) -> dict:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -616,7 +702,25 @@ def parse_action_api_path(path: str) -> tuple[int, str] | None:
     return action_id, action
 
 
+def parse_recommendation_api_path(path: str) -> tuple[int, str] | None:
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 3 or parts[0] != "api" or parts[1] != "recommendations":
+        return None
+    try:
+        recommendation_id = int(parts[2])
+    except ValueError:
+        return None
+    action = parts[3] if len(parts) >= 4 else ""
+    return recommendation_id, action
+
+
 def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
+    recommendation_request = parse_recommendation_api_path(path)
+    if recommendation_request:
+        recommendation_id, action = recommendation_request
+        operation = f"recommendation.{action or 'read'}"
+        return operation, "recommendation", recommendation_id
+
     action_request = parse_action_api_path(path)
     if action_request:
         action_id, action = action_request

@@ -101,6 +101,11 @@ class Storage:
                     verification_required integer not null default 0,
                     status text not null default 'suggested',
                     params_json text not null default '{}',
+                    action_log_id integer,
+                    decision_by text,
+                    decision_at text,
+                    decision_note text,
+                    executed_at text,
                     source text not null default 'planner',
                     metadata_json text not null default '{}'
                 );
@@ -277,6 +282,11 @@ class Storage:
             "verification_required": "alter table incident_recommendations add column verification_required integer not null default 0",
             "status": "alter table incident_recommendations add column status text not null default 'suggested'",
             "params_json": "alter table incident_recommendations add column params_json text not null default '{}'",
+            "action_log_id": "alter table incident_recommendations add column action_log_id integer",
+            "decision_by": "alter table incident_recommendations add column decision_by text",
+            "decision_at": "alter table incident_recommendations add column decision_at text",
+            "decision_note": "alter table incident_recommendations add column decision_note text",
+            "executed_at": "alter table incident_recommendations add column executed_at text",
             "source": "alter table incident_recommendations add column source text not null default 'planner'",
             "metadata_json": "alter table incident_recommendations add column metadata_json text not null default '{}'",
         }
@@ -403,9 +413,10 @@ class Storage:
                     incident_id, created_at, updated_at, environment, run_type, trace_id,
                     position, category, action_type, title, reason, risk,
                     approval_required, auto_execute, verification_required, status,
-                    params_json, source, metadata_json
+                    params_json, action_log_id, decision_by, decision_at, decision_note,
+                    executed_at, source, metadata_json
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -426,6 +437,11 @@ class Storage:
                         1 if item.get("verification_required") else 0,
                         str(item.get("status") or "suggested"),
                         json.dumps(safe_dict(item.get("params")), ensure_ascii=False),
+                        item.get("action_log_id"),
+                        str(item.get("decision_by") or "") or None,
+                        str(item.get("decision_at") or "") or None,
+                        str(item.get("decision_note") or "") or None,
+                        str(item.get("executed_at") or "") or None,
                         str(item.get("source") or "planner"),
                         json.dumps(safe_dict(item.get("metadata")), ensure_ascii=False),
                     )
@@ -696,6 +712,72 @@ class Storage:
                 (incident_id, limit),
             ).fetchall()
         return [recommendation_payload(row) for row in rows]
+
+    def get_incident_recommendation(self, recommendation_id: int) -> dict | None:
+        with self.lock:
+            row = self.connection.execute(
+                """
+                select * from incident_recommendations
+                where id = ?
+                """,
+                (recommendation_id,),
+            ).fetchone()
+        return recommendation_payload(row) if row else None
+
+    def update_incident_recommendation_status(
+        self,
+        recommendation_id: int,
+        status: str,
+        actor: str = "",
+        note: str = "",
+        action_log_id: int | None = None,
+        metadata: dict | None = None,
+    ) -> dict:
+        terminal_statuses = {"executed", "failed", "verified_ok", "verified_failed", "skipped", "rejected"}
+        now = utc_now_iso()
+        actor_value = actor.strip()
+        note_value = note.strip()
+        with self.lock:
+            row = self.connection.execute(
+                "select * from incident_recommendations where id = ?",
+                (recommendation_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"recommendation not found: #{recommendation_id}")
+            merged_metadata = parse_json_object(str(row["metadata_json"] or "{}"))
+            if metadata:
+                merged_metadata.update(metadata)
+            self.connection.execute(
+                """
+                update incident_recommendations
+                set updated_at = ?,
+                    status = ?,
+                    action_log_id = coalesce(?, action_log_id),
+                    decision_by = coalesce(nullif(?, ''), decision_by),
+                    decision_at = coalesce(?, decision_at),
+                    decision_note = coalesce(nullif(?, ''), decision_note),
+                    executed_at = coalesce(?, executed_at),
+                    metadata_json = ?
+                where id = ?
+                """,
+                (
+                    now,
+                    status,
+                    action_log_id,
+                    actor_value,
+                    now if actor_value or note_value else None,
+                    note_value,
+                    now if status in terminal_statuses else None,
+                    json.dumps(merged_metadata, ensure_ascii=False),
+                    recommendation_id,
+                ),
+            )
+            self.connection.commit()
+            updated = self.connection.execute(
+                "select * from incident_recommendations where id = ?",
+                (recommendation_id,),
+            ).fetchone()
+        return recommendation_payload(updated)
 
     def latest_incident_events(self, incident_id: int, limit: int = 100) -> list[dict]:
         with self.lock:
