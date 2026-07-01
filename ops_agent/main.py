@@ -41,7 +41,7 @@ def main() -> int:
 
     host = str(config.app.get("dashboard_host", "127.0.0.1"))
     port = int(config.app.get("dashboard_port", 8765))
-    start_dashboard(storage, host, port)
+    start_dashboard(storage, host, port, config=config, notifier=notifier)
     scheduler.run_forever()
     return 0
 

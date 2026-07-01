@@ -11,6 +11,7 @@ ActionStatus = Literal[
     "dry_run",
     "executed",
     "skipped",
+    "rejected",
     "failed",
     "verify_skipped",
     "verified_ok",

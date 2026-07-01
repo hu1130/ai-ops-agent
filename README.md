@@ -332,6 +332,33 @@ POST /api/incidents/1/close
 POST /api/incidents/1/transition
 ```
 
+动作审批队列 API：
+
+```text
+GET  /api/action-logs
+GET  /api/actions/pending
+GET  /api/actions/1
+POST /api/actions/1/approve
+POST /api/actions/1/reject
+```
+
+确认动作：
+```json
+{
+  "actor": "owner"
+}
+```
+
+拒绝动作：
+```json
+{
+  "actor": "owner",
+  "note": "先人工排查，不执行重启"
+}
+```
+
+`approve` 会真正执行该动作，并写回执行结果、审批人和执行后验证状态。`reject` 不会执行动作，只会把动作状态更新为 `rejected`，并写入拒绝人和原因。
+
 `POST /api/incidents/1/transition` 的 JSON 示例：
 
 ```json

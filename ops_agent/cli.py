@@ -10,6 +10,7 @@ from ops_agent.config import AppConfig, load_config
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.events import CheckResult, RunContext
 from ops_agent.incident_lifecycle import INCIDENT_STATUSES
+from ops_agent.remediation import approval
 from ops_agent.remediation.actions import ActionResult, RemediationAction
 from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action, format_action_plan
 from ops_agent.remediation.planner import build_remediation_plan
@@ -153,6 +154,10 @@ def main() -> int:
                 line += f" incident_id={row['incident_id']}"
             if row.get("approved_by"):
                 line += f" approved_by={row['approved_by']}"
+            if row.get("decision"):
+                line += f" decision={row['decision']}"
+            if row.get("decision_by"):
+                line += f" decision_by={row['decision_by']}"
             if row.get("verify_status"):
                 line += f" verify={row['verify_status']}"
             print(line)
@@ -319,30 +324,16 @@ def approve_action_command(args: argparse.Namespace, config: AppConfig) -> int:
         return 1
 
     storage = open_storage(config)
-    row = storage.get_action_log(args.id)
-    if not row:
+    try:
+        decision = approval.approve_action_log(storage, config, args.id, actor=args.by)
+    except ValueError as exc:
         storage.close()
-        print(f"动作不存在: #{args.id}")
+        print(str(exc))
         return 1
-    if row["status"] not in {"pending_approval", "skipped", "failed"}:
-        storage.close()
-        print(f"动作当前状态不允许确认执行: {row['status']}")
-        return 1
-
-    action = action_from_log(row)
-    result = execute_action(action, config, dry_run=False, approved=True)
-    storage.update_action_log(
-        args.id,
-        result.status,
-        result.output,
-        result.error,
-        approved_by=args.by,
-    )
-    verification = verify_and_record(args.id, action, result.status, config, storage)
     storage.close()
-    print(format_action_plan([action], [result]))
-    print(format_verification(verification))
-    return 0 if final_success(result.status, verification) else 1
+    print(format_action_plan([decision.action], [decision.result]))
+    print(format_verification(decision.verification))
+    return 0 if final_success(decision.result.status, decision.verification) else 1
 
 
 def verify_and_record(

@@ -163,6 +163,10 @@ class Storage:
             "verify_status": "alter table action_logs add column verify_status text",
             "verify_output": "alter table action_logs add column verify_output text",
             "verified_at": "alter table action_logs add column verified_at text",
+            "decision": "alter table action_logs add column decision text",
+            "decision_by": "alter table action_logs add column decision_by text",
+            "decision_at": "alter table action_logs add column decision_at text",
+            "decision_note": "alter table action_logs add column decision_note text",
         }
         for column, statement in additions.items():
             if column not in columns:
@@ -481,6 +485,7 @@ class Storage:
         approved_by: str = "",
     ) -> None:
         approved_at = utc_now_iso() if approved_by else None
+        decision = "approved" if approved_by else ""
         with self.lock:
             self.connection.execute(
                 """
@@ -490,34 +495,80 @@ class Storage:
                     output = ?,
                     error = ?,
                     approved_by = coalesce(nullif(?, ''), approved_by),
-                    approved_at = coalesce(?, approved_at)
+                    approved_at = coalesce(?, approved_at),
+                    decision = coalesce(nullif(?, ''), decision),
+                    decision_by = coalesce(nullif(?, ''), decision_by),
+                    decision_at = coalesce(?, decision_at)
                 where id = ?
                 """,
-                (utc_now_iso(), status, output, error, approved_by, approved_at, action_id),
+                (
+                    utc_now_iso(),
+                    status,
+                    output,
+                    error,
+                    approved_by,
+                    approved_at,
+                    decision,
+                    approved_by,
+                    approved_at,
+                    action_id,
+                ),
             )
             self.connection.commit()
 
-    def latest_action_logs(self, limit: int = 50, incident_id: int | None = None) -> list[dict]:
+    def reject_action_log(self, action_id: int, rejected_by: str, note: str = "") -> dict:
+        now = utc_now_iso()
+        actor = rejected_by.strip() or "operator"
+        message = f"rejected by {actor}"
+        if note.strip():
+            message += f": {note.strip()}"
         with self.lock:
-            if incident_id is None:
-                rows = self.connection.execute(
-                    """
-                    select * from action_logs
-                    order by id desc
-                    limit ?
-                    """,
-                    (limit,),
-                ).fetchall()
-            else:
-                rows = self.connection.execute(
-                    """
-                    select * from action_logs
-                    where incident_id = ?
-                    order by id desc
-                    limit ?
-                    """,
-                    (incident_id, limit),
-                ).fetchall()
+            self.connection.execute(
+                """
+                update action_logs
+                set updated_at = ?,
+                    status = 'rejected',
+                    error = ?,
+                    decision = 'rejected',
+                    decision_by = ?,
+                    decision_at = ?,
+                    decision_note = ?
+                where id = ?
+                """,
+                (now, message, actor, now, note.strip(), action_id),
+            )
+            self.connection.commit()
+            row = self.connection.execute(
+                "select * from action_logs where id = ?",
+                (action_id,),
+            ).fetchone()
+        return dict(row) if row else {}
+
+    def latest_action_logs(
+        self,
+        limit: int = 50,
+        incident_id: int | None = None,
+        status: str | None = None,
+    ) -> list[dict]:
+        with self.lock:
+            where: list[str] = []
+            params: list[object] = []
+            if incident_id is not None:
+                where.append("incident_id = ?")
+                params.append(incident_id)
+            if status:
+                where.append("status = ?")
+                params.append(status)
+            where_sql = f"where {' and '.join(where)}" if where else ""
+            rows = self.connection.execute(
+                f"""
+                select * from action_logs
+                {where_sql}
+                order by id desc
+                limit ?
+                """,
+                (*params, limit),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def update_incident_analysis(self, incident_id: int, analysis: str) -> None:

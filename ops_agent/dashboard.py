@@ -5,10 +5,19 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
+from ops_agent.alerts.notifier import Notifier
+from ops_agent.config import AppConfig
+from ops_agent.remediation.approval import approve_action_log, reject_action_log
 from ops_agent.storage import Storage
 
 
-def start_dashboard(storage: Storage, host: str, port: int) -> ThreadingHTTPServer:
+def start_dashboard(
+    storage: Storage,
+    host: str,
+    port: int,
+    config: AppConfig | None = None,
+    notifier: Notifier | None = None,
+) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
@@ -40,10 +49,28 @@ def start_dashboard(storage: Storage, host: str, port: int) -> ThreadingHTTPServ
             if path == "/api/action-logs":
                 self.send_json(storage.latest_action_logs())
                 return
+            if path == "/api/actions/pending":
+                self.send_json(storage.latest_action_logs(100, status="pending_approval"))
+                return
+            action_request = parse_action_api_path(path)
+            if action_request:
+                action_id, action = action_request
+                if action == "":
+                    row = storage.get_action_log(action_id)
+                    if not row:
+                        self.send_json({"error": "action not found"}, status=404)
+                        return
+                    self.send_json(row)
+                    return
             self.send_html(render_page(storage))
 
         def do_POST(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
+            action_request = parse_action_api_path(path)
+            if action_request:
+                self.handle_action_post(action_request)
+                return
+
             incident_request = parse_incident_api_path(path)
             if not incident_request:
                 self.send_json({"error": "not found"}, status=404)
@@ -67,6 +94,30 @@ def start_dashboard(storage: Storage, host: str, port: int) -> ThreadingHTTPServ
                 self.send_json({"error": str(exc)}, status=500)
                 return
             self.send_json(updated)
+
+        def handle_action_post(self, action_request: tuple[int, str]) -> None:
+            action_id, action = action_request
+            body = self.read_json_body()
+            actor = str(body.get("actor") or "api")
+            note = str(body.get("note") or body.get("reason") or "")
+            try:
+                if action == "approve":
+                    if config is None:
+                        self.send_json({"error": "approval execution is not configured"}, status=503)
+                        return
+                    result = approve_action_log(storage, config, action_id, actor=actor, notifier=notifier)
+                    self.send_json(result.to_dict())
+                    return
+                if action == "reject":
+                    self.send_json(reject_action_log(storage, action_id, actor=actor, note=note))
+                    return
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=500)
+                return
+            self.send_json({"error": f"unsupported action operation: {action}"}, status=404)
 
         def read_json_body(self) -> dict:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -391,6 +442,18 @@ def parse_incident_api_path(path: str) -> tuple[int, str] | None:
         return None
     action = parts[3] if len(parts) >= 4 else ""
     return incident_id, action
+
+
+def parse_action_api_path(path: str) -> tuple[int, str] | None:
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 3 or parts[0] != "api" or parts[1] != "actions":
+        return None
+    try:
+        action_id = int(parts[2])
+    except ValueError:
+        return None
+    action = parts[3] if len(parts) >= 4 else ""
+    return action_id, action
 
 
 def status_from_incident_action(action: str, body: dict) -> str:

@@ -1,8 +1,10 @@
 import tempfile
 import unittest
+import json
 import urllib.request
 from pathlib import Path
 
+from ops_agent.config import AppConfig
 from ops_agent.dashboard import render_page, start_dashboard
 from ops_agent.events import CheckResult
 from ops_agent.storage import Storage
@@ -84,6 +86,95 @@ class DashboardTest(unittest.TestCase):
         self.assertIn('"status": "acknowledged"', body)
         self.assertIn('"to_status": "acknowledged"', events_body)
         self.assertIn('"incident_id":', actions_body)
+
+    def test_action_approval_api_lists_and_rejects_pending_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            action_id = storage.save_action_log(
+                "restart_service",
+                "Restart app",
+                "medium",
+                "pending_approval",
+                "manual approval",
+                {"service": "app"},
+            )
+            storage.save_action_log(
+                "check_port",
+                "Check port",
+                "low",
+                "dry_run",
+                "diagnose",
+                {"host": "example.com", "port": 443},
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/actions/pending",
+                    timeout=5,
+                ) as response:
+                    pending = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/actions/{action_id}/reject",
+                    data=b'{"actor":"tester","note":"not needed"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    rejected = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(1, len(pending))
+        self.assertEqual(action_id, pending[0]["id"])
+        self.assertEqual("rejected", rejected["status"])
+        self.assertEqual("rejected", rejected["decision"])
+        self.assertEqual("tester", rejected["decision_by"])
+
+    def test_action_approval_api_executes_approved_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "remediation": {
+                        "allowed_actions": ["check_port"],
+                        "verification": {"enabled": False},
+                    }
+                },
+                base_dir=Path(tmp),
+            )
+            action_id = storage.save_action_log(
+                "check_port",
+                "Check closed port",
+                "low",
+                "pending_approval",
+                "manual approval",
+                {"host": "127.0.0.1", "port": 1, "timeout_seconds": 0.05},
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/actions/{action_id}/approve",
+                    data=b'{"actor":"tester"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    approved = json.loads(response.read().decode("utf-8"))
+                row = storage.get_action_log(action_id)
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(action_id, approved["action_id"])
+        self.assertEqual("failed", approved["result"]["status"])
+        self.assertEqual("failed", row["status"])
+        self.assertEqual("approved", row["decision"])
+        self.assertEqual("tester", row["approved_by"])
 
 
 if __name__ == "__main__":
