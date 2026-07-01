@@ -419,6 +419,96 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("run check", current["decision_note"])
         self.assertEqual(action["id"], current["action_log_id"])
 
+    def test_recommendation_list_api_filters_task_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="http", name="Site", status="critical", summary="Down")
+            incident_id = storage.save_incident("critical", "Site down", "analysis", [result])
+            other_id = storage.save_incident("warning", "Other issue", "analysis", [result])
+            storage.save_incident_recommendations(
+                incident_id,
+                [
+                    {
+                        "position": 1,
+                        "category": "diagnose",
+                        "action_type": "check_port",
+                        "title": "Check port",
+                        "reason": "Site down",
+                        "risk": "low",
+                        "status": "suggested",
+                        "params": {"host": "example.com", "port": 443},
+                    },
+                    {
+                        "position": 2,
+                        "category": "remediate",
+                        "action_type": "restart_service",
+                        "title": "Restart app",
+                        "reason": "Site down",
+                        "risk": "medium",
+                        "status": "pending_approval",
+                        "params": {"service": "app"},
+                    },
+                    {
+                        "position": 3,
+                        "category": "verify",
+                        "action_type": "http_probe",
+                        "title": "Verify app",
+                        "reason": "Check recovery",
+                        "risk": "low",
+                        "status": "verified_ok",
+                        "params": {"url": "https://example.com/health"},
+                    },
+                ],
+            )
+            storage.save_incident_recommendations(
+                other_id,
+                [
+                    {
+                        "position": 1,
+                        "category": "diagnose",
+                        "action_type": "run_diagnostic_command",
+                        "title": "Inspect logs",
+                        "reason": "Other issue",
+                        "risk": "low",
+                        "status": "failed",
+                        "params": {"command": "journalctl -n 20 --no-pager"},
+                    }
+                ],
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/recommendations?status=suggested,failed&limit=10",
+                    timeout=5,
+                ) as response:
+                    filtered = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/recommendations?incident_id={incident_id}&category=remediate",
+                    timeout=5,
+                ) as response:
+                    incident_remediate = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/recommendations/pending",
+                    timeout=5,
+                ) as response:
+                    pending = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/recommendations/actionable",
+                    timeout=5,
+                ) as response:
+                    actionable = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual({"suggested", "failed"}, {row["status"] for row in filtered})
+        self.assertEqual(["restart_service"], [row["action_type"] for row in incident_remediate])
+        self.assertEqual(["pending_approval"], [row["status"] for row in pending])
+        self.assertEqual({"suggested", "pending_approval", "failed"}, {row["status"] for row in actionable})
+        self.assertNotIn("verified_ok", {row["status"] for row in actionable})
+
     def test_post_api_requires_token_when_configured(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

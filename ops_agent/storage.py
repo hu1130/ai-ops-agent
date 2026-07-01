@@ -713,6 +713,47 @@ class Storage:
             ).fetchall()
         return [recommendation_payload(row) for row in rows]
 
+    def latest_recommendations(
+        self,
+        limit: int = 50,
+        incident_id: int | None = None,
+        statuses: Sequence[str] | None = None,
+        category: str = "",
+        risk: str = "",
+        action_type: str = "",
+        source: str = "",
+    ) -> list[dict]:
+        with self.lock:
+            where: list[str] = []
+            params: list[object] = []
+            if incident_id is not None:
+                where.append("incident_id = ?")
+                params.append(incident_id)
+            cleaned_statuses = [status for status in (statuses or []) if status]
+            if cleaned_statuses:
+                where.append(f"status in ({','.join('?' for _ in cleaned_statuses)})")
+                params.extend(cleaned_statuses)
+            for column, value in (
+                ("category", category),
+                ("risk", risk),
+                ("action_type", action_type),
+                ("source", source),
+            ):
+                if value:
+                    where.append(f"{column} = ?")
+                    params.append(value)
+            where_sql = f"where {' and '.join(where)}" if where else ""
+            rows = self.connection.execute(
+                f"""
+                select * from incident_recommendations
+                {where_sql}
+                order by updated_at desc, created_at desc, id desc
+                limit ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [recommendation_payload(row) for row in rows]
+
     def get_incident_recommendation(self, recommendation_id: int) -> dict | None:
         with self.lock:
             row = self.connection.execute(

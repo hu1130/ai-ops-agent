@@ -4,6 +4,7 @@ import html
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
+from urllib.parse import parse_qs, urlsplit
 
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.auth import AuthResult, authenticate_token, configured_api_tokens, has_role
@@ -15,6 +16,9 @@ from ops_agent.remediation.recommendations import (
     request_recommendation_approval,
 )
 from ops_agent.storage import Storage
+
+
+ACTIONABLE_RECOMMENDATION_STATUSES = ["suggested", "pending_approval", "failed", "verified_failed", "skipped"]
 
 
 def start_dashboard(
@@ -30,7 +34,7 @@ def start_dashboard(
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
-            path = self.path.split("?", 1)[0]
+            path, query = split_request_path(self.path)
             if path.startswith("/api/") and protect_reads:
                 auth = self.require_role(path, "viewer")
                 if auth is None:
@@ -87,6 +91,15 @@ def start_dashboard(
                 return
             if path == "/api/actions/failed":
                 self.send_json(storage.latest_failed_action_logs())
+                return
+            if path == "/api/recommendations":
+                self.send_json(storage.latest_recommendations(**recommendation_filters_from_query(query)))
+                return
+            if path == "/api/recommendations/pending":
+                self.send_json(storage.latest_recommendations(statuses=["pending_approval"]))
+                return
+            if path == "/api/recommendations/actionable":
+                self.send_json(storage.latest_recommendations(statuses=ACTIONABLE_RECOMMENDATION_STATUSES))
                 return
             recommendation_request = parse_recommendation_api_path(path)
             if recommendation_request:
@@ -397,6 +410,58 @@ def start_dashboard(
     actual_host, actual_port = server.server_address
     print(f"Dashboard: http://{actual_host}:{actual_port}")
     return server
+
+
+def split_request_path(raw_path: str) -> tuple[str, dict[str, list[str]]]:
+    parsed = urlsplit(raw_path)
+    return parsed.path, parse_qs(parsed.query, keep_blank_values=False)
+
+
+def recommendation_filters_from_query(query: dict[str, list[str]]) -> dict:
+    return {
+        "limit": query_limit(query, default=50, maximum=200),
+        "incident_id": query_optional_int(query, "incident_id"),
+        "statuses": query_statuses(query),
+        "category": query_text(query, "category"),
+        "risk": query_text(query, "risk"),
+        "action_type": query_text(query, "action_type"),
+        "source": query_text(query, "source"),
+    }
+
+
+def query_text(query: dict[str, list[str]], key: str) -> str:
+    values = query.get(key, [])
+    return str(values[0]).strip() if values else ""
+
+
+def query_optional_int(query: dict[str, list[str]], key: str) -> int | None:
+    text = query_text(query, key)
+    if not text:
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def query_limit(query: dict[str, list[str]], default: int, maximum: int) -> int:
+    text = query_text(query, "limit")
+    if not text:
+        return default
+    try:
+        value = int(text)
+    except ValueError:
+        return default
+    return min(max(value, 1), maximum)
+
+
+def query_statuses(query: dict[str, list[str]]) -> list[str]:
+    raw_values = query.get("status", []) + query.get("statuses", [])
+    statuses: list[str] = []
+    for value in raw_values:
+        statuses.extend(part.strip() for part in str(value).split(",") if part.strip())
+    return statuses
 
 
 def render_page(storage: Storage) -> str:
@@ -740,6 +805,9 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/actions/pending": ("action.pending", "action", None),
         "/api/incidents": ("incident.list", "incident", None),
         "/api/incidents/escalated": ("incident.escalated", "incident", None),
+        "/api/recommendations": ("recommendation.list", "recommendation", None),
+        "/api/recommendations/actionable": ("recommendation.actionable", "recommendation", None),
+        "/api/recommendations/pending": ("recommendation.pending", "recommendation", None),
         "/api/summary": ("summary.read", "summary", None),
         "/api/results": ("result.list", "result", None),
     }
