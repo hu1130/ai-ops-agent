@@ -288,6 +288,8 @@ python -m ops_agent.cli --config .\config.json run-action --type restart_docker_
 - `last_seen_at`: 最近出现时间
 - `last_summary`: 最近一次异常摘要
 
+恢复闭环不只依赖进程内存。服务重启后，如果数据库里还有 active 事件，调度器会用事件指纹匹配当前健康结果；只有该事件关联的所有监控目标都在本轮恢复正常时，才会自动转为 `resolved` 并发送恢复通知。
+
 当前状态：
 
 - `open`: 新告警已创建

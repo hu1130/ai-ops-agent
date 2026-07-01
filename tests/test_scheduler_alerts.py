@@ -153,6 +153,84 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertEqual(1, len(first_notifier.sent))
         self.assertEqual(0, len(restarted_notifier.sent))
 
+    def test_healthy_check_resolves_existing_open_incident_after_scheduler_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 1, "recovery_enabled": True},
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            first_scheduler = OpsScheduler(config, storage, RecordingNotifier())
+            first_scheduler.process_alert_states(
+                [CheckResult(source="http", name="Site", status="critical", summary="Request failed")]
+            )
+            open_incident = storage.latest_incidents(1)[0]
+
+            restarted_notifier = RecordingNotifier()
+            restarted_scheduler = OpsScheduler(config, storage, restarted_notifier)
+            restarted_scheduler.process_alert_states(
+                [CheckResult(source="http", name="Site", status="ok", summary="HTTP 200")]
+            )
+            resolved = storage.get_incident(open_incident["id"])
+            events = storage.latest_incident_events(open_incident["id"])
+            storage.close()
+
+        self.assertEqual("resolved", resolved["status"])
+        self.assertIn("resolved", [event["to_status"] for event in events])
+        self.assertEqual(1, len(restarted_notifier.sent))
+        self.assertEqual("Ops Agent recovered 1 issue(s)", restarted_notifier.sent[0][0])
+
+    def test_multi_target_incident_requires_all_targets_healthy_before_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 1, "recovery_enabled": True},
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 2 issue(s)",
+                "analysis",
+                [
+                    CheckResult(source="http", name="Site", status="critical", summary="Request failed"),
+                    CheckResult(source="json_api", name="Chat", status="warning", summary="Slow response"),
+                ],
+                fingerprint="prod:normal:http:Site|json_api:Chat",
+            )
+
+            scheduler.process_alert_states(
+                [CheckResult(source="http", name="Site", status="ok", summary="HTTP 200")]
+            )
+            still_open = storage.get_incident(incident_id)
+
+            scheduler.process_alert_states(
+                [
+                    CheckResult(source="http", name="Site", status="ok", summary="HTTP 200"),
+                    CheckResult(source="json_api", name="Chat", status="ok", summary="Fast response"),
+                ]
+            )
+            resolved = storage.get_incident(incident_id)
+            events = storage.latest_incident_events(incident_id)
+            storage.close()
+
+        self.assertEqual("open", still_open["status"])
+        self.assertEqual("resolved", resolved["status"])
+        self.assertIn("resolved", [event["to_status"] for event in events])
+        self.assertEqual(1, len(notifier.sent))
+        self.assertEqual("Ops Agent recovered 2 issue(s)", notifier.sent[0][0])
+
     def test_playbook_halt_skips_remaining_steps_after_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AppConfig(

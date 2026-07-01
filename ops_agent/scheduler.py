@@ -26,7 +26,7 @@ from ops_agent.remediation.playbooks import (
 from ops_agent.remediation.planner import build_remediation_plan
 from ops_agent.remediation.verifier import verify_after_action
 from ops_agent.retention import format_retention_result, run_retention_cleanup
-from ops_agent.storage import Storage
+from ops_agent.storage import Storage, fingerprint_target_keys
 
 
 @dataclass
@@ -70,6 +70,7 @@ class OpsScheduler:
         recoveries: list[CheckResult] = []
         recovery_incident_ids: set[int] = set()
         repeated_by_incident: dict[int, list[CheckResult]] = {}
+        ok_results_by_context: dict[tuple[str, str], dict[str, CheckResult]] = {}
 
         for result in results:
             key = check_key(result)
@@ -91,6 +92,24 @@ class OpsScheduler:
                 state.is_open = False
                 state.last_summary = result.summary
                 state.incident_id = None
+                context_key = (result.environment or "prod", result.run_type or "normal")
+                ok_results_by_context.setdefault(context_key, {})[key] = result
+
+        if recovery_enabled:
+            existing_recovery_keys = {check_key(result) for result in recoveries}
+            for (environment, run_type), ok_results_by_key in ok_results_by_context.items():
+                recovered_incidents = self.storage.find_recoverable_active_incidents(
+                    environment,
+                    run_type,
+                    ok_results_by_key.keys(),
+                )
+                for incident in recovered_incidents:
+                    recovery_incident_ids.add(int(incident["id"]))
+                    for target_key in fingerprint_target_keys(str(incident.get("fingerprint", ""))):
+                        result = ok_results_by_key.get(target_key)
+                        if result and target_key not in existing_recovery_keys:
+                            recoveries.append(result)
+                            existing_recovery_keys.add(target_key)
 
         for incident_id, repeated_results in repeated_by_incident.items():
             self.update_existing_incident(incident_id, repeated_results)

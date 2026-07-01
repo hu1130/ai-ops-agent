@@ -113,6 +113,34 @@ class IncidentLifecycleTest(unittest.TestCase):
         self.assertIn("http/Site", updated["last_summary"])
         self.assertIsNone(resolved_lookup)
 
+    def test_active_incidents_can_be_matched_by_fingerprint_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            site = CheckResult(source="http", name="Site", status="critical", summary="Down")
+            chat = CheckResult(source="json_api", name="Chat", status="warning", summary="Slow")
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 2 issues",
+                "analysis",
+                [site, chat],
+                fingerprint="prod:normal:http:Site|json_api:Chat",
+            )
+            site_matches = storage.find_active_incidents_for_check("prod", "normal", "http:Site")
+            partial_recoveries = storage.find_recoverable_active_incidents("prod", "normal", ["http:Site"])
+            full_recoveries = storage.find_recoverable_active_incidents(
+                "prod",
+                "normal",
+                ["http:Site", "json_api:Chat"],
+            )
+            storage.transition_incident(incident_id, "resolved", actor="test")
+            resolved_matches = storage.find_active_incidents_for_check("prod", "normal", "http:Site")
+            storage.close()
+
+        self.assertEqual([incident_id], [row["id"] for row in site_matches])
+        self.assertEqual([], partial_recoveries)
+        self.assertEqual([incident_id], [row["id"] for row in full_recoveries])
+        self.assertEqual([], resolved_matches)
+
 
 if __name__ == "__main__":
     unittest.main()

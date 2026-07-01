@@ -339,6 +339,47 @@ class Storage:
             ).fetchone()
         return dict(row) if row else None
 
+    def find_active_incidents_for_check(self, environment: str, run_type: str, target_key: str) -> list[dict]:
+        if not target_key:
+            return []
+        return [
+            row
+            for row in self.active_fingerprint_incidents(environment, run_type)
+            if target_key in fingerprint_target_keys(str(row.get("fingerprint", "")))
+        ]
+
+    def find_recoverable_active_incidents(
+        self,
+        environment: str,
+        run_type: str,
+        recovered_target_keys: Sequence[str],
+    ) -> list[dict]:
+        recovered_keys = {key for key in recovered_target_keys if key}
+        if not recovered_keys:
+            return []
+
+        recoverable: list[dict] = []
+        for row in self.active_fingerprint_incidents(environment, run_type):
+            targets = fingerprint_target_keys(str(row.get("fingerprint", "")))
+            if targets and targets.issubset(recovered_keys):
+                recoverable.append(row)
+        return recoverable
+
+    def active_fingerprint_incidents(self, environment: str, run_type: str) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                """
+                select * from incidents
+                where environment = ?
+                  and run_type = ?
+                  and fingerprint <> ''
+                  and status not in ('resolved', 'closed')
+                order by id desc
+                """,
+                (environment or "prod", run_type or "normal"),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def update_incident_occurrence(
         self,
         incident_id: int,
@@ -1000,6 +1041,13 @@ def summarize_results(results: list[CheckResult]) -> str:
         f"{result.source}/{result.name}: {result.summary}"
         for result in results
     )
+
+
+def fingerprint_target_keys(fingerprint: str) -> set[str]:
+    parts = (fingerprint or "").split(":", 2)
+    if len(parts) < 3:
+        return set()
+    return {target for target in parts[2].split("|") if target}
 
 
 def max_severity(current: str, incoming: str) -> str:
