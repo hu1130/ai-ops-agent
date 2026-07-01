@@ -59,6 +59,32 @@ class IncidentLifecycleTest(unittest.TestCase):
                 storage.transition_incident(incident_id, "open", actor="alice")
             storage.close()
 
+    def test_action_logs_can_be_linked_to_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            incident_id = storage.save_incident(
+                "warning",
+                "Ops Agent detected 1 issue",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="warning", summary="Slow")],
+            )
+            storage.save_action_log(
+                "check_port",
+                "Check port",
+                "low",
+                "dry_run",
+                "diagnose",
+                {"host": "example.com", "port": 443},
+                incident_id=incident_id,
+            )
+            linked = storage.latest_action_logs(10, incident_id=incident_id)
+            unlinked = storage.latest_action_logs(10, incident_id=999)
+            storage.close()
+
+        self.assertEqual(1, len(linked))
+        self.assertEqual(incident_id, linked[0]["incident_id"])
+        self.assertEqual([], unlinked)
+
 
 if __name__ == "__main__":
     unittest.main()

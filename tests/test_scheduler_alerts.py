@@ -61,6 +61,7 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertTrue(any(row["environment"] == "staging" for row in rows))
         self.assertTrue(any(row["run_type"] == "synthetic_test" for row in rows))
         self.assertTrue(any(row["trace_id"] == "trace-1" for row in rows))
+        self.assertTrue(all(row["incident_id"] for row in rows))
 
     def test_recovery_resolves_open_incident(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

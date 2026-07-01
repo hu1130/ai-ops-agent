@@ -46,6 +46,15 @@ class DashboardTest(unittest.TestCase):
             storage = Storage(Path(tmp) / "ops.db")
             result = CheckResult(source="json", name="AI", status="warning", summary="Slow")
             incident_id = storage.save_incident("warning", "Ops Agent detected 1 issue(s)", "analysis", [result])
+            storage.save_action_log(
+                "check_port",
+                "Check port",
+                "low",
+                "dry_run",
+                "diagnose",
+                {"host": "example.com", "port": 443},
+                incident_id=incident_id,
+            )
             server = start_dashboard(storage, "127.0.0.1", 0)
             host, port = server.server_address
             try:
@@ -62,6 +71,11 @@ class DashboardTest(unittest.TestCase):
                     timeout=5,
                 ) as response:
                     events_body = response.read().decode("utf-8")
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/actions",
+                    timeout=5,
+                ) as response:
+                    actions_body = response.read().decode("utf-8")
             finally:
                 server.shutdown()
                 server.server_close()
@@ -69,6 +83,7 @@ class DashboardTest(unittest.TestCase):
 
         self.assertIn('"status": "acknowledged"', body)
         self.assertIn('"to_status": "acknowledged"', events_body)
+        self.assertIn('"incident_id":', actions_body)
 
 
 if __name__ == "__main__":

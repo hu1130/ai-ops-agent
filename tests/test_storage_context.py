@@ -76,6 +76,10 @@ class StorageContextTest(unittest.TestCase):
             storage.save_results([CheckResult(source="http", name="Site", status="ok", summary="HTTP 200")])
             rows = storage.latest_results()
             recovered_incident = storage.latest_incidents(1)[0]
+            action_columns = [
+                row["name"]
+                for row in storage.connection.execute("pragma table_info(action_logs)").fetchall()
+            ]
             incident_events_exists = storage.connection.execute(
                 "select name from sqlite_master where type = 'table' and name = 'incident_events'"
             ).fetchone()
@@ -84,6 +88,7 @@ class StorageContextTest(unittest.TestCase):
         self.assertEqual("prod", rows[0]["environment"])
         self.assertEqual("normal", rows[0]["run_type"])
         self.assertIn("trace_id", rows[0])
+        self.assertIn("incident_id", action_columns)
         self.assertEqual("resolved", recovered_incident["status"])
         self.assertIsNotNone(incident_events_exists)
 

@@ -210,6 +210,12 @@ python -m ops_agent.cli --config .\config.json incidents
 python -m ops_agent.cli --config .\config.json incident-events --id 1
 ```
 
+查看某个事件关联的处置动作：
+
+```powershell
+python -m ops_agent.cli --config .\config.json action-logs --incident-id 1
+```
+
 人工确认事件：
 
 ```powershell
@@ -228,6 +234,7 @@ python -m ops_agent.cli --config .\config.json incident-transition --id 1 --stat
 GET  /api/incidents
 GET  /api/incidents/1
 GET  /api/incidents/1/events
+GET  /api/incidents/1/actions
 POST /api/incidents/1/ack
 POST /api/incidents/1/resolve
 POST /api/incidents/1/close
@@ -242,6 +249,12 @@ POST /api/incidents/1/transition
   "actor": "owner",
   "note": "开始处理"
 }
+```
+
+手动执行动作时可以绑定事件：
+
+```powershell
+python -m ops_agent.cli --config .\config.json run-action --type check_port --host 127.0.0.1 --port 8765 --incident-id 1
 ```
 
 ## 环境和测试数据标记

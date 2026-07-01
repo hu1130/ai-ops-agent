@@ -88,10 +88,12 @@ class OpsScheduler:
             diagnostics = format_snapshot(collect_diagnostics(new_alerts, self.config))
             suggestions = build_action_suggestions(new_alerts)
             action_plan = build_remediation_plan(new_alerts, self.config)
-            action_results = self.process_remediation_actions(action_plan, new_alerts)
-            remediation_text = format_action_plan(action_plan, action_results)
-            analysis = f"{analysis}{suggestions}{diagnostics}{remediation_text}"
+            analysis = f"{analysis}{suggestions}{diagnostics}"
             incident_id = self.storage.save_incident(severity, title, analysis, new_alerts)
+            action_results = self.process_remediation_actions(action_plan, new_alerts, incident_id=incident_id)
+            remediation_text = format_action_plan(action_plan, action_results)
+            analysis = f"{analysis}{remediation_text}"
+            self.storage.update_incident_analysis(incident_id, analysis)
             for result in new_alerts:
                 self._issues[check_key(result)].incident_id = incident_id
             next_status = incident_status_from_action_results(action_results)
@@ -119,7 +121,12 @@ class OpsScheduler:
                 )
             self.notifier.send(title, text, dedupe_key="recovered:" + problem_key(recoveries))
 
-    def process_remediation_actions(self, actions, context_results: list[CheckResult] | None = None):
+    def process_remediation_actions(
+        self,
+        actions,
+        context_results: list[CheckResult] | None = None,
+        incident_id: int | None = None,
+    ):
         if not actions:
             return []
 
@@ -147,6 +154,7 @@ class OpsScheduler:
                 environment=context.environment,
                 run_type=context.run_type,
                 trace_id=context.trace_id,
+                incident_id=incident_id,
             )
             results.append(result)
         return results

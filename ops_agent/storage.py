@@ -74,6 +74,7 @@ class Storage:
 
                 create table if not exists action_logs (
                     id integer primary key autoincrement,
+                    incident_id integer,
                     created_at text not null,
                     updated_at text,
                     environment text not null default 'prod',
@@ -155,6 +156,7 @@ class Storage:
             for row in self.connection.execute("pragma table_info(action_logs)").fetchall()
         }
         additions = {
+            "incident_id": "alter table action_logs add column incident_id integer",
             "updated_at": "alter table action_logs add column updated_at text",
             "approved_by": "alter table action_logs add column approved_by text",
             "approved_at": "alter table action_logs add column approved_at text",
@@ -429,16 +431,19 @@ class Storage:
         environment: str = "prod",
         run_type: str = "normal",
         trace_id: str = "",
+        incident_id: int | None = None,
     ) -> int:
         with self.lock:
             cursor = self.connection.execute(
                 """
                 insert into action_logs (
-                    created_at, environment, run_type, trace_id, action_type, title, risk, status, reason, params_json, output, error
+                    incident_id, created_at, environment, run_type, trace_id,
+                    action_type, title, risk, status, reason, params_json, output, error
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    incident_id,
                     utc_now_iso(),
                     environment or "prod",
                     run_type or "normal",
@@ -492,17 +497,41 @@ class Storage:
             )
             self.connection.commit()
 
-    def latest_action_logs(self, limit: int = 50) -> list[dict]:
+    def latest_action_logs(self, limit: int = 50, incident_id: int | None = None) -> list[dict]:
         with self.lock:
-            rows = self.connection.execute(
-                """
-                select * from action_logs
-                order by id desc
-                limit ?
-                """,
-                (limit,),
-            ).fetchall()
+            if incident_id is None:
+                rows = self.connection.execute(
+                    """
+                    select * from action_logs
+                    order by id desc
+                    limit ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = self.connection.execute(
+                    """
+                    select * from action_logs
+                    where incident_id = ?
+                    order by id desc
+                    limit ?
+                    """,
+                    (incident_id, limit),
+                ).fetchall()
         return [dict(row) for row in rows]
+
+    def update_incident_analysis(self, incident_id: int, analysis: str) -> None:
+        with self.lock:
+            self.connection.execute(
+                """
+                update incidents
+                set analysis = ?,
+                    updated_at = ?
+                where id = ?
+                """,
+                (analysis, utc_now_iso(), incident_id),
+            )
+            self.connection.commit()
 
     def count_retention_candidates(
         self,
@@ -604,6 +633,15 @@ class Storage:
             self.connection.execute(
                 f"delete from check_results where {check_where}",
                 check_params,
+            )
+            self.connection.execute(
+                f"""
+                delete from incident_events
+                where incident_id in (
+                    select id from incidents where {incident_where}
+                )
+                """,
+                incident_params,
             )
             self.connection.execute(f"delete from incidents where {incident_where}", incident_params)
             self.connection.execute(f"delete from action_logs where {action_where}", action_params)

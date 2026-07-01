@@ -87,6 +87,14 @@ class RetentionTest(unittest.TestCase):
                 """,
                 (old,),
             )
+            incident_id = storage.connection.execute("select id from incidents").fetchone()[0]
+            storage.connection.execute(
+                """
+                insert into incident_events (incident_id, created_at, from_status, to_status, actor, note, metadata_json)
+                values (?, ?, '', 'open', 'system', 'created', '{}')
+                """,
+                (incident_id, old),
+            )
             storage.connection.execute(
                 """
                 insert into action_logs (created_at, action_type, title, risk, status, reason, params_json, output, error)
@@ -102,12 +110,14 @@ class RetentionTest(unittest.TestCase):
             )
             incidents = storage.latest_incidents()
             actions = storage.latest_action_logs()
+            incident_events = storage.latest_incident_events(incident_id)
             storage.close()
 
         self.assertEqual(1, result.deleted_incidents)
         self.assertEqual(1, result.deleted_action_logs)
         self.assertEqual([], incidents)
         self.assertEqual([], actions)
+        self.assertEqual([], incident_events)
 
     def test_test_incidents_and_actions_use_shorter_retention_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

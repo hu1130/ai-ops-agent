@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     run_parser.add_argument("--command", dest="diagnostic_command", default="", help="Read-only diagnostic command")
     run_parser.add_argument("--service", default="", help="Service name for restart_service")
     run_parser.add_argument("--container", default="", help="Container name for restart_docker_container")
+    run_parser.add_argument("--incident-id", type=int, default=0, help="Related incident id")
     run_parser.add_argument("--execute", action="store_true", help="Actually execute safe actions; default is dry-run")
     add_verify_args(run_parser)
 
@@ -60,7 +61,8 @@ def parse_args() -> argparse.Namespace:
     transition_parser.add_argument("--actor", default="operator", help="Actor name")
     transition_parser.add_argument("--note", default="", help="Transition note")
 
-    subparsers.add_parser("action-logs", help="Show latest remediation action audit logs")
+    action_logs_parser = subparsers.add_parser("action-logs", help="Show latest remediation action audit logs")
+    action_logs_parser.add_argument("--incident-id", type=int, default=0, help="Filter by incident id")
     return parser.parse_args()
 
 
@@ -138,13 +140,15 @@ def main() -> int:
 
     if args.command == "action-logs":
         storage = open_storage(config)
-        rows = storage.latest_action_logs(20)
+        rows = storage.latest_action_logs(20, incident_id=args.incident_id or None)
         storage.close()
         if not rows:
             print("暂无处置动作日志。")
             return 0
         for row in rows:
             line = f"#{row['id']} [{row['created_at']}] {row['status']} {row['action_type']} {row['title']}"
+            if row.get("incident_id"):
+                line += f" incident_id={row['incident_id']}"
             if row.get("approved_by"):
                 line += f" approved_by={row['approved_by']}"
             if row.get("verify_status"):
@@ -177,6 +181,7 @@ def run_action_command(args: argparse.Namespace, config: AppConfig) -> int:
             environment=context.environment,
             run_type=context.run_type,
             trace_id=context.trace_id,
+            incident_id=args.incident_id or None,
         )
         storage.close()
         print(f"动作已进入待确认队列: #{action_id}")
@@ -196,6 +201,7 @@ def run_action_command(args: argparse.Namespace, config: AppConfig) -> int:
         environment=context.environment,
         run_type=context.run_type,
         trace_id=context.trace_id,
+        incident_id=args.incident_id or None,
     )
     verification = verify_and_record(action_id, action, result.status, config, storage)
     storage.close()
@@ -301,7 +307,41 @@ def verify_and_record(
         output = verification.output or verification.error
         storage.update_action_verification(action_id, verification.status, output)
         notify_verification_result(config, action, verification)
+    update_related_incident_after_action(storage, action_id, action, verification)
     return verification
+
+
+def update_related_incident_after_action(
+    storage: Storage,
+    action_id: int,
+    action: RemediationAction,
+    verification: VerificationResult,
+) -> None:
+    if action.action_type not in MUTATING_ACTIONS:
+        return
+    row = storage.get_action_log(action_id)
+    if not row or not row.get("incident_id"):
+        return
+    incident_id = int(row["incident_id"])
+    if verification.status == "verified_ok":
+        target = "resolved"
+        note = "remediation action verified"
+    elif verification.status == "verified_failed":
+        target = "remediating"
+        note = "remediation verification failed"
+    else:
+        target = "verifying"
+        note = "remediation action executed"
+    try:
+        storage.transition_incident(
+            incident_id,
+            target,
+            actor="ops-agent",
+            note=note,
+            metadata={"action_id": action_id, "verification_status": verification.status},
+        )
+    except ValueError:
+        return
 
 
 def notify_verification_result(config: AppConfig, action: RemediationAction, verification: VerificationResult) -> None:
