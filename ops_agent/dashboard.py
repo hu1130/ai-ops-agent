@@ -62,6 +62,9 @@ def start_dashboard(
                 if action == "events":
                     self.send_json(storage.latest_incident_events(incident_id))
                     return
+                if action == "recommendations":
+                    self.send_json(storage.latest_incident_recommendations(incident_id))
+                    return
                 if action == "actions":
                     self.send_json(storage.latest_action_logs(100, incident_id=incident_id))
                     return

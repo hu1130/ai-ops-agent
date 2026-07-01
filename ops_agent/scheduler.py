@@ -23,7 +23,8 @@ from ops_agent.remediation.playbooks import (
     playbook_meta,
     playbook_rollback_actions,
 )
-from ops_agent.remediation.planner import build_remediation_plan
+from ops_agent.remediation.planner import build_remediation_plan, public_params
+from ops_agent.remediation.policy import decide_action_policy
 from ops_agent.remediation.verifier import verify_after_action
 from ops_agent.retention import format_retention_result, run_retention_cleanup
 from ops_agent.storage import Storage, fingerprint_target_keys
@@ -152,6 +153,15 @@ class OpsScheduler:
                 occurrence_count=len(new_alerts),
             )
             action_results = self.process_remediation_actions(action_plan, new_alerts, incident_id=incident_id)
+            self.storage.save_incident_recommendations(
+                incident_id,
+                build_incident_recommendations(
+                    action_plan,
+                    action_results,
+                    self.config,
+                    context_from_results(new_alerts),
+                ),
+            )
             remediation_text = format_action_plan(action_plan, action_results)
             analysis = f"{analysis}{remediation_text}"
             self.storage.update_incident_analysis(incident_id, analysis)
@@ -538,6 +548,89 @@ def context_from_results(results: list[CheckResult]) -> RunContext:
         run_type=common_context_value([result.run_type for result in results], "normal"),
         trace_id=common_context_value([result.trace_id for result in results], ""),
     )
+
+
+def build_incident_recommendations(
+    planned_actions: list[RemediationAction],
+    action_results: list[ActionResult],
+    config: AppConfig,
+    context: RunContext,
+) -> list[dict]:
+    if action_results:
+        return [
+            recommendation_from_action_result(index, result, config, context)
+            for index, result in enumerate(action_results, start=1)
+        ]
+    return [
+        recommendation_from_action(index, action, config, context, status="suggested")
+        for index, action in enumerate(planned_actions, start=1)
+    ]
+
+
+def recommendation_from_action_result(
+    position: int,
+    result: ActionResult,
+    config: AppConfig,
+    context: RunContext,
+) -> dict:
+    recommendation = recommendation_from_action(
+        position,
+        result.action,
+        config,
+        context,
+        status=result.status,
+    )
+    if result.output:
+        recommendation["metadata"]["output"] = result.output
+    if result.error:
+        recommendation["metadata"]["error"] = result.error
+    return recommendation
+
+
+def recommendation_from_action(
+    position: int,
+    action: RemediationAction,
+    config: AppConfig,
+    context: RunContext,
+    status: str,
+) -> dict:
+    decision = decide_action_policy(action, config)
+    meta = playbook_meta(action)
+    approval_required = decision.requires_approval if decision.configured else action.action_type in MUTATING_ACTIONS
+    verification_required = bool(decision.verification_required or action.params.get("verify_after"))
+    metadata = {
+        "policy_configured": decision.configured,
+        "policy_name": decision.policy_name,
+        "policy_allowed": decision.allowed,
+        "policy_reason": decision.reason,
+        "playbook": meta,
+    }
+    return {
+        "environment": context.environment,
+        "run_type": context.run_type,
+        "trace_id": context.trace_id,
+        "position": position,
+        "category": str(meta.get("stage") or infer_recommendation_category(action.action_type)),
+        "action_type": action.action_type,
+        "title": action.title,
+        "reason": action.reason,
+        "risk": action.risk,
+        "approval_required": approval_required,
+        "auto_execute": action.auto_execute,
+        "verification_required": verification_required,
+        "status": status,
+        "params": public_params(action.params),
+        "source": "playbook" if meta else "planner",
+        "metadata": metadata,
+    }
+
+
+def infer_recommendation_category(action_type: str) -> str:
+    if action_type in {"check_port", "check_process", "run_diagnostic_command"}:
+        return "diagnose"
+    if action_type in MUTATING_ACTIONS:
+        return "remediate"
+    return "action"
 
 
 def common_context_value(values: list[str], default: str) -> str:

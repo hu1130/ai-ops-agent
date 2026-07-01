@@ -94,6 +94,21 @@ class DashboardTest(unittest.TestCase):
             result = CheckResult(source="json_api", name="AI", status="warning", summary="Slow")
             incident_id = storage.save_incident("warning", "Ops Agent detected 1 issue(s)", "analysis", [result])
             storage.escalate_incident(incident_id, 1, "failed remediation", metadata={"rule": "test"})
+            storage.save_incident_recommendations(
+                incident_id,
+                [
+                    {
+                        "position": 1,
+                        "category": "diagnose",
+                        "action_type": "check_port",
+                        "title": "Check service port",
+                        "reason": "Synthetic response is slow",
+                        "risk": "low",
+                        "status": "suggested",
+                        "params": {"host": "example.com", "port": 443},
+                    }
+                ],
+            )
             storage.save_action_log(
                 "check_port",
                 "Check port",
@@ -134,6 +149,11 @@ class DashboardTest(unittest.TestCase):
                     timeout=5,
                 ) as response:
                     failed_actions = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/recommendations",
+                    timeout=5,
+                ) as response:
+                    recommendations = json.loads(response.read().decode("utf-8"))
             finally:
                 server.shutdown()
                 server.server_close()
@@ -142,11 +162,15 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(incident_id, detail["incident"]["id"])
         self.assertTrue(detail["summary"]["is_escalated"])
         self.assertEqual(1, detail["summary"]["escalation_level"])
+        self.assertEqual(1, detail["summary"]["recommendation_count"])
         self.assertEqual(2, detail["summary"]["action_count"])
         self.assertEqual(1, detail["summary"]["failed_action_count"])
         self.assertEqual("failed remediation", detail["incident"]["escalation_reason"])
+        self.assertEqual("check_port", detail["recommendations"][0]["action_type"])
+        self.assertEqual("example.com", detail["recommendations"][0]["params"]["host"])
         self.assertTrue(any(event["note"] == "incident escalated" for event in detail["events"]))
         self.assertEqual("failed", detail["failed_actions"][0]["status"])
+        self.assertEqual("check_port", recommendations[0]["action_type"])
         self.assertEqual(1, len(failed_actions))
         self.assertEqual(incident_id, failed_actions[0]["incident_id"])
 

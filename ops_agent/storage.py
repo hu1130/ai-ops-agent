@@ -82,6 +82,29 @@ class Storage:
                     metadata_json text not null
                 );
 
+                create table if not exists incident_recommendations (
+                    id integer primary key autoincrement,
+                    incident_id integer not null,
+                    created_at text not null,
+                    updated_at text,
+                    environment text not null default 'prod',
+                    run_type text not null default 'normal',
+                    trace_id text not null default '',
+                    position integer not null default 0,
+                    category text not null default 'diagnose',
+                    action_type text not null default '',
+                    title text not null,
+                    reason text not null,
+                    risk text not null default 'low',
+                    approval_required integer not null default 0,
+                    auto_execute integer not null default 0,
+                    verification_required integer not null default 0,
+                    status text not null default 'suggested',
+                    params_json text not null default '{}',
+                    source text not null default 'planner',
+                    metadata_json text not null default '{}'
+                );
+
                 create table if not exists action_logs (
                     id integer primary key autoincrement,
                     incident_id integer,
@@ -122,11 +145,15 @@ class Storage:
                     message text not null,
                     metadata_json text not null
                 );
+
+                create index if not exists idx_incident_recommendations_incident
+                    on incident_recommendations (incident_id, position, id);
                 """
             )
             self.ensure_context_columns()
             self.ensure_incident_lifecycle_columns()
             self.ensure_action_log_columns()
+            self.ensure_recommendation_columns()
             self.connection.commit()
 
     def ensure_context_columns(self) -> None:
@@ -226,6 +253,32 @@ class Storage:
             "decision_by": "alter table action_logs add column decision_by text",
             "decision_at": "alter table action_logs add column decision_at text",
             "decision_note": "alter table action_logs add column decision_note text",
+        }
+        for column, statement in additions.items():
+            if column not in columns:
+                self.connection.execute(statement)
+
+    def ensure_recommendation_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("pragma table_info(incident_recommendations)").fetchall()
+        }
+        additions = {
+            "updated_at": "alter table incident_recommendations add column updated_at text",
+            "environment": "alter table incident_recommendations add column environment text not null default 'prod'",
+            "run_type": "alter table incident_recommendations add column run_type text not null default 'normal'",
+            "trace_id": "alter table incident_recommendations add column trace_id text not null default ''",
+            "position": "alter table incident_recommendations add column position integer not null default 0",
+            "category": "alter table incident_recommendations add column category text not null default 'diagnose'",
+            "action_type": "alter table incident_recommendations add column action_type text not null default ''",
+            "risk": "alter table incident_recommendations add column risk text not null default 'low'",
+            "approval_required": "alter table incident_recommendations add column approval_required integer not null default 0",
+            "auto_execute": "alter table incident_recommendations add column auto_execute integer not null default 0",
+            "verification_required": "alter table incident_recommendations add column verification_required integer not null default 0",
+            "status": "alter table incident_recommendations add column status text not null default 'suggested'",
+            "params_json": "alter table incident_recommendations add column params_json text not null default '{}'",
+            "source": "alter table incident_recommendations add column source text not null default 'planner'",
+            "metadata_json": "alter table incident_recommendations add column metadata_json text not null default '{}'",
         }
         for column, statement in additions.items():
             if column not in columns:
@@ -336,6 +389,50 @@ class Storage:
             )
             self.connection.commit()
             return incident_id
+
+    def save_incident_recommendations(self, incident_id: int, recommendations: list[dict]) -> None:
+        now = utc_now_iso()
+        with self.lock:
+            self.connection.execute(
+                "delete from incident_recommendations where incident_id = ?",
+                (incident_id,),
+            )
+            self.connection.executemany(
+                """
+                insert into incident_recommendations (
+                    incident_id, created_at, updated_at, environment, run_type, trace_id,
+                    position, category, action_type, title, reason, risk,
+                    approval_required, auto_execute, verification_required, status,
+                    params_json, source, metadata_json
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        incident_id,
+                        now,
+                        now,
+                        str(item.get("environment") or "prod"),
+                        str(item.get("run_type") or "normal"),
+                        str(item.get("trace_id") or ""),
+                        int(item.get("position") or index),
+                        str(item.get("category") or "diagnose"),
+                        str(item.get("action_type") or ""),
+                        str(item.get("title") or ""),
+                        str(item.get("reason") or ""),
+                        str(item.get("risk") or "low"),
+                        1 if item.get("approval_required") else 0,
+                        1 if item.get("auto_execute") else 0,
+                        1 if item.get("verification_required") else 0,
+                        str(item.get("status") or "suggested"),
+                        json.dumps(safe_dict(item.get("params")), ensure_ascii=False),
+                        str(item.get("source") or "planner"),
+                        json.dumps(safe_dict(item.get("metadata")), ensure_ascii=False),
+                    )
+                    for index, item in enumerate(recommendations, start=1)
+                ],
+            )
+            self.connection.commit()
 
     def find_active_incident_by_fingerprint(self, fingerprint: str) -> dict | None:
         if not fingerprint:
@@ -553,17 +650,20 @@ class Storage:
         if not incident:
             return None
         events = self.latest_incident_events(incident_id)
+        recommendations = self.latest_incident_recommendations(incident_id)
         actions = self.latest_action_logs(100, incident_id=incident_id)
         failed_actions = self.latest_failed_action_logs(100, incident_id=incident_id)
         return {
             "incident": incident,
             "events": events,
+            "recommendations": recommendations,
             "actions": actions,
             "failed_actions": failed_actions,
             "summary": {
                 "is_escalated": int(incident.get("escalation_level") or 0) > 0,
                 "escalation_level": int(incident.get("escalation_level") or 0),
                 "event_count": len(events),
+                "recommendation_count": len(recommendations),
                 "action_count": len(actions),
                 "failed_action_count": len(failed_actions),
                 "status": incident.get("status", ""),
@@ -583,6 +683,19 @@ class Storage:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def latest_incident_recommendations(self, incident_id: int, limit: int = 100) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                """
+                select * from incident_recommendations
+                where incident_id = ?
+                order by position asc, id asc
+                limit ?
+                """,
+                (incident_id, limit),
+            ).fetchall()
+        return [recommendation_payload(row) for row in rows]
 
     def latest_incident_events(self, incident_id: int, limit: int = 100) -> list[dict]:
         with self.lock:
@@ -1151,6 +1264,15 @@ class Storage:
                 """,
                 incident_params,
             )
+            self.connection.execute(
+                f"""
+                delete from incident_recommendations
+                where incident_id in (
+                    select id from incidents where {incident_where}
+                )
+                """,
+                incident_params,
+            )
             self.connection.execute(f"delete from incidents where {incident_where}", incident_params)
             self.connection.execute(f"delete from action_logs where {action_where}", action_params)
             self.connection.execute(f"delete from api_audit_logs where {api_audit_where}", api_audit_params)
@@ -1248,6 +1370,28 @@ def summarize_results(results: list[CheckResult]) -> str:
         f"{result.source}/{result.name}: {result.summary}"
         for result in results
     )
+
+
+def recommendation_payload(row: sqlite3.Row) -> dict:
+    payload = dict(row)
+    payload["approval_required"] = bool(payload.get("approval_required"))
+    payload["auto_execute"] = bool(payload.get("auto_execute"))
+    payload["verification_required"] = bool(payload.get("verification_required"))
+    payload["params"] = parse_json_object(str(payload.get("params_json") or "{}"))
+    payload["metadata"] = parse_json_object(str(payload.get("metadata_json") or "{}"))
+    return payload
+
+
+def parse_json_object(value: str) -> dict:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def safe_dict(value: object) -> dict:
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def fingerprint_target_keys(fingerprint: str) -> set[str]:

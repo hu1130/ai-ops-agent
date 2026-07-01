@@ -69,12 +69,24 @@ class SchedulerAlertsTest(unittest.TestCase):
                 ]
             )
             rows = storage.latest_action_logs()
+            recommendations = storage.latest_incident_recommendations(rows[0]["incident_id"])
             storage.close()
         self.assertTrue(any(row["action_type"] == "check_port" for row in rows))
         self.assertTrue(any(row["environment"] == "staging" for row in rows))
         self.assertTrue(any(row["run_type"] == "synthetic_test" for row in rows))
         self.assertTrue(any(row["trace_id"] == "trace-1" for row in rows))
         self.assertTrue(all(row["incident_id"] for row in rows))
+        check_port = next(row for row in recommendations if row["action_type"] == "check_port")
+        self.assertEqual("diagnose", check_port["category"])
+        self.assertEqual("dry_run", check_port["status"])
+        self.assertEqual("example.com", check_port["params"]["host"])
+        self.assertEqual(443, check_port["params"]["port"])
+        self.assertTrue(check_port["auto_execute"])
+        self.assertFalse(check_port["approval_required"])
+        self.assertFalse(check_port["verification_required"])
+        self.assertEqual("staging", check_port["environment"])
+        self.assertEqual("synthetic_test", check_port["run_type"])
+        self.assertEqual("trace-1", check_port["trace_id"])
 
     def test_recovery_resolves_open_incident(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

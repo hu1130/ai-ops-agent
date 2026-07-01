@@ -95,6 +95,19 @@ class RetentionTest(unittest.TestCase):
                 """,
                 (incident_id, old),
             )
+            storage.save_incident_recommendations(
+                incident_id,
+                [
+                    {
+                        "position": 1,
+                        "category": "diagnose",
+                        "action_type": "check_port",
+                        "title": "old recommendation",
+                        "reason": "old incident",
+                        "params": {"host": "example.com", "port": 443},
+                    }
+                ],
+            )
             storage.connection.execute(
                 """
                 insert into action_logs (created_at, action_type, title, risk, status, reason, params_json, output, error)
@@ -111,6 +124,7 @@ class RetentionTest(unittest.TestCase):
             incidents = storage.latest_incidents()
             actions = storage.latest_action_logs()
             incident_events = storage.latest_incident_events(incident_id)
+            recommendations = storage.latest_incident_recommendations(incident_id)
             storage.close()
 
         self.assertEqual(1, result.deleted_incidents)
@@ -118,6 +132,7 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual([], incidents)
         self.assertEqual([], actions)
         self.assertEqual([], incident_events)
+        self.assertEqual([], recommendations)
 
     def test_test_incidents_and_actions_use_shorter_retention_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -349,6 +349,7 @@ GET  /api/incidents/escalated
 GET  /api/incidents/1
 GET  /api/incidents/1/detail
 GET  /api/incidents/1/events
+GET  /api/incidents/1/recommendations
 GET  /api/incidents/1/actions
 GET  /api/incidents/1/failed-actions
 POST /api/incidents/1/ack
@@ -357,7 +358,7 @@ POST /api/incidents/1/close
 POST /api/incidents/1/transition
 ```
 
-`GET /api/incidents/1/detail` 会一次返回事件本体、事件流、关联动作、失败动作和摘要字段，方便后续前端直接展示处理闭环和升级原因。
+`GET /api/incidents/1/detail` 会一次返回事件本体、事件流、结构化处置建议、关联动作、失败动作和摘要字段，方便后续前端直接展示处理闭环和升级原因。结构化建议也可以通过 `GET /api/incidents/1/recommendations` 单独读取，字段包括动作类型、风险、是否需要人工确认、是否需要执行后验证、当前状态、参数和策略/playbook 元信息。
 
 API 鉴权：
 
