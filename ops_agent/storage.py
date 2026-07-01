@@ -49,6 +49,11 @@ class Storage:
                     environment text not null default 'prod',
                     run_type text not null default 'normal',
                     trace_id text not null default '',
+                    fingerprint text not null default '',
+                    occurrence_count integer not null default 1,
+                    first_seen_at text,
+                    last_seen_at text,
+                    last_summary text not null default '',
                     status text not null default 'open',
                     severity text not null,
                     title text not null,
@@ -153,6 +158,11 @@ class Storage:
         }
         additions = {
             "updated_at": "alter table incidents add column updated_at text",
+            "fingerprint": "alter table incidents add column fingerprint text not null default ''",
+            "occurrence_count": "alter table incidents add column occurrence_count integer not null default 1",
+            "first_seen_at": "alter table incidents add column first_seen_at text",
+            "last_seen_at": "alter table incidents add column last_seen_at text",
+            "last_summary": "alter table incidents add column last_summary text not null default ''",
             "status": "alter table incidents add column status text not null default 'open'",
             "acknowledged_at": "alter table incidents add column acknowledged_at text",
             "acknowledged_by": "alter table incidents add column acknowledged_by text",
@@ -177,6 +187,14 @@ class Storage:
             update incidents
             set updated_at = coalesce(updated_at, created_at)
             where updated_at is null
+            """
+        )
+        self.connection.execute(
+            """
+            update incidents
+            set first_seen_at = coalesce(first_seen_at, created_at),
+                last_seen_at = coalesce(last_seen_at, updated_at, created_at),
+                last_summary = coalesce(nullif(last_summary, ''), title)
             """
         )
 
@@ -256,17 +274,22 @@ class Storage:
         analysis: str,
         results: list[CheckResult],
         status: str | None = None,
+        fingerprint: str = "",
+        occurrence_count: int = 0,
     ) -> int:
         incident_status = validate_incident_status(status or initial_incident_status(severity))
         created_at = utc_now_iso()
+        occurrences = occurrence_count if occurrence_count > 0 else max(1, len(results))
+        last_summary = summarize_results(results) or title
         with self.lock:
             cursor = self.connection.execute(
                 """
                 insert into incidents (
-                    created_at, updated_at, environment, run_type, trace_id, status,
+                    created_at, updated_at, environment, run_type, trace_id,
+                    fingerprint, occurrence_count, first_seen_at, last_seen_at, last_summary, status,
                     severity, title, analysis, results_json, resolved_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     created_at,
@@ -274,6 +297,11 @@ class Storage:
                     common_value([result.environment for result in results], "prod"),
                     common_value([result.run_type for result in results], "normal"),
                     common_value([result.trace_id for result in results], ""),
+                    fingerprint,
+                    occurrences,
+                    created_at,
+                    created_at,
+                    last_summary,
                     incident_status,
                     severity,
                     title,
@@ -294,6 +322,71 @@ class Storage:
             )
             self.connection.commit()
             return incident_id
+
+    def find_active_incident_by_fingerprint(self, fingerprint: str) -> dict | None:
+        if not fingerprint:
+            return None
+        with self.lock:
+            row = self.connection.execute(
+                """
+                select * from incidents
+                where fingerprint = ?
+                  and status not in ('resolved', 'closed')
+                order by id desc
+                limit 1
+                """,
+                (fingerprint,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_incident_occurrence(
+        self,
+        incident_id: int,
+        severity: str,
+        title: str,
+        results: list[CheckResult],
+        increment: int = 1,
+    ) -> dict:
+        now = utc_now_iso()
+        last_summary = summarize_results(results) or title
+        with self.lock:
+            row = self.connection.execute(
+                "select * from incidents where id = ?",
+                (incident_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"incident not found: {incident_id}")
+            next_count = int(row["occurrence_count"] or 1) + max(1, increment)
+            next_severity = max_severity(str(row["severity"]), severity)
+            self.connection.execute(
+                """
+                update incidents
+                set updated_at = ?,
+                    last_seen_at = ?,
+                    last_summary = ?,
+                    occurrence_count = ?,
+                    severity = ?,
+                    title = ?,
+                    results_json = ?
+                where id = ?
+                """,
+                (
+                    now,
+                    now,
+                    last_summary,
+                    next_count,
+                    next_severity,
+                    title,
+                    json.dumps([result.__dict__ for result in results], ensure_ascii=False),
+                    incident_id,
+                ),
+            )
+            self.connection.commit()
+            updated = self.connection.execute(
+                "select * from incidents where id = ?",
+                (incident_id,),
+            ).fetchone()
+        return dict(updated)
 
     def latest_results(self, limit: int = 50) -> list[dict]:
         with self.lock:
@@ -900,6 +993,18 @@ def common_value(values: list[str], default: str) -> str:
     if all(value == first for value in cleaned):
         return first
     return "mixed"
+
+
+def summarize_results(results: list[CheckResult]) -> str:
+    return "; ".join(
+        f"{result.source}/{result.name}: {result.summary}"
+        for result in results
+    )
+
+
+def max_severity(current: str, incoming: str) -> str:
+    rank = {"ok": 0, "warning": 1, "critical": 2}
+    return incoming if rank.get(incoming, 0) > rank.get(current, 0) else current
 
 
 def build_retention_where(

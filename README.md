@@ -280,6 +280,14 @@ python -m ops_agent.cli --config .\config.json run-action --type restart_docker_
 
 告警事件不再只是静态记录。`incidents` 会保存当前生命周期状态，`incident_events` 会保存每次状态变化审计。
 
+同一环境、同一运行类型、同一监控目标的重复异常会归并到已有 active 事件，不会反复创建新事件或重复发送同一类告警。归并字段：
+
+- `fingerprint`: 事件指纹
+- `occurrence_count`: 已归并的异常出现次数
+- `first_seen_at`: 首次出现时间
+- `last_seen_at`: 最近出现时间
+- `last_summary`: 最近一次异常摘要
+
 当前状态：
 
 - `open`: 新告警已创建

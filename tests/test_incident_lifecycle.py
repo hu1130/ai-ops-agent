@@ -85,6 +85,34 @@ class IncidentLifecycleTest(unittest.TestCase):
         self.assertEqual(incident_id, linked[0]["incident_id"])
         self.assertEqual([], unlinked)
 
+    def test_incident_fingerprint_tracks_occurrences(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="http", name="Site", status="warning", summary="Slow")
+            incident_id = storage.save_incident(
+                "warning",
+                "Ops Agent detected 1 issue",
+                "analysis",
+                [result],
+                fingerprint="prod:normal:http:Site",
+            )
+            active = storage.find_active_incident_by_fingerprint("prod:normal:http:Site")
+            updated = storage.update_incident_occurrence(
+                incident_id,
+                "critical",
+                "Ops Agent detected 1 issue",
+                [CheckResult(source="http", name="Site", status="critical", summary="Failed")],
+            )
+            storage.transition_incident(incident_id, "resolved", actor="test")
+            resolved_lookup = storage.find_active_incident_by_fingerprint("prod:normal:http:Site")
+            storage.close()
+
+        self.assertEqual(incident_id, active["id"])
+        self.assertEqual(2, updated["occurrence_count"])
+        self.assertEqual("critical", updated["severity"])
+        self.assertIn("http/Site", updated["last_summary"])
+        self.assertIsNone(resolved_lookup)
+
 
 if __name__ == "__main__":
     unittest.main()

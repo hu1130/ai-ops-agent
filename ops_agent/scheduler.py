@@ -69,6 +69,7 @@ class OpsScheduler:
         new_alerts: list[CheckResult] = []
         recoveries: list[CheckResult] = []
         recovery_incident_ids: set[int] = set()
+        repeated_by_incident: dict[int, list[CheckResult]] = {}
 
         for result in results:
             key = check_key(result)
@@ -79,6 +80,8 @@ class OpsScheduler:
                 if not state.is_open and state.failure_count >= threshold:
                     state.is_open = True
                     new_alerts.append(result)
+                elif state.is_open and state.incident_id:
+                    repeated_by_incident.setdefault(state.incident_id, []).append(result)
             else:
                 if state.is_open and recovery_enabled:
                     recoveries.append(result)
@@ -89,15 +92,38 @@ class OpsScheduler:
                 state.last_summary = result.summary
                 state.incident_id = None
 
+        for incident_id, repeated_results in repeated_by_incident.items():
+            self.update_existing_incident(incident_id, repeated_results)
+
         if new_alerts:
             severity = "critical" if any(item.status == "critical" for item in new_alerts) else "warning"
             title = f"Ops Agent detected {len(new_alerts)} issue(s)"
+            fingerprint = incident_fingerprint(new_alerts)
+            existing = self.storage.find_active_incident_by_fingerprint(fingerprint)
+            if existing:
+                incident_id = int(existing["id"])
+                self.update_existing_incident(incident_id, new_alerts, severity=severity, title=title)
+                for result in new_alerts:
+                    self._issues[check_key(result)].incident_id = incident_id
+                new_alerts = []
+
+        if new_alerts:
+            severity = "critical" if any(item.status == "critical" for item in new_alerts) else "warning"
+            title = f"Ops Agent detected {len(new_alerts)} issue(s)"
+            fingerprint = incident_fingerprint(new_alerts)
             analysis = analyze_incident(new_alerts, self.config.ai)
             diagnostics = format_snapshot(collect_diagnostics(new_alerts, self.config))
             suggestions = build_action_suggestions(new_alerts)
             action_plan = build_remediation_plan(new_alerts, self.config)
             analysis = f"{analysis}{suggestions}{diagnostics}"
-            incident_id = self.storage.save_incident(severity, title, analysis, new_alerts)
+            incident_id = self.storage.save_incident(
+                severity,
+                title,
+                analysis,
+                new_alerts,
+                fingerprint=fingerprint,
+                occurrence_count=len(new_alerts),
+            )
             action_results = self.process_remediation_actions(action_plan, new_alerts, incident_id=incident_id)
             remediation_text = format_action_plan(action_plan, action_results)
             analysis = f"{analysis}{remediation_text}"
@@ -128,6 +154,28 @@ class OpsScheduler:
                     metadata={"recovered_checks": [check_key(result) for result in recoveries]},
                 )
             self.notifier.send(title, text, dedupe_key="recovered:" + problem_key(recoveries))
+
+    def update_existing_incident(
+        self,
+        incident_id: int,
+        results: list[CheckResult],
+        severity: str = "",
+        title: str = "",
+    ) -> None:
+        if not results:
+            return
+        merged_severity = severity or ("critical" if any(item.status == "critical" for item in results) else "warning")
+        merged_title = title or f"Ops Agent detected {len(results)} issue(s)"
+        try:
+            self.storage.update_incident_occurrence(
+                incident_id,
+                merged_severity,
+                merged_title,
+                results,
+                increment=len(results),
+            )
+        except ValueError:
+            return
 
     def process_remediation_actions(
         self,
@@ -361,6 +409,12 @@ class OpsScheduler:
 
 def problem_key(problems: list[CheckResult]) -> str:
     return "|".join(f"{item.source}:{item.name}:{item.status}" for item in problems)
+
+
+def incident_fingerprint(results: list[CheckResult]) -> str:
+    context = context_from_results(results)
+    targets = sorted({check_key(result) for result in results})
+    return f"{context.environment}:{context.run_type}:{'|'.join(targets)}"
 
 
 def check_key(result: CheckResult) -> str:

@@ -101,6 +101,58 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertEqual("resolved", resolved["status"])
         self.assertIn("resolved", [event["to_status"] for event in events])
 
+    def test_repeated_problem_updates_existing_incident_without_new_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 1, "recovery_enabled": True},
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            problem = CheckResult(source="http", name="Site", status="critical", summary="Request failed")
+            scheduler.process_alert_states([problem])
+            scheduler.process_alert_states([problem])
+            incidents = storage.latest_incidents(10)
+            storage.close()
+
+        self.assertEqual(1, len(incidents))
+        self.assertEqual(2, incidents[0]["occurrence_count"])
+        self.assertEqual(1, len(notifier.sent))
+
+    def test_existing_open_incident_is_merged_after_scheduler_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 1, "recovery_enabled": True},
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            first_notifier = RecordingNotifier()
+            first_scheduler = OpsScheduler(config, storage, first_notifier)
+            problem = CheckResult(source="http", name="Site", status="critical", summary="Request failed")
+            first_scheduler.process_alert_states([problem])
+
+            restarted_notifier = RecordingNotifier()
+            restarted_scheduler = OpsScheduler(config, storage, restarted_notifier)
+            restarted_scheduler.process_alert_states([problem])
+            incidents = storage.latest_incidents(10)
+            storage.close()
+
+        self.assertEqual(1, len(incidents))
+        self.assertEqual(2, incidents[0]["occurrence_count"])
+        self.assertEqual(1, len(first_notifier.sent))
+        self.assertEqual(0, len(restarted_notifier.sent))
+
     def test_playbook_halt_skips_remaining_steps_after_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AppConfig(

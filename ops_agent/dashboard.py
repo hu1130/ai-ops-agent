@@ -554,11 +554,14 @@ def render_result_row(row: dict) -> str:
 def render_incident_row(row: dict) -> str:
     severity = safe(row.get("severity", ""))
     lifecycle_status = safe(row.get("status", "open"))
+    occurrence_count = int(row.get("occurrence_count") or 1)
+    occurrence_label = f" x{occurrence_count}" if occurrence_count > 1 else ""
+    last_seen = row.get("last_seen_at") or row.get("updated_at") or row.get("created_at", "")
     return (
         "<details>"
         "<summary>"
-        f"<span class='time'>{safe(row.get('created_at', ''))}</span>"
-        f"<span class='status {severity}'>{severity}/{lifecycle_status}</span>"
+        f"<span class='time'>{safe(last_seen)}</span>"
+        f"<span class='status {severity}'>{severity}/{lifecycle_status}{safe(occurrence_label)}</span>"
         f"<strong>{safe(row.get('title', ''))}</strong>"
         "</summary>"
         f"<pre>{safe(row.get('analysis', ''))}</pre>"
