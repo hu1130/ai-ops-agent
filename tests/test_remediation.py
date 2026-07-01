@@ -30,6 +30,119 @@ class RemediationTest(unittest.TestCase):
         self.assertTrue(any(action.action_type == "check_port" for action in actions))
         self.assertTrue(any(action.params.get("port") == 443 for action in actions))
 
+    def test_policy_auto_execute_overrides_plan_defaults(self) -> None:
+        config = AppConfig(
+            raw={
+                "remediation": {
+                    "enabled": True,
+                    "actions": {"check_port": {"auto_execute": False}},
+                    "policies": [
+                        {
+                            "action_type": "check_port",
+                            "targets": ["agent.example.com:443"],
+                            "enabled": True,
+                            "auto_execute": True,
+                            "requires_approval": False,
+                        }
+                    ],
+                }
+            },
+            base_dir=Path("."),
+        )
+        issue = CheckResult(
+            source="json_api",
+            name="AI customer service",
+            status="warning",
+            summary="Slow response",
+            details={"url": "https://agent.example.com/v1/chat"},
+        )
+        actions = build_remediation_plan([issue], config)
+        self.assertEqual(1, len(actions))
+        check_port_actions = [action for action in actions if action.action_type == "check_port"]
+        self.assertEqual(1, len(check_port_actions))
+        self.assertTrue(check_port_actions[0].auto_execute)
+
+    def test_policy_denies_unlisted_target(self) -> None:
+        config = AppConfig(
+            raw={
+                "remediation": {
+                    "policies": [
+                        {
+                            "action_type": "check_port",
+                            "targets": ["allowed.example.com:443"],
+                            "enabled": True,
+                            "auto_execute": True,
+                        }
+                    ]
+                }
+            },
+            base_dir=Path("."),
+        )
+        action = RemediationAction(
+            action_type="check_port",
+            title="Check blocked port",
+            reason="Manual test",
+            params={"host": "blocked.example.com", "port": 443},
+            auto_execute=True,
+        )
+        result = execute_action(action, config, dry_run=False)
+        self.assertEqual("skipped", result.status)
+        self.assertIn("policy denied", result.error)
+
+    def test_policy_requires_verify_after_for_mutating_action(self) -> None:
+        config = AppConfig(
+            raw={
+                "remediation": {
+                    "policies": [
+                        {
+                            "action_type": "restart_service",
+                            "targets": ["ops-agent"],
+                            "enabled": True,
+                            "requires_approval": True,
+                            "verification_required": True,
+                        }
+                    ]
+                }
+            },
+            base_dir=Path("."),
+        )
+        action = RemediationAction(
+            action_type="restart_service",
+            title="Restart ops-agent",
+            reason="Manual test",
+            risk="medium",
+            params={"service": "ops-agent"},
+        )
+        result = execute_action(action, config, dry_run=False, approved=True)
+        self.assertEqual("skipped", result.status)
+        self.assertIn("verify_after", result.error)
+
+    def test_disabled_policy_is_skipped(self) -> None:
+        config = AppConfig(
+            raw={
+                "remediation": {
+                    "policies": [
+                        {
+                            "action_type": "cleanup_temp_files",
+                            "targets": ["/tmp"],
+                            "enabled": False,
+                        }
+                    ]
+                }
+            },
+            base_dir=Path("."),
+        )
+        action = RemediationAction(
+            action_type="cleanup_temp_files",
+            title="Cleanup temp",
+            reason="Manual test",
+            risk="medium",
+            params={"paths": ["/tmp"]},
+        )
+        result = execute_action(action, config, dry_run=False, approved=True)
+        self.assertEqual("skipped", result.status)
+        self.assertIn("policy denied", result.error)
+
     def test_dry_run_does_not_execute_mutating_action(self) -> None:
         config = AppConfig(raw={"remediation": {"allowed_actions": ["restart_service"]}}, base_dir=Path("."))
         action = RemediationAction(

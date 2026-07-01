@@ -78,6 +78,59 @@
       "interval_seconds": 5,
       "timeout_seconds": 5
     },
+    "policies": [
+      {
+        "name": "port checks",
+        "action_type": "check_port",
+        "enabled": true,
+        "targets": ["*"],
+        "auto_execute": true,
+        "requires_approval": false
+      },
+      {
+        "name": "read-only diagnostics",
+        "action_type": "run_diagnostic_command",
+        "enabled": true,
+        "targets": ["df", "free", "ps", "docker", "journalctl", "tail", "systemctl", "pgrep"],
+        "auto_execute": false,
+        "requires_approval": false
+      },
+      {
+        "name": "ops-agent service restart",
+        "action_type": "restart_service",
+        "enabled": true,
+        "targets": ["ops-agent"],
+        "auto_execute": false,
+        "requires_approval": true,
+        "verification_required": true,
+        "verify_after": {
+          "type": "http",
+          "url": "http://127.0.0.1:8765/api/summary",
+          "expected_status": 200,
+          "wait_seconds": 5,
+          "retries": 3,
+          "interval_seconds": 5,
+          "timeout_seconds": 5
+        }
+      },
+      {
+        "name": "docker restart placeholder",
+        "action_type": "restart_docker_container",
+        "enabled": false,
+        "targets": ["your-container-name"],
+        "auto_execute": false,
+        "requires_approval": true,
+        "verification_required": true
+      },
+      {
+        "name": "temp cleanup disabled",
+        "action_type": "cleanup_temp_files",
+        "enabled": false,
+        "targets": ["/tmp"],
+        "auto_execute": false,
+        "requires_approval": true
+      }
+    ],
     "actions": {
       "check_port": {
         "auto_execute": true

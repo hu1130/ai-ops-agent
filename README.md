@@ -130,7 +130,7 @@ python -m ops_agent.cli --config .\config.json validate-config
 - 默认 `suggest` 模式，只建议和 dry-run，不直接修改系统
 - 支持端口检查、进程检查、只读诊断命令
 - 重启服务、重启容器、清理临时文件、轮转日志已建模，但默认需要人工确认
-- 重启服务和重启容器必须配置白名单后才能执行
+- 重启服务和重启容器必须通过白名单或策略中心授权后才能执行
 - 所有动作都会写入 `action_logs` 审计日志
 
 生成处置计划：
@@ -157,6 +157,41 @@ python -m ops_agent.cli --config .\config.json run-action --type check_port --ho
 python -m ops_agent.cli --config .\config.json action-logs
 ```
 
+## 自愈策略中心
+
+`remediation.policies` 用来明确控制每一种自愈动作的边界。配置了策略后，执行器会优先按策略判断；没有配置策略时，才兼容旧的 `allowed_actions`、`allowed_services` 和 `allowed_containers`。
+
+策略可以控制：
+- `action_type`: 动作类型，例如 `check_port`、`run_diagnostic_command`、`restart_service`
+- `targets`: 允许作用的目标，支持 `*`，也支持 `host:port`、服务名、容器名、诊断命令首词
+- `enabled`: 是否启用这条策略
+- `auto_execute`: 计划生成后是否允许自动执行
+- `requires_approval`: 是否必须人工确认
+- `verification_required`: 修改系统状态后是否必须配置验证
+- `verify_after`: 执行成功后请求的健康检查地址
+
+示例：
+```json
+{
+  "name": "ops-agent service restart",
+  "action_type": "restart_service",
+  "enabled": true,
+  "targets": ["ops-agent"],
+  "auto_execute": false,
+  "requires_approval": true,
+  "verification_required": true,
+  "verify_after": {
+    "type": "http",
+    "url": "http://127.0.0.1:8765/api/summary",
+    "expected_status": 200,
+    "wait_seconds": 5,
+    "retries": 3
+  }
+}
+```
+
+建议规则：读操作可以放宽；重启、清理、变更类动作必须明确目标、不能使用 `*`、必须人工确认，并配置执行后验证。
+
 需要人工确认的动作会先生成一个动作 ID：
 
 ```powershell
@@ -169,7 +204,7 @@ python -m ops_agent.cli --config .\config.json run-action --type restart_service
 python -m ops_agent.cli --config .\config.json approve-action --id 1 --by owner --execute
 ```
 
-只有在 `remediation.allowed_services` 或 `remediation.allowed_containers` 白名单中的服务/容器才会被真正重启。
+没有配置 `remediation.policies` 时，只有在 `remediation.allowed_services` 或 `remediation.allowed_containers` 白名单中的服务/容器才会被真正重启。配置策略后，以策略中心的 `targets` 为准。
 
 执行后验证可以在创建动作时指定健康接口：
 

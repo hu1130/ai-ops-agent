@@ -6,10 +6,16 @@ import subprocess
 
 from ops_agent.config import AppConfig
 from ops_agent.remediation.actions import ActionResult, RemediationAction
+from ops_agent.remediation.policy import (
+    MUTATING_ACTIONS,
+    apply_policy_defaults,
+    decide_action_policy,
+    format_policy_decision,
+    policy_configured,
+)
 
 
 READ_ONLY_COMMANDS = {"df", "free", "ps", "docker", "journalctl", "tail", "systemctl", "pgrep"}
-MUTATING_ACTIONS = {"restart_service", "restart_docker_container", "cleanup_temp_files", "rotate_large_log"}
 
 
 def execute_action(
@@ -18,15 +24,32 @@ def execute_action(
     dry_run: bool = True,
     approved: bool = False,
 ) -> ActionResult:
+    decision = decide_action_policy(action, config)
+    if decision.configured:
+        if not decision.allowed:
+            return ActionResult(action=action, status="skipped", error=format_policy_decision(decision))
+        action = apply_policy_defaults(action, config)
+        if not dry_run and action.action_type in MUTATING_ACTIONS and decision.requires_approval and not approved:
+            return ActionResult(action=action, status="skipped", error="policy requires manual approval")
+        if (
+            not dry_run
+            and
+            action.action_type in MUTATING_ACTIONS
+            and decision.verification_required
+            and not action.params.get("verify_after")
+        ):
+            return ActionResult(action=action, status="skipped", error="policy requires verify_after")
+
     if dry_run:
         return ActionResult(action=action, status="dry_run", output=describe_dry_run(action))
 
-    allowed_actions = set(config.raw.get("remediation", {}).get("allowed_actions", []))
-    if allowed_actions and action.action_type not in allowed_actions:
-        return ActionResult(action=action, status="skipped", error=f"动作未在 allowed_actions 中: {action.action_type}")
+    if not decision.configured:
+        allowed_actions = set(config.raw.get("remediation", {}).get("allowed_actions", []))
+        if allowed_actions and action.action_type not in allowed_actions:
+            return ActionResult(action=action, status="skipped", error=f"动作未在 allowed_actions 中: {action.action_type}")
 
-    if action.action_type in MUTATING_ACTIONS and not approved:
-        return ActionResult(action=action, status="skipped", error="该动作会修改系统状态，需要先人工确认。")
+        if action.action_type in MUTATING_ACTIONS and not approved:
+            return ActionResult(action=action, status="skipped", error="该动作会修改系统状态，需要先人工确认。")
 
     if action.action_type == "check_port":
         return check_port(action)
@@ -81,7 +104,7 @@ def restart_service(action: RemediationAction, config: AppConfig) -> ActionResul
     allowed = set(config.raw.get("remediation", {}).get("allowed_services", []))
     if not service:
         return ActionResult(action=action, status="failed", error="service 参数不能为空。")
-    if service not in allowed:
+    if not policy_configured(config) and service not in allowed:
         return ActionResult(action=action, status="skipped", error=f"服务不在 allowed_services 白名单中: {service}")
     return run_mutating_command(action, ["systemctl", "restart", service], config)
 
@@ -91,7 +114,7 @@ def restart_docker_container(action: RemediationAction, config: AppConfig) -> Ac
     allowed = set(config.raw.get("remediation", {}).get("allowed_containers", []))
     if not container:
         return ActionResult(action=action, status="failed", error="container 参数不能为空。")
-    if container not in allowed:
+    if not policy_configured(config) and container not in allowed:
         return ActionResult(action=action, status="skipped", error=f"容器不在 allowed_containers 白名单中: {container}")
     return run_mutating_command(action, ["docker", "restart", container], config)
 

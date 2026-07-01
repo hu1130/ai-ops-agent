@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from ops_agent.config import AppConfig
 from ops_agent.events import CheckResult
 from ops_agent.remediation.actions import RemediationAction
+from ops_agent.remediation.policy import apply_policy_defaults, decide_action_policy
 
 
 def build_remediation_plan(results: list[CheckResult], config: AppConfig) -> list[RemediationAction]:
@@ -19,7 +20,13 @@ def build_remediation_plan(results: list[CheckResult], config: AppConfig) -> lis
         if not result.is_problem:
             continue
         actions.extend(plan_for_result(result, configured_actions))
-    return dedupe_actions(actions)
+    planned: list[RemediationAction] = []
+    for action in dedupe_actions(actions):
+        decision = decide_action_policy(action, config)
+        if decision.configured and not decision.allowed:
+            continue
+        planned.append(apply_policy_defaults(action, config))
+    return planned
 
 
 def plan_for_result(result: CheckResult, configured_actions: dict[str, bool]) -> list[RemediationAction]:

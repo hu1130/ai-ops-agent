@@ -10,9 +10,10 @@ from ops_agent.config import AppConfig, load_config
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.events import CheckResult, RunContext
 from ops_agent.incident_lifecycle import INCIDENT_STATUSES
-from ops_agent.remediation.actions import RemediationAction
+from ops_agent.remediation.actions import ActionResult, RemediationAction
 from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action, format_action_plan
 from ops_agent.remediation.planner import build_remediation_plan
+from ops_agent.remediation.policy import apply_policy_defaults, decide_action_policy, format_policy_decision
 from ops_agent.remediation.verifier import VerificationResult, verify_after_action
 from ops_agent.retention import format_retention_result, run_retention_cleanup
 from ops_agent.storage import Storage
@@ -165,8 +166,58 @@ def main() -> int:
 
 def run_action_command(args: argparse.Namespace, config: AppConfig) -> int:
     action = build_cli_action(args)
+    policy_decision = decide_action_policy(action, config)
+    if policy_decision.configured and policy_decision.allowed:
+        action = apply_policy_defaults(action, config)
+
     storage = open_storage(config)
     context = build_cli_context(config)
+
+    if policy_decision.configured and not policy_decision.allowed:
+        error = format_policy_decision(policy_decision)
+        result = ActionResult(action=action, status="skipped", error=error)
+        storage.save_action_log(
+            action.action_type,
+            action.title,
+            action.risk,
+            result.status,
+            action.reason,
+            action.params,
+            result.output,
+            result.error,
+            environment=context.environment,
+            run_type=context.run_type,
+            trace_id=context.trace_id,
+            incident_id=args.incident_id or None,
+        )
+        storage.close()
+        print(format_action_plan([action], [result]))
+        return 1
+
+    if (
+        policy_decision.configured
+        and action.action_type in MUTATING_ACTIONS
+        and policy_decision.verification_required
+        and not action.params.get("verify_after")
+    ):
+        result = ActionResult(action=action, status="skipped", error="policy requires verify_after")
+        storage.save_action_log(
+            action.action_type,
+            action.title,
+            action.risk,
+            result.status,
+            action.reason,
+            action.params,
+            result.output,
+            result.error,
+            environment=context.environment,
+            run_type=context.run_type,
+            trace_id=context.trace_id,
+            incident_id=args.incident_id or None,
+        )
+        storage.close()
+        print(format_action_plan([action], [result]))
+        return 1
 
     if action.action_type in MUTATING_ACTIONS and not args.execute:
         action_id = storage.save_action_log(
@@ -524,6 +575,7 @@ def validate_config(config: AppConfig) -> list[str]:
         allowed_actions = remediation.get("allowed_actions", [])
         if allowed_actions and not isinstance(allowed_actions, list):
             errors.append("remediation.allowed_actions 必须是数组")
+        validate_remediation_policies(remediation, errors)
 
     retention = dict(config.raw.get("retention", {}))
     if retention:
@@ -585,6 +637,49 @@ def validate_string_list(value: object, field: str, errors: list[str]) -> None:
         return
     if any(not str(item).strip() for item in value):
         errors.append(f"{field} 不能包含空值")
+
+
+def validate_remediation_policies(remediation: dict, errors: list[str]) -> None:
+    policies = remediation.get("policies", [])
+    if not policies:
+        return
+    if not isinstance(policies, list):
+        errors.append("remediation.policies 必须是数组")
+        return
+
+    for index, policy in enumerate(policies):
+        field = f"remediation.policies[{index}]"
+        if not isinstance(policy, dict):
+            errors.append(f"{field} 必须是对象")
+            continue
+
+        action_type = str(policy.get("action_type", "")).strip()
+        if not action_type:
+            errors.append(f"{field}.action_type 不能为空")
+
+        for bool_field in ("enabled", "auto_execute", "requires_approval", "verification_required"):
+            if bool_field in policy and not isinstance(policy[bool_field], bool):
+                errors.append(f"{field}.{bool_field} 必须是 true/false")
+
+        if "targets" in policy:
+            validate_string_list(policy["targets"], f"{field}.targets", errors)
+
+        targets = policy.get("targets", [])
+        enabled = bool(policy.get("enabled", True))
+        if action_type in MUTATING_ACTIONS and enabled:
+            if not isinstance(targets, list) or not targets:
+                errors.append(f"{field}.targets 修改类动作必须显式配置目标")
+            elif any(str(item).strip() == "*" for item in targets):
+                errors.append(f"{field}.targets 修改类动作不能使用 *")
+
+        verify_after = policy.get("verify_after")
+        if verify_after is not None and not isinstance(verify_after, dict):
+            errors.append(f"{field}.verify_after 必须是对象")
+        elif isinstance(verify_after, dict) and verify_after:
+            if verify_after.get("type", "http") != "http":
+                errors.append(f"{field}.verify_after.type 目前只支持 http")
+            if verify_after.get("url"):
+                validate_url(str(verify_after["url"]), f"{field}.verify_after.url", errors)
 
 
 if __name__ == "__main__":
