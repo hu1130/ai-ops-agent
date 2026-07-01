@@ -9,6 +9,7 @@ from ops_agent.storage import Storage
 
 @dataclass(frozen=True)
 class RetentionResult:
+    closed_incidents: int = 0
     deleted_check_results: int = 0
     deleted_incidents: int = 0
     deleted_action_logs: int = 0
@@ -27,6 +28,7 @@ class RetentionResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "closed_incidents": self.closed_incidents,
             "deleted_check_results": self.deleted_check_results,
             "deleted_incidents": self.deleted_incidents,
             "deleted_action_logs": self.deleted_action_logs,
@@ -54,6 +56,9 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
     test_incidents_days = int(config.get("test_incidents_days", max(7, test_results_days)))
     test_action_logs_days = int(config.get("test_action_logs_days", max(7, test_results_days)))
     test_api_audit_logs_days = int(config.get("test_api_audit_logs_days", max(7, test_results_days)))
+    auto_close_enabled = bool(config.get("auto_close_resolved_incidents", True))
+    auto_close_cutoff = cutoff(now, int(config.get("auto_close_resolved_after_days", 7)))
+    test_auto_close_cutoff = cutoff(now, int(config.get("test_auto_close_resolved_after_days", 1)))
     test_check_cutoff = cutoff(now, test_results_days)
     test_incident_cutoff = cutoff(now, test_incidents_days)
     test_action_cutoff = cutoff(now, test_action_logs_days)
@@ -75,7 +80,18 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
             api_audit_cutoff=api_audit_cutoff,
             test_api_audit_cutoff=test_api_audit_cutoff,
         )
+        closed_incidents = 0
+        if auto_close_enabled:
+            closed_incidents = storage.count_resolved_incidents_to_auto_close(
+                auto_close_cutoff,
+                incident_cutoff,
+                test_auto_close_cutoff,
+                test_incident_cutoff,
+                test_environments,
+                test_run_types,
+            )
         return RetentionResult(
+            closed_incidents=closed_incidents,
             deleted_check_results=counts["check_results"],
             deleted_incidents=counts["incidents"],
             deleted_action_logs=counts["action_logs"],
@@ -83,6 +99,16 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
             dry_run=True,
         )
 
+    closed_incidents = 0
+    if auto_close_enabled:
+        closed_incidents = storage.close_resolved_incidents(
+            auto_close_cutoff,
+            incident_cutoff,
+            test_auto_close_cutoff,
+            test_incident_cutoff,
+            test_environments,
+            test_run_types,
+        )
     deleted = storage.delete_retention_candidates(
         check_cutoff,
         problem_cutoff,
@@ -100,6 +126,7 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
     if vacuumed:
         storage.vacuum()
     return RetentionResult(
+        closed_incidents=closed_incidents,
         deleted_check_results=deleted["check_results"],
         deleted_incidents=deleted["incidents"],
         deleted_action_logs=deleted["action_logs"],
@@ -125,6 +152,7 @@ def format_retention_result(result: RetentionResult) -> str:
     mode = "预览" if result.dry_run else "执行"
     return (
         f"数据保留清理{mode}结果:\n"
+        f"- closed_incidents: {result.closed_incidents}\n"
         f"- check_results: {result.deleted_check_results}\n"
         f"- incidents: {result.deleted_incidents}\n"
         f"- action_logs: {result.deleted_action_logs}\n"

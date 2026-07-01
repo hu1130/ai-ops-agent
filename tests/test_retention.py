@@ -202,6 +202,108 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(1, len(rows))
         self.assertEqual("recent", rows[0]["message"])
 
+    def test_retention_dry_run_counts_resolved_incidents_to_auto_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            incident_id = insert_incident(storage, status="resolved", days_ago=10)
+            result = run_retention_cleanup(
+                storage,
+                {
+                    "enabled": True,
+                    "auto_close_resolved_incidents": True,
+                    "auto_close_resolved_after_days": 7,
+                    "incidents_days": 90,
+                },
+                dry_run=True,
+            )
+            incident = storage.get_incident(incident_id)
+            storage.close()
+
+        self.assertEqual(1, result.closed_incidents)
+        self.assertEqual("resolved", incident["status"])
+
+    def test_retention_auto_closes_old_resolved_incidents_without_deleting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            old_resolved_id = insert_incident(storage, status="resolved", days_ago=10)
+            recent_resolved_id = insert_incident(storage, status="resolved", days_ago=2)
+            open_id = insert_incident(storage, status="open", days_ago=10)
+            result = run_retention_cleanup(
+                storage,
+                {
+                    "enabled": True,
+                    "auto_close_resolved_incidents": True,
+                    "auto_close_resolved_after_days": 7,
+                    "incidents_days": 90,
+                },
+                dry_run=False,
+            )
+            old_resolved = storage.get_incident(old_resolved_id)
+            recent_resolved = storage.get_incident(recent_resolved_id)
+            open_incident = storage.get_incident(open_id)
+            events = storage.latest_incident_events(old_resolved_id)
+            storage.close()
+
+        self.assertEqual(1, result.closed_incidents)
+        self.assertEqual(0, result.deleted_incidents)
+        self.assertEqual("closed", old_resolved["status"])
+        self.assertEqual("resolved", recent_resolved["status"])
+        self.assertEqual("open", open_incident["status"])
+        self.assertIn("closed", [event["to_status"] for event in events])
+
+    def test_test_resolved_incidents_use_shorter_auto_close_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            test_id = insert_incident(
+                storage,
+                status="resolved",
+                days_ago=2,
+                environment="test",
+                run_type="manual_test",
+            )
+            prod_id = insert_incident(storage, status="resolved", days_ago=2)
+            result = run_retention_cleanup(
+                storage,
+                {
+                    "enabled": True,
+                    "auto_close_resolved_incidents": True,
+                    "auto_close_resolved_after_days": 7,
+                    "test_auto_close_resolved_after_days": 1,
+                    "incidents_days": 90,
+                    "test_incidents_days": 7,
+                    "test_environments": ["test"],
+                    "test_run_types": ["manual_test"],
+                },
+                dry_run=False,
+            )
+            test_incident = storage.get_incident(test_id)
+            prod_incident = storage.get_incident(prod_id)
+            storage.close()
+
+        self.assertEqual(1, result.closed_incidents)
+        self.assertEqual("closed", test_incident["status"])
+        self.assertEqual("resolved", prod_incident["status"])
+
+    def test_auto_close_resolved_incidents_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            incident_id = insert_incident(storage, status="resolved", days_ago=10)
+            result = run_retention_cleanup(
+                storage,
+                {
+                    "enabled": True,
+                    "auto_close_resolved_incidents": False,
+                    "auto_close_resolved_after_days": 7,
+                    "incidents_days": 90,
+                },
+                dry_run=False,
+            )
+            incident = storage.get_incident(incident_id)
+            storage.close()
+
+        self.assertEqual(0, result.closed_incidents)
+        self.assertEqual("resolved", incident["status"])
+
 
 def insert_check(
     storage: Storage,
@@ -218,6 +320,29 @@ def insert_check(
         (iso_days_ago(days_ago), environment, run_type, status),
     )
     storage.connection.commit()
+
+
+def insert_incident(
+    storage: Storage,
+    status: str,
+    days_ago: int,
+    environment: str = "prod",
+    run_type: str = "normal",
+) -> int:
+    timestamp = iso_days_ago(days_ago)
+    resolved_at = timestamp if status in {"resolved", "closed"} else None
+    cursor = storage.connection.execute(
+        """
+        insert into incidents (
+            created_at, updated_at, environment, run_type, trace_id,
+            status, severity, title, analysis, results_json, resolved_at
+        )
+        values (?, ?, ?, ?, 'trace-a', ?, 'warning', 'incident', 'analysis', '[]', ?)
+        """,
+        (timestamp, timestamp, environment, run_type, status, resolved_at),
+    )
+    storage.connection.commit()
+    return int(cursor.lastrowid)
 
 
 def iso_days_ago(days: int) -> str:

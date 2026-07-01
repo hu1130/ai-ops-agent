@@ -609,6 +609,16 @@ def validate_config(config: AppConfig) -> list[str]:
             "retention.test_api_audit_logs_days",
             errors,
         )
+        validate_positive_int(
+            retention.get("auto_close_resolved_after_days", 7),
+            "retention.auto_close_resolved_after_days",
+            errors,
+        )
+        validate_positive_int(
+            retention.get("test_auto_close_resolved_after_days", 1),
+            "retention.test_auto_close_resolved_after_days",
+            errors,
+        )
         validate_string_list(retention.get("test_environments", ["test"]), "retention.test_environments", errors)
         validate_string_list(retention.get("test_run_types", ["manual_test", "synthetic_test"]), "retention.test_run_types", errors)
         try:

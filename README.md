@@ -474,6 +474,9 @@ python -m ops_agent.cli --config .\config.json run-action --type check_port --ho
   "test_results_days": 7,
   "test_incidents_days": 7,
   "test_action_logs_days": 7,
+  "auto_close_resolved_incidents": true,
+  "auto_close_resolved_after_days": 7,
+  "test_auto_close_resolved_after_days": 1,
   "test_environments": ["test"],
   "test_run_types": ["manual_test", "synthetic_test"],
   "cleanup_hour": 3,
@@ -487,8 +490,11 @@ python -m ops_agent.cli --config .\config.json run-action --type check_port --ho
 - warning/critical 巡检记录保留 90 天
 - 告警事件保留 90 天
 - 处置动作审计保留 90 天
+- 已恢复事件默认 7 天后自动转为 `closed` 归档，测试环境默认 1 天后归档
 - `environment=test` 或 `run_type=manual_test/synthetic_test` 的测试数据保留 7 天
 - 每天 03:00 自动执行一次
+
+注意：自动归档只改变事件生命周期状态，不删除记录；真正删除仍由 `incidents_days`、`test_incidents_days` 等保留天数控制。
 
 手动预览将删除多少数据：
 

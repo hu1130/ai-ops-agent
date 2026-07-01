@@ -805,6 +805,71 @@ class Storage:
             )
             self.connection.commit()
 
+    def count_resolved_incidents_to_auto_close(
+        self,
+        resolved_cutoff: str,
+        incident_retention_cutoff: str,
+        test_resolved_cutoff: str = "",
+        test_incident_retention_cutoff: str = "",
+        test_environments: Sequence[str] | None = None,
+        test_run_types: Sequence[str] | None = None,
+    ) -> int:
+        where, params = build_auto_close_where(
+            resolved_cutoff,
+            incident_retention_cutoff,
+            test_resolved_cutoff,
+            test_incident_retention_cutoff,
+            test_environments or [],
+            test_run_types or [],
+        )
+        with self.lock:
+            count = self.connection.execute(
+                f"select count(*) from incidents where {where}",
+                params,
+            ).fetchone()[0]
+        return int(count)
+
+    def close_resolved_incidents(
+        self,
+        resolved_cutoff: str,
+        incident_retention_cutoff: str,
+        test_resolved_cutoff: str = "",
+        test_incident_retention_cutoff: str = "",
+        test_environments: Sequence[str] | None = None,
+        test_run_types: Sequence[str] | None = None,
+    ) -> int:
+        where, params = build_auto_close_where(
+            resolved_cutoff,
+            incident_retention_cutoff,
+            test_resolved_cutoff,
+            test_incident_retention_cutoff,
+            test_environments or [],
+            test_run_types or [],
+        )
+        with self.lock:
+            rows = self.connection.execute(
+                f"select id from incidents where {where} order by id asc",
+                params,
+            ).fetchall()
+
+        closed = 0
+        for row in rows:
+            try:
+                self.transition_incident(
+                    int(row["id"]),
+                    "closed",
+                    actor="retention",
+                    note="auto-close resolved incident",
+                    metadata={
+                        "resolved_cutoff": resolved_cutoff,
+                        "test_resolved_cutoff": test_resolved_cutoff,
+                    },
+                )
+            except ValueError:
+                continue
+            closed += 1
+        return closed
+
     def count_retention_candidates(
         self,
         check_cutoff: str,
@@ -1053,6 +1118,34 @@ def fingerprint_target_keys(fingerprint: str) -> set[str]:
 def max_severity(current: str, incoming: str) -> str:
     rank = {"ok": 0, "warning": 1, "critical": 2}
     return incoming if rank.get(incoming, 0) > rank.get(current, 0) else current
+
+
+def build_auto_close_where(
+    resolved_cutoff: str,
+    incident_retention_cutoff: str,
+    test_resolved_cutoff: str,
+    test_incident_retention_cutoff: str,
+    test_environments: Sequence[str],
+    test_run_types: Sequence[str],
+) -> tuple[str, list[str]]:
+    timestamp = "coalesce(resolved_at, updated_at, created_at)"
+    normal_where = f"status = 'resolved' and {timestamp} < ? and created_at >= ?"
+    test_clause, test_params = build_test_clause(test_environments, test_run_types)
+    if not test_clause or not test_resolved_cutoff or not test_incident_retention_cutoff:
+        return f"({normal_where})", [resolved_cutoff, incident_retention_cutoff]
+
+    test_where = f"status = 'resolved' and {timestamp} < ? and created_at >= ?"
+    return (
+        f"(({test_clause}) and {test_where}) or (not ({test_clause}) and {normal_where})",
+        [
+            *test_params,
+            test_resolved_cutoff,
+            test_incident_retention_cutoff,
+            *test_params,
+            resolved_cutoff,
+            incident_retention_cutoff,
+        ],
+    )
 
 
 def build_retention_where(
