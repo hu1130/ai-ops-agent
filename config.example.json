@@ -9,6 +9,7 @@
     "dashboard_host": "127.0.0.1",
     "dashboard_port": 8765,
     "api_token": "",
+    "api_tokens": [],
     "api_auth_required_for_reads": false
   },
   "http_checks": [

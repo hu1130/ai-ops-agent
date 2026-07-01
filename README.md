@@ -337,16 +337,33 @@ API 鉴权：
 ```json
 {
   "app": {
-    "api_token": "replace-with-a-long-random-token",
+    "api_tokens": [
+      {
+        "name": "readonly-dashboard",
+        "role": "viewer",
+        "token": "replace-with-viewer-token"
+      },
+      {
+        "name": "ops-console",
+        "role": "operator",
+        "token": "replace-with-operator-token"
+      }
+    ],
     "api_auth_required_for_reads": false
   }
 }
 ```
 
-配置 `app.api_token` 后，所有 `POST` 接口都必须带 token：
+角色说明：
+
+- `viewer`: 可访问读接口；如果 `api_auth_required_for_reads=false`，读接口仍可不带 token。
+- `operator`: 可执行事件流转、动作确认和拒绝。
+- `admin`: 拥有 operator 权限，保留给后续用户和系统管理能力。
+
+旧配置 `app.api_token` 继续兼容，会被视为 `admin` token。配置 token 后，所有 `POST` 接口至少需要 `operator` 权限：
 
 ```text
-Authorization: Bearer replace-with-a-long-random-token
+Authorization: Bearer replace-with-operator-token
 ```
 
 也可以使用请求头 `X-Ops-Agent-Token`。如果把 `api_auth_required_for_reads` 设为 `true`，`GET /api/*` 读接口也会要求 token。

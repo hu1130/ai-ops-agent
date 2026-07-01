@@ -6,6 +6,7 @@ import sys
 from urllib.parse import urlparse
 
 from ops_agent.alerts.notifier import Notifier
+from ops_agent.auth import ROLE_ORDER
 from ops_agent.config import AppConfig, load_config
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.events import CheckResult, RunContext
@@ -549,6 +550,7 @@ def validate_config(config: AppConfig) -> list[str]:
     validate_context_name(config.app.get("run_type", "normal"), "app.run_type", errors)
     if config.app.get("cli_run_type"):
         validate_context_name(config.app.get("cli_run_type"), "app.cli_run_type", errors)
+    validate_api_auth_config(config.app, errors)
 
     for index, check in enumerate(config.http_checks):
         validate_url(str(check.get("url", "")), f"http_checks[{index}].url", errors)
@@ -658,6 +660,42 @@ def validate_string_list(value: object, field: str, errors: list[str]) -> None:
         return
     if any(not str(item).strip() for item in value):
         errors.append(f"{field} 不能包含空值")
+
+
+def validate_api_auth_config(app: dict, errors: list[str]) -> None:
+    if "api_auth_required_for_reads" in app and not isinstance(app["api_auth_required_for_reads"], bool):
+        errors.append("app.api_auth_required_for_reads 必须是 true/false")
+    if "api_token" in app and app["api_token"] is not None and not isinstance(app["api_token"], str):
+        errors.append("app.api_token 必须是字符串")
+
+    tokens = app.get("api_tokens", [])
+    if not tokens:
+        return
+    if isinstance(tokens, list):
+        for index, item in enumerate(tokens):
+            field = f"app.api_tokens[{index}]"
+            if not isinstance(item, dict):
+                errors.append(f"{field} 必须是对象")
+                continue
+            if "token" in item and not isinstance(item["token"], str):
+                errors.append(f"{field}.token 必须是字符串")
+            role = str(item.get("role", "viewer")).strip().lower()
+            if role not in ROLE_ORDER:
+                errors.append(f"{field}.role 必须是 viewer/operator/admin")
+        return
+    if isinstance(tokens, dict):
+        for name, value in tokens.items():
+            field = f"app.api_tokens.{name}"
+            if isinstance(value, dict):
+                if "token" in value and not isinstance(value["token"], str):
+                    errors.append(f"{field}.token 必须是字符串")
+                role = str(value.get("role", "viewer")).strip().lower()
+                if role not in ROLE_ORDER:
+                    errors.append(f"{field}.role 必须是 viewer/operator/admin")
+            elif not isinstance(value, str):
+                errors.append(f"{field} 必须是字符串或对象")
+        return
+    errors.append("app.api_tokens 必须是数组或对象")
 
 
 def validate_remediation_policies(remediation: dict, errors: list[str]) -> None:

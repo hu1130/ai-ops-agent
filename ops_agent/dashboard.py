@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import html
-import hmac
 import json
-import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
 from ops_agent.alerts.notifier import Notifier
+from ops_agent.auth import AuthResult, authenticate_token, configured_api_tokens, has_role
 from ops_agent.config import AppConfig
 from ops_agent.remediation.approval import approve_action_log, reject_action_log
 from ops_agent.storage import Storage
@@ -20,17 +19,17 @@ def start_dashboard(
     config: AppConfig | None = None,
     notifier: Notifier | None = None,
 ) -> ThreadingHTTPServer:
-    api_token = configured_api_token(config)
+    api_tokens = configured_api_tokens(config)
     protect_reads = bool(config.app.get("api_auth_required_for_reads", False)) if config else False
     app_context = dict(config.app) if config else {}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
-            if path.startswith("/api/") and protect_reads and not self.is_authorized(api_token):
-                self.record_audit(path, 401, "unauthorized", "missing or invalid token")
-                self.send_auth_error()
-                return
+            if path.startswith("/api/") and protect_reads:
+                auth = self.require_role(path, "viewer")
+                if auth is None:
+                    return
             if path == "/api/summary":
                 self.send_json(storage.dashboard_summary())
                 return
@@ -79,19 +78,18 @@ def start_dashboard(
 
         def do_POST(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
-            if not self.is_authorized(api_token):
-                self.record_audit(path, 401, "unauthorized", "missing or invalid token")
-                self.send_auth_error()
+            auth = self.require_role(path, "operator")
+            if auth is None:
                 return
 
             action_request = parse_action_api_path(path)
             if action_request:
-                self.handle_action_post(action_request)
+                self.handle_action_post(action_request, auth)
                 return
 
             incident_request = parse_incident_api_path(path)
             if not incident_request:
-                self.record_audit(path, 404, "not_found", "unsupported api path")
+                self.record_audit(path, 404, "not_found", "unsupported api path", auth=auth)
                 self.send_json({"error": "not found"}, status=404)
                 return
 
@@ -99,7 +97,7 @@ def start_dashboard(
             actor = "api"
             try:
                 body = self.read_json_body()
-                actor = str(body.get("actor") or "api")
+                actor = self.actor_from_body(body, auth)
                 to_status = status_from_incident_action(action, body)
                 updated = storage.transition_incident(
                     incident_id,
@@ -109,27 +107,34 @@ def start_dashboard(
                     metadata={"api_action": action},
                 )
             except ValueError as exc:
-                self.record_audit(path, 400, "error", str(exc), actor=actor)
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
                 self.send_json({"error": str(exc)}, status=400)
                 return
             except Exception as exc:
-                self.record_audit(path, 500, "error", str(exc), actor=actor)
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
                 self.send_json({"error": str(exc)}, status=500)
                 return
-            self.record_audit(path, 200, "success", f"incident status={updated.get('status')}", actor=actor)
+            self.record_audit(path, 200, "success", f"incident status={updated.get('status')}", actor=actor, auth=auth)
             self.send_json(updated)
 
-        def handle_action_post(self, action_request: tuple[int, str]) -> None:
+        def handle_action_post(self, action_request: tuple[int, str], auth: AuthResult) -> None:
             action_id, action = action_request
             path = self.path.split("?", 1)[0]
             actor = "api"
             try:
                 body = self.read_json_body()
-                actor = str(body.get("actor") or "api")
+                actor = self.actor_from_body(body, auth)
                 note = str(body.get("note") or body.get("reason") or "")
                 if action == "approve":
                     if config is None:
-                        self.record_audit(path, 503, "error", "approval execution is not configured", actor=actor)
+                        self.record_audit(
+                            path,
+                            503,
+                            "error",
+                            "approval execution is not configured",
+                            actor=actor,
+                            auth=auth,
+                        )
                         self.send_json({"error": "approval execution is not configured"}, status=503)
                         return
                     result = approve_action_log(storage, config, action_id, actor=actor, notifier=notifier)
@@ -139,23 +144,31 @@ def start_dashboard(
                         "success",
                         f"action status={result.result.status}",
                         actor=actor,
+                        auth=auth,
                     )
                     self.send_json(result.to_dict())
                     return
                 if action == "reject":
                     rejected = reject_action_log(storage, action_id, actor=actor, note=note)
-                    self.record_audit(path, 200, "success", "action rejected", actor=actor)
+                    self.record_audit(path, 200, "success", "action rejected", actor=actor, auth=auth)
                     self.send_json(rejected)
                     return
             except ValueError as exc:
-                self.record_audit(path, 400, "error", str(exc), actor=actor)
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
                 self.send_json({"error": str(exc)}, status=400)
                 return
             except Exception as exc:
-                self.record_audit(path, 500, "error", str(exc), actor=actor)
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
                 self.send_json({"error": str(exc)}, status=500)
                 return
-            self.record_audit(path, 404, "not_found", f"unsupported action operation: {action}", actor=actor)
+            self.record_audit(
+                path,
+                404,
+                "not_found",
+                f"unsupported action operation: {action}",
+                actor=actor,
+                auth=auth,
+            )
             self.send_json({"error": f"unsupported action operation: {action}"}, status=404)
 
         def read_json_body(self) -> dict:
@@ -168,21 +181,45 @@ def start_dashboard(
             payload = json.loads(raw)
             return payload if isinstance(payload, dict) else {}
 
-        def is_authorized(self, expected_token: str) -> bool:
-            if not expected_token:
-                return True
+        def require_role(self, path: str, required_role: str) -> AuthResult | None:
+            auth = self.authenticate()
+            if not auth.authenticated:
+                message = auth.reason or "missing or invalid token"
+                self.record_audit(path, 401, "unauthorized", message, auth=auth)
+                self.send_auth_error(401, "unauthorized")
+                return None
+            if not has_role(auth.role, required_role):
+                message = f"requires {required_role} role"
+                self.record_audit(path, 403, "forbidden", message, auth=auth)
+                self.send_auth_error(403, "forbidden")
+                return None
+            return auth
+
+        def authenticate(self) -> AuthResult:
+            return authenticate_token(self.provided_token(), api_tokens)
+
+        def provided_token(self) -> str:
             provided = self.headers.get("X-Ops-Agent-Token", "").strip()
             authorization = self.headers.get("Authorization", "").strip()
             if authorization.lower().startswith("bearer "):
                 provided = authorization[7:].strip()
-            return hmac.compare_digest(provided, expected_token)
+            return provided
 
-        def send_auth_error(self) -> None:
-            payload = {"error": "unauthorized"}
+        def actor_from_body(self, body: dict, auth: AuthResult) -> str:
+            return str(
+                body.get("actor")
+                or self.headers.get("X-Ops-Agent-Actor")
+                or auth.token_name
+                or "api"
+            )
+
+        def send_auth_error(self, status: int, message: str) -> None:
+            payload = {"error": message}
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(401)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("WWW-Authenticate", 'Bearer realm="ops-agent"')
+            if status == 401:
+                self.send_header("WWW-Authenticate", 'Bearer realm="ops-agent"')
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -194,11 +231,15 @@ def start_dashboard(
             outcome: str,
             message: str,
             actor: str = "",
+            auth: AuthResult | None = None,
         ) -> None:
             operation, target_type, target_id = audit_target_from_path(path)
+            audit_actor = actor or self.headers.get("X-Ops-Agent-Actor", "")
+            if not audit_actor and auth and auth.authenticated:
+                audit_actor = auth.token_name
             try:
                 storage.record_api_audit(
-                    actor=actor or self.headers.get("X-Ops-Agent-Actor", ""),
+                    actor=audit_actor,
                     source_ip=self.client_ip(),
                     method=self.command,
                     path=path,
@@ -208,7 +249,12 @@ def start_dashboard(
                     status_code=status_code,
                     outcome=outcome,
                     message=message,
-                    metadata={"user_agent": self.headers.get("User-Agent", "")},
+                    metadata={
+                        "user_agent": self.headers.get("User-Agent", ""),
+                        "auth_role": auth.role if auth else "anonymous",
+                        "token_name": auth.token_name if auth else "",
+                        "auth_reason": auth.reason if auth else "",
+                    },
                     environment=str(app_context.get("environment") or "prod"),
                     run_type="api",
                 )
@@ -570,16 +616,6 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/results": ("result.list", "result", None),
     }
     return mapping.get(path, ("api.unknown", "", None))
-
-
-def configured_api_token(config: AppConfig | None) -> str:
-    env_token = os.environ.get("OPS_AGENT_API_TOKEN", "").strip()
-    if env_token:
-        return env_token
-    if config is None:
-        return ""
-    app = config.app
-    return str(app.get("api_token") or app.get("dashboard_api_token") or "").strip()
 
 
 def status_from_incident_action(action: str, body: dict) -> str:

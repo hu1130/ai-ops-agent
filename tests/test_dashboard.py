@@ -262,6 +262,123 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(401, raised.exception.code)
         self.assertIn("current_status", body)
 
+    def test_viewer_token_can_read_when_read_auth_is_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "app": {
+                        "api_auth_required_for_reads": True,
+                        "api_tokens": [
+                            {"name": "readonly", "token": "viewer-token", "role": "viewer"},
+                        ],
+                    }
+                },
+                base_dir=Path(tmp),
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/summary",
+                    headers={"Authorization": "Bearer viewer-token"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertIn("current_status", body)
+
+    def test_viewer_token_cannot_write_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="json", name="AI", status="warning", summary="Slow")
+            incident_id = storage.save_incident("warning", "Ops Agent detected 1 issue(s)", "analysis", [result])
+            config = AppConfig(
+                raw={
+                    "app": {
+                        "api_tokens": [
+                            {"name": "readonly", "token": "viewer-token", "role": "viewer"},
+                        ],
+                    }
+                },
+                base_dir=Path(tmp),
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/ack",
+                    data=b"{}",
+                    method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer viewer-token",
+                    },
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=5)
+                incident = storage.get_incident(incident_id)
+                audit = storage.latest_api_audit_logs()[0]
+                metadata = json.loads(audit["metadata_json"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(403, raised.exception.code)
+        self.assertEqual("open", incident["status"])
+        self.assertEqual("forbidden", audit["outcome"])
+        self.assertEqual(403, audit["status_code"])
+        self.assertEqual("viewer", metadata["auth_role"])
+        self.assertEqual("readonly", metadata["token_name"])
+
+    def test_operator_token_can_write_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="json", name="AI", status="warning", summary="Slow")
+            incident_id = storage.save_incident("warning", "Ops Agent detected 1 issue(s)", "analysis", [result])
+            config = AppConfig(
+                raw={
+                    "app": {
+                        "api_tokens": [
+                            {"name": "ops-console", "token": "operator-token", "role": "operator"},
+                        ],
+                    }
+                },
+                base_dir=Path(tmp),
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/ack",
+                    data=b"{}",
+                    method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Ops-Agent-Token": "operator-token",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                audit = storage.latest_api_audit_logs()[0]
+                metadata = json.loads(audit["metadata_json"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("acknowledged", body["status"])
+        self.assertEqual("ops-console", body["acknowledged_by"])
+        self.assertEqual("success", audit["outcome"])
+        self.assertEqual("ops-console", audit["actor"])
+        self.assertEqual("operator", metadata["auth_role"])
+        self.assertEqual("ops-console", metadata["token_name"])
+
     def test_post_api_records_success_audit_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

@@ -42,6 +42,24 @@ class CliTest(unittest.TestCase):
         self.assertTrue(any("app.environment" in error for error in errors))
         self.assertTrue(any("retention.test_environments" in error for error in errors))
 
+    def test_validate_config_reports_bad_api_token_roles(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {
+                    "interval_seconds": 60,
+                    "api_auth_required_for_reads": "yes",
+                    "api_tokens": [
+                        {"name": "bad", "token": "secret", "role": "owner"},
+                    ],
+                },
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+            },
+            base_dir=Path("."),
+        )
+        errors = validate_config(config)
+        self.assertTrue(any("app.api_auth_required_for_reads" in error for error in errors))
+        self.assertTrue(any("app.api_tokens[0].role" in error for error in errors))
+
     def test_validate_config_accepts_container_log_check(self) -> None:
         config = AppConfig(
             raw={
