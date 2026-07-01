@@ -576,6 +576,7 @@ def validate_config(config: AppConfig) -> list[str]:
         if allowed_actions and not isinstance(allowed_actions, list):
             errors.append("remediation.allowed_actions 必须是数组")
         validate_remediation_policies(remediation, errors)
+        validate_remediation_playbooks(remediation, errors)
 
     retention = dict(config.raw.get("retention", {}))
     if retention:
@@ -680,6 +681,54 @@ def validate_remediation_policies(remediation: dict, errors: list[str]) -> None:
                 errors.append(f"{field}.verify_after.type 目前只支持 http")
             if verify_after.get("url"):
                 validate_url(str(verify_after["url"]), f"{field}.verify_after.url", errors)
+
+
+def validate_remediation_playbooks(remediation: dict, errors: list[str]) -> None:
+    playbooks = remediation.get("playbooks", [])
+    if not playbooks:
+        return
+    if not isinstance(playbooks, list):
+        errors.append("remediation.playbooks 必须是数组")
+        return
+
+    for index, playbook in enumerate(playbooks):
+        field = f"remediation.playbooks[{index}]"
+        if not isinstance(playbook, dict):
+            errors.append(f"{field} 必须是对象")
+            continue
+
+        if not str(playbook.get("name", "")).strip():
+            errors.append(f"{field}.name 不能为空")
+        if "enabled" in playbook and not isinstance(playbook["enabled"], bool):
+            errors.append(f"{field}.enabled 必须是 true/false")
+
+        match = playbook.get("match", {})
+        if match and not isinstance(match, dict):
+            errors.append(f"{field}.match 必须是对象")
+        elif isinstance(match, dict):
+            for key in ("sources", "statuses", "name_contains", "summary_contains", "url_contains", "path_contains"):
+                if key in match:
+                    validate_string_list(match[key], f"{field}.match.{key}", errors)
+
+        steps = playbook.get("steps", [])
+        if not isinstance(steps, list) or not steps:
+            errors.append(f"{field}.steps 必须是非空数组")
+            continue
+
+        for step_index, step in enumerate(steps):
+            step_field = f"{field}.steps[{step_index}]"
+            if not isinstance(step, dict):
+                errors.append(f"{step_field} 必须是对象")
+                continue
+            action_type = str(step.get("action_type", "")).strip()
+            if not action_type:
+                errors.append(f"{step_field}.action_type 不能为空")
+            if "risk" in step and str(step["risk"]) not in {"low", "medium", "high"}:
+                errors.append(f"{step_field}.risk 必须是 low/medium/high")
+            if "auto_execute" in step and not isinstance(step["auto_execute"], bool):
+                errors.append(f"{step_field}.auto_execute 必须是 true/false")
+            if "params" in step and not isinstance(step["params"], dict):
+                errors.append(f"{step_field}.params 必须是对象")
 
 
 if __name__ == "__main__":

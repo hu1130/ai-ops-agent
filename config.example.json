@@ -78,6 +78,55 @@
       "interval_seconds": 5,
       "timeout_seconds": 5
     },
+    "playbooks": [
+      {
+        "name": "web availability triage",
+        "enabled": true,
+        "match": {
+          "sources": ["http", "json_api"],
+          "statuses": ["warning", "critical"]
+        },
+        "steps": [
+          {
+            "action_type": "check_port",
+            "title": "检查目标端口 {{host}}:{{port}}",
+            "reason": "{{source}}/{{name}} 访问异常，先确认目标端口是否可连通。",
+            "params": {
+              "host": "{{host}}",
+              "port": "{{port}}",
+              "timeout_seconds": 3
+            },
+            "auto_execute": true
+          },
+          {
+            "action_type": "run_diagnostic_command",
+            "title": "查看容器状态",
+            "reason": "{{source}}/{{name}} 异常时，确认容器是否仍在运行。",
+            "params": {
+              "command": "docker ps --format table {{.Names}}\\t{{.Status}}\\t{{.Ports}}"
+            }
+          }
+        ]
+      },
+      {
+        "name": "disk pressure triage",
+        "enabled": true,
+        "match": {
+          "sources": ["server"],
+          "name_contains": ["Disk"]
+        },
+        "steps": [
+          {
+            "action_type": "run_diagnostic_command",
+            "title": "查看磁盘占用",
+            "reason": "磁盘使用率异常时，先定位磁盘和目录占用。",
+            "params": {
+              "command": "df -h"
+            }
+          }
+        ]
+      }
+    ],
     "policies": [
       {
         "name": "port checks",

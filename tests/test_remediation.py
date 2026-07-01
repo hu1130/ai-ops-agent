@@ -62,6 +62,91 @@ class RemediationTest(unittest.TestCase):
         self.assertEqual(1, len(check_port_actions))
         self.assertTrue(check_port_actions[0].auto_execute)
 
+    def test_playbook_generates_template_actions(self) -> None:
+        config = AppConfig(
+            raw={
+                "remediation": {
+                    "enabled": True,
+                    "playbooks": [
+                        {
+                            "name": "web triage",
+                            "match": {"sources": ["json_api"]},
+                            "steps": [
+                                {
+                                    "action_type": "check_port",
+                                    "title": "PB {{host}}:{{port}}",
+                                    "reason": "{{source}}/{{name}} playbook matched",
+                                    "params": {"host": "{{host}}", "port": "{{port}}", "timeout_seconds": 3},
+                                    "auto_execute": True,
+                                },
+                                {
+                                    "action_type": "run_diagnostic_command",
+                                    "title": "PB docker ps",
+                                    "reason": "Keep docker template syntax",
+                                    "params": {"command": "docker ps --format table {{.Names}}\\t{{.Status}}\\t{{.Ports}}"},
+                                },
+                            ],
+                        }
+                    ],
+                    "policies": [
+                        {
+                            "action_type": "check_port",
+                            "targets": ["agent.example.com:443"],
+                            "enabled": True,
+                            "auto_execute": True,
+                        },
+                        {
+                            "action_type": "run_diagnostic_command",
+                            "targets": ["docker"],
+                            "enabled": True,
+                        },
+                    ],
+                }
+            },
+            base_dir=Path("."),
+        )
+        issue = CheckResult(
+            source="json_api",
+            name="AI customer service",
+            status="warning",
+            summary="Slow response",
+            details={"url": "https://agent.example.com/v1/chat"},
+        )
+        actions = build_remediation_plan([issue], config)
+        self.assertEqual(2, len(actions))
+        self.assertTrue(any(action.title == "PB agent.example.com:443" for action in actions))
+        docker_actions = [action for action in actions if action.action_type == "run_diagnostic_command"]
+        self.assertEqual(
+            "docker ps --format table {{.Names}}\\t{{.Status}}\\t{{.Ports}}",
+            docker_actions[0].params["command"],
+        )
+
+    def test_playbook_does_not_match_unrelated_issue(self) -> None:
+        config = AppConfig(
+            raw={
+                "remediation": {
+                    "enabled": True,
+                    "playbooks": [
+                        {
+                            "name": "web triage",
+                            "match": {"sources": ["json_api"]},
+                            "steps": [
+                                {
+                                    "action_type": "check_port",
+                                    "title": "Should not appear",
+                                    "reason": "source mismatch",
+                                    "params": {"host": "example.com", "port": 443},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+            base_dir=Path("."),
+        )
+        issue = CheckResult(source="manual", name="Manual issue", status="warning", summary="test")
+        self.assertEqual([], build_remediation_plan([issue], config))
+
     def test_policy_denies_unlisted_target(self) -> None:
         config = AppConfig(
             raw={

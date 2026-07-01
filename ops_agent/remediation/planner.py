@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from ops_agent.config import AppConfig
 from ops_agent.events import CheckResult
 from ops_agent.remediation.actions import RemediationAction
+from ops_agent.remediation.playbooks import build_playbook_actions
 from ops_agent.remediation.policy import apply_policy_defaults, decide_action_policy
 
 
@@ -19,6 +20,7 @@ def build_remediation_plan(results: list[CheckResult], config: AppConfig) -> lis
     for result in results:
         if not result.is_problem:
             continue
+        actions.extend(build_playbook_actions(result, remediation, configured_actions))
         actions.extend(plan_for_result(result, configured_actions))
     planned: list[RemediationAction] = []
     for action in dedupe_actions(actions):

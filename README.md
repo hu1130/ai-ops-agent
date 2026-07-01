@@ -157,6 +157,45 @@ python -m ops_agent.cli --config .\config.json run-action --type check_port --ho
 python -m ops_agent.cli --config .\config.json action-logs
 ```
 
+## 自愈 Playbook
+
+`remediation.playbooks` 用来把常见故障处理流程配置成剧本。Playbook 只负责编排动作，不绕过策略中心；最终能否自动执行、是否需要人工确认、是否必须执行后验证，仍由 `remediation.policies` 决定。
+
+Playbook 支持按以下条件匹配异常：
+- `sources`: 例如 `http`、`json_api`、`server`、`log`
+- `statuses`: `warning` 或 `critical`
+- `name_contains`、`summary_contains`、`url_contains`、`path_contains`
+
+步骤里的 `params`、`title`、`reason` 支持占位符：
+- `{{source}}`、`{{name}}`、`{{status}}`、`{{summary}}`
+- `{{url}}`、`{{host}}`、`{{port}}`、`{{path}}`
+- `{{details.xxx}}`
+
+示例：
+```json
+{
+  "name": "web availability triage",
+  "enabled": true,
+  "match": {
+    "sources": ["http", "json_api"],
+    "statuses": ["warning", "critical"]
+  },
+  "steps": [
+    {
+      "action_type": "check_port",
+      "title": "检查目标端口 {{host}}:{{port}}",
+      "reason": "{{source}}/{{name}} 访问异常，先确认目标端口是否可连通。",
+      "params": {
+        "host": "{{host}}",
+        "port": "{{port}}",
+        "timeout_seconds": 3
+      },
+      "auto_execute": true
+    }
+  ]
+}
+```
+
 ## 自愈策略中心
 
 `remediation.policies` 用来明确控制每一种自愈动作的边界。配置了策略后，执行器会优先按策略判断；没有配置策略时，才兼容旧的 `allowed_actions`、`allowed_services` 和 `allowed_containers`。

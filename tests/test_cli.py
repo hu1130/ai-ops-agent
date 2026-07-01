@@ -124,6 +124,66 @@ class CliTest(unittest.TestCase):
         errors = validate_config(config)
         self.assertTrue(any("修改类动作不能使用 *" in error for error in errors))
 
+    def test_validate_config_accepts_remediation_playbook(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60},
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+                "remediation": {
+                    "playbooks": [
+                        {
+                            "name": "web triage",
+                            "enabled": True,
+                            "match": {"sources": ["http", "json_api"], "statuses": ["warning", "critical"]},
+                            "steps": [
+                                {
+                                    "action_type": "check_port",
+                                    "title": "检查 {{host}}:{{port}}",
+                                    "reason": "web target failed",
+                                    "params": {"host": "{{host}}", "port": "{{port}}"},
+                                    "auto_execute": True,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            },
+            base_dir=Path("."),
+        )
+        self.assertEqual([], validate_config(config))
+
+    def test_validate_config_reports_bad_remediation_playbook(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60},
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+                "remediation": {
+                    "playbooks": [
+                        {
+                            "enabled": "yes",
+                            "match": {"sources": "json_api"},
+                            "steps": [
+                                {
+                                    "risk": "danger",
+                                    "auto_execute": "yes",
+                                    "params": "bad",
+                                }
+                            ],
+                        }
+                    ]
+                },
+            },
+            base_dir=Path("."),
+        )
+        errors = validate_config(config)
+        self.assertTrue(any("remediation.playbooks[0].name" in error for error in errors))
+        self.assertTrue(any("remediation.playbooks[0].enabled" in error for error in errors))
+        self.assertTrue(any("remediation.playbooks[0].match.sources" in error for error in errors))
+        self.assertTrue(any("remediation.playbooks[0].steps[0].action_type" in error for error in errors))
+        self.assertTrue(any("remediation.playbooks[0].steps[0].risk" in error for error in errors))
+        self.assertTrue(any("remediation.playbooks[0].steps[0].auto_execute" in error for error in errors))
+        self.assertTrue(any("remediation.playbooks[0].steps[0].params" in error for error in errors))
+
 
 if __name__ == "__main__":
     unittest.main()
