@@ -130,12 +130,16 @@ def dedupe_actions(actions: list[RemediationAction]) -> list[RemediationAction]:
     seen: set[tuple[str, str]] = set()
     unique: list[RemediationAction] = []
     for action in actions:
-        key = (action.action_type, repr(sorted(action.params.items())))
+        key = (action.action_type, repr(sorted(public_params(action.params).items())))
         if key in seen:
             continue
         seen.add(key)
         unique.append(action)
     return unique
+
+
+def public_params(params: dict) -> dict:
+    return {key: value for key, value in params.items() if not str(key).startswith("_")}
 
 
 def host_port_from_url(url: str) -> tuple[str, int | None]:

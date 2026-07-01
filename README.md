@@ -166,6 +166,11 @@ Playbook 支持按以下条件匹配异常：
 - `statuses`: `warning` 或 `critical`
 - `name_contains`、`summary_contains`、`url_contains`、`path_contains`
 
+执行闭环字段：
+- `stage`: 步骤阶段，支持 `diagnose`、`remediate`、`verify`、`rollback`
+- `on_failure`: 步骤失败后的处理，支持 `continue`、`halt`、`escalate`、`rollback`
+- `rollback_steps`: 当步骤设置 `on_failure=rollback` 时执行的回滚/补救诊断步骤
+
 步骤里的 `params`、`title`、`reason` 支持占位符：
 - `{{source}}`、`{{name}}`、`{{status}}`、`{{summary}}`
 - `{{url}}`、`{{host}}`、`{{port}}`、`{{path}}`
@@ -176,12 +181,16 @@ Playbook 支持按以下条件匹配异常：
 {
   "name": "web availability triage",
   "enabled": true,
+  "on_failure": "halt",
   "match": {
     "sources": ["http", "json_api"],
     "statuses": ["warning", "critical"]
   },
   "steps": [
     {
+      "id": "check_target_port",
+      "stage": "diagnose",
+      "on_failure": "halt",
       "action_type": "check_port",
       "title": "检查目标端口 {{host}}:{{port}}",
       "reason": "{{source}}/{{name}} 访问异常，先确认目标端口是否可连通。",
@@ -195,6 +204,14 @@ Playbook 支持按以下条件匹配异常：
   ]
 }
 ```
+
+失败处理含义：
+- `continue`: 当前步骤失败也继续后续步骤
+- `halt`: 当前步骤失败后跳过同一 Playbook 的后续步骤，并写入 `skipped` 审计
+- `escalate`: 当前步骤失败后发送升级告警，并将关联事件推进到 `remediating`
+- `rollback`: 当前步骤失败后执行 `rollback_steps`，再跳过同一 Playbook 的后续步骤
+
+调度器执行成功后如果动作里带有 `verify_after`，会自动做执行后验证，并把结果写回 `action_logs.verify_status`。
 
 ## 自愈策略中心
 

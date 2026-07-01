@@ -152,7 +152,11 @@ def run_command(action: RemediationAction, args: list[str], config: AppConfig) -
 
 
 def describe_dry_run(action: RemediationAction) -> str:
-    params = ", ".join(f"{key}={value}" for key, value in sorted(action.params.items()))
+    params = ", ".join(
+        f"{key}={value}"
+        for key, value in sorted(action.params.items())
+        if not str(key).startswith("_")
+    )
     return f"将执行: {action.action_type} ({params})"
 
 
@@ -164,6 +168,12 @@ def format_action_plan(actions: list[RemediationAction], results: list[ActionRes
         mode = "可自动执行" if action.auto_execute else "需人工确认"
         lines.append(f"{index}. [{action.risk}] {action.title} - {mode}")
         lines.append(f"   原因: {action.reason}")
+        playbook = action.params.get("_playbook")
+        if isinstance(playbook, dict):
+            lines.append(
+                "   剧本: "
+                f"{playbook.get('name', '')}/{playbook.get('stage', '')}/{playbook.get('step_id', '')}"
+            )
     if results:
         lines.extend(["", "处置执行结果:"])
         for result in results:

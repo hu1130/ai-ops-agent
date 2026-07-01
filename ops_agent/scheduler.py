@@ -15,8 +15,16 @@ from ops_agent.monitors.http_monitor import run_http_checks
 from ops_agent.monitors.json_api_monitor import run_json_checks
 from ops_agent.monitors.log_monitor import run_log_checks
 from ops_agent.monitors.server_monitor import run_server_checks
+from ops_agent.remediation.actions import ActionResult, RemediationAction
 from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action, format_action_plan
+from ops_agent.remediation.playbooks import (
+    playbook_failure_policy,
+    playbook_identity,
+    playbook_meta,
+    playbook_rollback_actions,
+)
 from ops_agent.remediation.planner import build_remediation_plan
+from ops_agent.remediation.verifier import verify_after_action
 from ops_agent.retention import format_retention_result, run_retention_cleanup
 from ops_agent.storage import Storage
 
@@ -123,10 +131,10 @@ class OpsScheduler:
 
     def process_remediation_actions(
         self,
-        actions,
+        actions: list[RemediationAction],
         context_results: list[CheckResult] | None = None,
         incident_id: int | None = None,
-    ):
+    ) -> list[ActionResult]:
         if not actions:
             return []
 
@@ -134,30 +142,159 @@ class OpsScheduler:
         mode = str(remediation.get("mode", "suggest"))
         dry_run = mode != "auto"
         context = context_from_results(context_results or [])
-        results = []
+        results: list[ActionResult] = []
+        halted_playbooks: set[str] = set()
         for action in actions:
-            if mode == "off":
-                result = execute_action(action, self.config, dry_run=True)
-            elif dry_run or not action.auto_execute:
-                result = execute_action(action, self.config, dry_run=True)
-            else:
-                result = execute_action(action, self.config, dry_run=False)
-            self.storage.save_action_log(
-                action.action_type,
-                action.title,
-                action.risk,
-                result.status,
-                action.reason,
-                action.params,
-                result.output,
-                result.error,
-                environment=context.environment,
-                run_type=context.run_type,
-                trace_id=context.trace_id,
-                incident_id=incident_id,
-            )
+            playbook_name = playbook_identity(action)
+            if playbook_name and playbook_name in halted_playbooks:
+                result = ActionResult(
+                    action=action,
+                    status="skipped",
+                    error=f"playbook halted after previous failure: {playbook_name}",
+                )
+                self.record_action_result(result, context, incident_id)
+                results.append(result)
+                continue
+
+            result = self.execute_and_record_action(action, mode, dry_run, context, incident_id)
             results.append(result)
+
+            if not action_failed(result):
+                continue
+
+            handling_results, should_halt = self.handle_playbook_failure(
+                action,
+                result,
+                mode,
+                dry_run,
+                context,
+                incident_id,
+            )
+            results.extend(handling_results)
+            if should_halt and playbook_name:
+                halted_playbooks.add(playbook_name)
         return results
+
+    def execute_and_record_action(
+        self,
+        action: RemediationAction,
+        mode: str,
+        dry_run: bool,
+        context: RunContext,
+        incident_id: int | None,
+    ) -> ActionResult:
+        if mode == "off":
+            result = execute_action(action, self.config, dry_run=True)
+        elif dry_run or not action.auto_execute:
+            result = execute_action(action, self.config, dry_run=True)
+        else:
+            result = execute_action(action, self.config, dry_run=False)
+
+        action_id = self.record_action_result(result, context, incident_id)
+        if result.status != "executed":
+            return result
+
+        verification = verify_after_action(action, self.config)
+        if verification.status == "verify_skipped":
+            return result
+
+        output = verification.output or verification.error
+        self.storage.update_action_verification(action_id, verification.status, output)
+        return ActionResult(
+            action=action,
+            status=verification.status,
+            output=verification.output,
+            error=verification.error,
+        )
+
+    def record_action_result(
+        self,
+        result: ActionResult,
+        context: RunContext,
+        incident_id: int | None,
+    ) -> int:
+        return self.storage.save_action_log(
+            result.action.action_type,
+            result.action.title,
+            result.action.risk,
+            result.status,
+            result.action.reason,
+            result.action.params,
+            result.output,
+            result.error,
+            environment=context.environment,
+            run_type=context.run_type,
+            trace_id=context.trace_id,
+            incident_id=incident_id,
+        )
+
+    def handle_playbook_failure(
+        self,
+        action: RemediationAction,
+        result: ActionResult,
+        mode: str,
+        dry_run: bool,
+        context: RunContext,
+        incident_id: int | None,
+    ) -> tuple[list[ActionResult], bool]:
+        playbook_name = playbook_identity(action)
+        if not playbook_name:
+            return [], False
+
+        policy = playbook_failure_policy(action)
+        if policy == "continue":
+            return [], False
+
+        meta = playbook_meta(action)
+        if policy == "escalate":
+            self.escalate_playbook_failure(action, result, incident_id, meta)
+            return [], True
+
+        if policy == "rollback":
+            rollback_results = []
+            for rollback_action in playbook_rollback_actions(action):
+                rollback_results.append(
+                    self.execute_and_record_action(rollback_action, mode, dry_run, context, incident_id)
+                )
+            return rollback_results, True
+
+        return [], True
+
+    def escalate_playbook_failure(
+        self,
+        action: RemediationAction,
+        result: ActionResult,
+        incident_id: int | None,
+        meta: dict,
+    ) -> None:
+        playbook_name = str(meta.get("name") or "")
+        step_id = str(meta.get("step_id") or "")
+        title = "Ops Agent playbook escalation"
+        text = (
+            f"Playbook: {playbook_name}\n"
+            f"Step: {step_id}\n"
+            f"Action: {action.title}\n"
+            f"Status: {result.status}\n"
+            f"Error: {result.error}"
+        )
+        self.notifier.send(title, text, dedupe_key=f"playbook-escalation:{playbook_name}:{step_id}:{result.status}")
+        if not incident_id:
+            return
+        try:
+            self.storage.transition_incident(
+                incident_id,
+                "remediating",
+                actor="scheduler",
+                note="playbook escalation",
+                metadata={
+                    "playbook": playbook_name,
+                    "step_id": step_id,
+                    "action_status": result.status,
+                    "error": result.error,
+                },
+            )
+        except ValueError:
+            return
 
     def send_daily_report_if_due(self) -> None:
         report_config = self.config.alerts.get("daily_report", {})
@@ -274,6 +411,10 @@ def incident_status_from_action_results(action_results) -> str:
     ):
         return "remediating"
     return ""
+
+
+def action_failed(result: ActionResult) -> bool:
+    return result.status in {"failed", "verified_failed"}
 
 
 def build_recovery_message(results: list[CheckResult]) -> str:

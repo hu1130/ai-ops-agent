@@ -82,12 +82,16 @@
       {
         "name": "web availability triage",
         "enabled": true,
+        "on_failure": "halt",
         "match": {
           "sources": ["http", "json_api"],
           "statuses": ["warning", "critical"]
         },
         "steps": [
           {
+            "id": "check_target_port",
+            "stage": "diagnose",
+            "on_failure": "halt",
             "action_type": "check_port",
             "title": "检查目标端口 {{host}}:{{port}}",
             "reason": "{{source}}/{{name}} 访问异常，先确认目标端口是否可连通。",
@@ -99,6 +103,9 @@
             "auto_execute": true
           },
           {
+            "id": "inspect_containers",
+            "stage": "diagnose",
+            "on_failure": "continue",
             "action_type": "run_diagnostic_command",
             "title": "查看容器状态",
             "reason": "{{source}}/{{name}} 异常时，确认容器是否仍在运行。",
@@ -111,17 +118,57 @@
       {
         "name": "disk pressure triage",
         "enabled": true,
+        "on_failure": "continue",
         "match": {
           "sources": ["server"],
           "name_contains": ["Disk"]
         },
         "steps": [
           {
+            "id": "inspect_disk",
+            "stage": "diagnose",
+            "on_failure": "continue",
             "action_type": "run_diagnostic_command",
             "title": "查看磁盘占用",
             "reason": "磁盘使用率异常时，先定位磁盘和目录占用。",
             "params": {
               "command": "df -h"
+            }
+          }
+        ]
+      },
+      {
+        "name": "ops-agent guarded restart example",
+        "enabled": false,
+        "on_failure": "rollback",
+        "match": {
+          "sources": ["manual"],
+          "name_contains": ["ops-agent restart"]
+        },
+        "steps": [
+          {
+            "id": "restart_ops_agent",
+            "stage": "remediate",
+            "on_failure": "rollback",
+            "action_type": "restart_service",
+            "title": "重启 ops-agent 服务",
+            "reason": "示例剧本：人工确认后重启 ops-agent，并在失败时执行回滚诊断。",
+            "risk": "medium",
+            "params": {
+              "service": "ops-agent"
+            }
+          }
+        ],
+        "rollback_steps": [
+          {
+            "id": "inspect_ops_agent_after_failure",
+            "stage": "rollback",
+            "on_failure": "escalate",
+            "action_type": "run_diagnostic_command",
+            "title": "查看 ops-agent 状态",
+            "reason": "重启失败后查看 systemd 状态，作为回滚诊断信息。",
+            "params": {
+              "command": "systemctl status ops-agent --no-pager"
             }
           }
         ]

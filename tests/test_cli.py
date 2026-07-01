@@ -134,14 +134,29 @@ class CliTest(unittest.TestCase):
                         {
                             "name": "web triage",
                             "enabled": True,
+                            "on_failure": "halt",
                             "match": {"sources": ["http", "json_api"], "statuses": ["warning", "critical"]},
                             "steps": [
                                 {
+                                    "id": "check_target",
+                                    "stage": "diagnose",
+                                    "on_failure": "halt",
                                     "action_type": "check_port",
                                     "title": "检查 {{host}}:{{port}}",
                                     "reason": "web target failed",
                                     "params": {"host": "{{host}}", "port": "{{port}}"},
                                     "auto_execute": True,
+                                }
+                            ],
+                            "rollback_steps": [
+                                {
+                                    "id": "inspect_after_failure",
+                                    "stage": "rollback",
+                                    "on_failure": "escalate",
+                                    "action_type": "run_diagnostic_command",
+                                    "title": "查看状态",
+                                    "reason": "rollback diagnostic",
+                                    "params": {"command": "systemctl status ops-agent --no-pager"},
                                 }
                             ],
                         }
@@ -161,14 +176,18 @@ class CliTest(unittest.TestCase):
                     "playbooks": [
                         {
                             "enabled": "yes",
+                            "on_failure": "bad",
                             "match": {"sources": "json_api"},
                             "steps": [
                                 {
                                     "risk": "danger",
                                     "auto_execute": "yes",
                                     "params": "bad",
+                                    "stage": "bad",
+                                    "on_failure": "bad",
                                 }
                             ],
+                            "rollback_steps": "bad",
                         }
                     ]
                 },
@@ -178,11 +197,15 @@ class CliTest(unittest.TestCase):
         errors = validate_config(config)
         self.assertTrue(any("remediation.playbooks[0].name" in error for error in errors))
         self.assertTrue(any("remediation.playbooks[0].enabled" in error for error in errors))
+        self.assertTrue(any("remediation.playbooks[0].on_failure" in error for error in errors))
         self.assertTrue(any("remediation.playbooks[0].match.sources" in error for error in errors))
         self.assertTrue(any("remediation.playbooks[0].steps[0].action_type" in error for error in errors))
         self.assertTrue(any("remediation.playbooks[0].steps[0].risk" in error for error in errors))
         self.assertTrue(any("remediation.playbooks[0].steps[0].auto_execute" in error for error in errors))
         self.assertTrue(any("remediation.playbooks[0].steps[0].params" in error for error in errors))
+        self.assertTrue(any("remediation.playbooks[0].steps[0].stage" in error for error in errors))
+        self.assertTrue(any("remediation.playbooks[0].steps[0].on_failure" in error for error in errors))
+        self.assertTrue(any("remediation.playbooks[0].rollback_steps" in error for error in errors))
 
 
 if __name__ == "__main__":

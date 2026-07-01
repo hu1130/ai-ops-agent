@@ -8,6 +8,9 @@ from ops_agent.events import CheckResult
 from ops_agent.remediation.actions import RemediationAction
 
 TOKEN_RE = re.compile(r"{{\s*([a-zA-Z][a-zA-Z0-9_.-]*)\s*}}")
+PLAYBOOK_META_KEY = "_playbook"
+FAILURE_POLICIES = {"continue", "halt", "escalate", "rollback"}
+STAGES = {"diagnose", "remediate", "verify", "rollback"}
 
 
 def build_playbook_actions(
@@ -77,6 +80,43 @@ def actions_from_playbook(
     if not isinstance(steps, list):
         return []
 
+    default_on_failure = normalize_choice(str(playbook.get("on_failure") or "continue"), FAILURE_POLICIES, "continue")
+    rollback_actions = [
+        action.to_dict()
+        for action in actions_from_steps(
+            result,
+            playbook,
+            playbook.get("rollback_steps", []),
+            configured_actions,
+            default_on_failure="continue",
+            default_stage="rollback",
+            rollback_for="playbook",
+        )
+    ]
+    return actions_from_steps(
+        result,
+        playbook,
+        steps,
+        configured_actions,
+        default_on_failure=default_on_failure,
+        default_stage="diagnose",
+        rollback_actions=rollback_actions,
+    )
+
+
+def actions_from_steps(
+    result: CheckResult,
+    playbook: dict[str, Any],
+    steps: object,
+    configured_actions: dict[str, bool],
+    default_on_failure: str,
+    default_stage: str,
+    rollback_actions: list[dict[str, Any]] | None = None,
+    rollback_for: str = "",
+) -> list[RemediationAction]:
+    if not isinstance(steps, list):
+        return []
+
     context = template_context(result)
     playbook_name = str(playbook.get("name") or "playbook")
     actions: list[RemediationAction] = []
@@ -89,6 +129,21 @@ def actions_from_playbook(
         params = render_value(step.get("params", {}), context)
         if not isinstance(params, dict):
             params = {}
+        step_id = str(step.get("id") or f"step-{index}").strip() or f"step-{index}"
+        stage = normalize_choice(str(step.get("stage") or default_stage), STAGES, default_stage)
+        on_failure = normalize_choice(str(step.get("on_failure") or default_on_failure), FAILURE_POLICIES, default_on_failure)
+        meta: dict[str, Any] = {
+            "name": playbook_name,
+            "step_id": step_id,
+            "step_order": index,
+            "stage": stage,
+            "on_failure": on_failure,
+        }
+        if rollback_for:
+            meta["rollback_for"] = rollback_for
+        if on_failure == "rollback" and rollback_actions:
+            meta["rollback_actions"] = rollback_actions
+        params[PLAYBOOK_META_KEY] = meta
         title = str(render_value(step.get("title") or f"{playbook_name}: step {index}", context))
         reason = str(render_value(step.get("reason") or f"Matched remediation playbook: {playbook_name}", context))
         actions.append(
@@ -102,6 +157,36 @@ def actions_from_playbook(
             )
         )
     return actions
+
+
+def playbook_meta(action: RemediationAction) -> dict[str, Any]:
+    meta = action.params.get(PLAYBOOK_META_KEY)
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
+def playbook_identity(action: RemediationAction) -> str:
+    meta = playbook_meta(action)
+    return str(meta.get("name") or "")
+
+
+def playbook_failure_policy(action: RemediationAction) -> str:
+    meta = playbook_meta(action)
+    return normalize_choice(str(meta.get("on_failure") or "continue"), FAILURE_POLICIES, "continue")
+
+
+def playbook_rollback_actions(action: RemediationAction) -> list[RemediationAction]:
+    meta = playbook_meta(action)
+    raw_actions = meta.get("rollback_actions", [])
+    if not isinstance(raw_actions, list):
+        return []
+    from ops_agent.remediation.actions import action_from_dict
+
+    return [action_from_dict(item) for item in raw_actions if isinstance(item, dict)]
+
+
+def normalize_choice(value: str, allowed: set[str], default: str) -> str:
+    normalized = value.strip().lower()
+    return normalized if normalized in allowed else default
 
 
 def template_context(result: CheckResult) -> dict[str, Any]:

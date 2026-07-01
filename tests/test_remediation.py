@@ -70,9 +70,13 @@ class RemediationTest(unittest.TestCase):
                     "playbooks": [
                         {
                             "name": "web triage",
+                            "on_failure": "halt",
                             "match": {"sources": ["json_api"]},
                             "steps": [
                                 {
+                                    "id": "check_target",
+                                    "stage": "diagnose",
+                                    "on_failure": "halt",
                                     "action_type": "check_port",
                                     "title": "PB {{host}}:{{port}}",
                                     "reason": "{{source}}/{{name}} playbook matched",
@@ -80,6 +84,8 @@ class RemediationTest(unittest.TestCase):
                                     "auto_execute": True,
                                 },
                                 {
+                                    "id": "inspect_containers",
+                                    "stage": "diagnose",
                                     "action_type": "run_diagnostic_command",
                                     "title": "PB docker ps",
                                     "reason": "Keep docker template syntax",
@@ -114,7 +120,11 @@ class RemediationTest(unittest.TestCase):
         )
         actions = build_remediation_plan([issue], config)
         self.assertEqual(2, len(actions))
-        self.assertTrue(any(action.title == "PB agent.example.com:443" for action in actions))
+        port_actions = [action for action in actions if action.title == "PB agent.example.com:443"]
+        self.assertEqual(1, len(port_actions))
+        self.assertEqual("web triage", port_actions[0].params["_playbook"]["name"])
+        self.assertEqual("check_target", port_actions[0].params["_playbook"]["step_id"])
+        self.assertEqual("halt", port_actions[0].params["_playbook"]["on_failure"])
         docker_actions = [action for action in actions if action.action_type == "run_diagnostic_command"]
         self.assertEqual(
             "docker ps --format table {{.Names}}\\t{{.Status}}\\t{{.Ports}}",

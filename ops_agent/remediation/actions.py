@@ -38,6 +38,17 @@ class RemediationAction:
         }
 
 
+def action_from_dict(data: dict[str, Any]) -> RemediationAction:
+    return RemediationAction(
+        action_type=str(data.get("action_type", "")),
+        title=str(data.get("title", "")),
+        reason=str(data.get("reason", "")),
+        risk=str(data.get("risk", "low")),  # type: ignore[arg-type]
+        params=dict(data.get("params", {})) if isinstance(data.get("params", {}), dict) else {},
+        auto_execute=bool(data.get("auto_execute", False)),
+    )
+
+
 @dataclass(frozen=True)
 class ActionResult:
     action: RemediationAction

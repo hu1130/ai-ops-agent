@@ -13,6 +13,7 @@ from ops_agent.incident_lifecycle import INCIDENT_STATUSES
 from ops_agent.remediation.actions import ActionResult, RemediationAction
 from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action, format_action_plan
 from ops_agent.remediation.planner import build_remediation_plan
+from ops_agent.remediation.playbooks import FAILURE_POLICIES, STAGES
 from ops_agent.remediation.policy import apply_policy_defaults, decide_action_policy, format_policy_decision
 from ops_agent.remediation.verifier import VerificationResult, verify_after_action
 from ops_agent.retention import format_retention_result, run_retention_cleanup
@@ -701,6 +702,8 @@ def validate_remediation_playbooks(remediation: dict, errors: list[str]) -> None
             errors.append(f"{field}.name 不能为空")
         if "enabled" in playbook and not isinstance(playbook["enabled"], bool):
             errors.append(f"{field}.enabled 必须是 true/false")
+        if "on_failure" in playbook and str(playbook["on_failure"]) not in FAILURE_POLICIES:
+            errors.append(f"{field}.on_failure 必须是 continue/halt/escalate/rollback")
 
         match = playbook.get("match", {})
         if match and not isinstance(match, dict):
@@ -716,19 +719,34 @@ def validate_remediation_playbooks(remediation: dict, errors: list[str]) -> None
             continue
 
         for step_index, step in enumerate(steps):
-            step_field = f"{field}.steps[{step_index}]"
-            if not isinstance(step, dict):
-                errors.append(f"{step_field} 必须是对象")
-                continue
-            action_type = str(step.get("action_type", "")).strip()
-            if not action_type:
-                errors.append(f"{step_field}.action_type 不能为空")
-            if "risk" in step and str(step["risk"]) not in {"low", "medium", "high"}:
-                errors.append(f"{step_field}.risk 必须是 low/medium/high")
-            if "auto_execute" in step and not isinstance(step["auto_execute"], bool):
-                errors.append(f"{step_field}.auto_execute 必须是 true/false")
-            if "params" in step and not isinstance(step["params"], dict):
-                errors.append(f"{step_field}.params 必须是对象")
+            validate_playbook_step(step, f"{field}.steps[{step_index}]", errors)
+
+        rollback_steps = playbook.get("rollback_steps", [])
+        if rollback_steps:
+            if not isinstance(rollback_steps, list):
+                errors.append(f"{field}.rollback_steps 必须是数组")
+            else:
+                for step_index, step in enumerate(rollback_steps):
+                    validate_playbook_step(step, f"{field}.rollback_steps[{step_index}]", errors)
+
+
+def validate_playbook_step(step: object, field: str, errors: list[str]) -> None:
+    if not isinstance(step, dict):
+        errors.append(f"{field} 必须是对象")
+        return
+    action_type = str(step.get("action_type", "")).strip()
+    if not action_type:
+        errors.append(f"{field}.action_type 不能为空")
+    if "risk" in step and str(step["risk"]) not in {"low", "medium", "high"}:
+        errors.append(f"{field}.risk 必须是 low/medium/high")
+    if "auto_execute" in step and not isinstance(step["auto_execute"], bool):
+        errors.append(f"{field}.auto_execute 必须是 true/false")
+    if "params" in step and not isinstance(step["params"], dict):
+        errors.append(f"{field}.params 必须是对象")
+    if "stage" in step and str(step["stage"]) not in STAGES:
+        errors.append(f"{field}.stage 必须是 diagnose/remediate/verify/rollback")
+    if "on_failure" in step and str(step["on_failure"]) not in FAILURE_POLICIES:
+        errors.append(f"{field}.on_failure 必须是 continue/halt/escalate/rollback")
 
 
 if __name__ == "__main__":
