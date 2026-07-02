@@ -52,6 +52,25 @@ http://127.0.0.1:8765
 - 事件中心，可展开查看报警分析和诊断内容
 - 最近巡检记录
 
+## HTTP 备用诊断
+
+HTTP 监控支持 `fallback_urls`。主检查地址失败时，系统会自动访问同域名备用入口，区分“业务真的不可用”和“健康检查地址不存在但站点可访问”。
+
+示例：
+
+```json
+{
+  "name": "Website health",
+  "url": "https://example.com/healthz",
+  "expected_status": 200,
+  "fallback_urls": ["/login", "/"],
+  "fallback_expected_statuses": [200, 204, 301, 302, 401, 403],
+  "fallback_success_status": "warning"
+}
+```
+
+如果 `/healthz` 返回 404，但 `/login` 或 `/` 正常，结果会带上 `classification=primary_failed_fallback_reachable`，不会再简单判断为整站宕机。生产环境如果希望这种情况完全不触发故障事件，可以把 `fallback_success_status` 设为 `ok`；如果希望提醒你补健康检查接口，设为 `warning`。
+
 ## Docker 日志监控
 
 推荐按容器名配置 Docker 日志，不要写死 `/var/lib/docker/containers/...` 里的容器 ID 路径。容器重建后 ID 会变，容器名通常保持稳定。

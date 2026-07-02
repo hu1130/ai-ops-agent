@@ -555,6 +555,25 @@ def validate_config(config: AppConfig) -> list[str]:
     for index, check in enumerate(config.http_checks):
         validate_url(str(check.get("url", "")), f"http_checks[{index}].url", errors)
         validate_positive_int(check.get("timeout_seconds", 5), f"http_checks[{index}].timeout_seconds", errors)
+        validate_positive_int(check.get("expected_status", 200), f"http_checks[{index}].expected_status", errors)
+        validate_positive_int(check.get("max_latency_ms", 3000), f"http_checks[{index}].max_latency_ms", errors)
+        if "fallback_urls" in check:
+            validate_string_list(check["fallback_urls"], f"http_checks[{index}].fallback_urls", errors)
+            if isinstance(check["fallback_urls"], list):
+                for fallback_index, fallback_url in enumerate(check["fallback_urls"]):
+                    fallback_text = str(fallback_url or "").strip()
+                    if fallback_text.startswith(("http://", "https://")):
+                        validate_url(fallback_text, f"http_checks[{index}].fallback_urls[{fallback_index}]", errors)
+        if "fallback_expected_statuses" in check:
+            validate_status_code_list(
+                check["fallback_expected_statuses"],
+                f"http_checks[{index}].fallback_expected_statuses",
+                errors,
+            )
+        if "fallback_success_status" in check:
+            fallback_status = str(check["fallback_success_status"]).strip().lower()
+            if fallback_status not in {"ok", "warning", "critical"}:
+                errors.append(f"http_checks[{index}].fallback_success_status 必须是 ok/warning/critical")
 
     for index, check in enumerate(config.json_checks):
         validate_url(str(check.get("url", "")), f"json_checks[{index}].url", errors)
@@ -681,6 +700,23 @@ def validate_string_list(value: object, field: str, errors: list[str]) -> None:
         return
     if any(not str(item).strip() for item in value):
         errors.append(f"{field} 不能包含空值")
+
+
+def validate_status_code_list(value: object, field: str, errors: list[str]) -> None:
+    if not isinstance(value, list):
+        errors.append(f"{field} 必须是数组")
+        return
+    if not value:
+        errors.append(f"{field} 不能为空")
+        return
+    for index, item in enumerate(value):
+        try:
+            status_code = int(item)
+        except (TypeError, ValueError):
+            errors.append(f"{field}[{index}] 必须是数字")
+            continue
+        if status_code < 100 or status_code > 599:
+            errors.append(f"{field}[{index}] 必须在 100-599 之间")
 
 
 def validate_api_auth_config(app: dict, errors: list[str]) -> None:
