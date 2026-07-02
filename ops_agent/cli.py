@@ -557,6 +557,8 @@ def validate_config(config: AppConfig) -> list[str]:
         validate_positive_int(check.get("timeout_seconds", 5), f"http_checks[{index}].timeout_seconds", errors)
         validate_positive_int(check.get("expected_status", 200), f"http_checks[{index}].expected_status", errors)
         validate_positive_int(check.get("max_latency_ms", 3000), f"http_checks[{index}].max_latency_ms", errors)
+        if "fallback_enabled" in check and not isinstance(check["fallback_enabled"], bool):
+            errors.append(f"http_checks[{index}].fallback_enabled 必须是 true/false")
         if "fallback_urls" in check:
             validate_string_list(check["fallback_urls"], f"http_checks[{index}].fallback_urls", errors)
             if isinstance(check["fallback_urls"], list):

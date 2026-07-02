@@ -54,7 +54,7 @@ http://127.0.0.1:8765
 
 ## HTTP 备用诊断
 
-HTTP 监控支持 `fallback_urls`。主检查地址失败时，系统会自动访问同域名备用入口，区分“业务真的不可用”和“健康检查地址不存在但站点可访问”。
+HTTP 监控默认会做备用诊断。主检查地址失败时，系统会自动访问同域名备用入口，区分“业务真的不可用”和“健康检查地址不存在但站点可访问”。默认备用入口是 `/`、`/login`、`/signin`，也可以用 `fallback_urls` 为单个项目覆盖。
 
 示例：
 
@@ -69,7 +69,9 @@ HTTP 监控支持 `fallback_urls`。主检查地址失败时，系统会自动�
 }
 ```
 
-如果 `/healthz` 返回 404，但 `/login` 或 `/` 正常，结果会带上 `classification=primary_failed_fallback_reachable`，不会再简单判断为整站宕机。生产环境如果希望这种情况完全不触发故障事件，可以把 `fallback_success_status` 设为 `ok`；如果希望提醒你补健康检查接口，设为 `warning`。
+如果 `/healthz`、`/health`、`/api/status` 等主探针返回 404/405/401/403，但备用入口正常，结果会带上 `classification`，例如 `primary_route_missing_fallback_reachable` 或 `primary_auth_required_fallback_reachable`，不会再简单判断为整站宕机。生产环境如果希望这种情况完全不触发故障事件，可以把 `fallback_success_status` 设为 `ok`；如果希望提醒你补健康检查接口，设为 `warning`。
+
+注意：主探针返回 5xx 时不会因为首页能打开就降级。5xx 通常代表应用或依赖真的异常，仍然按 critical 处理。
 
 ## Docker 日志监控
 

@@ -54,8 +54,21 @@ class HttpMonitorTest(unittest.TestCase):
 
         self.assertEqual(result.status, "ok")
         self.assertIn("fallback reachable", result.summary)
-        self.assertEqual(result.details["classification"], "primary_failed_fallback_reachable")
+        self.assertEqual(result.details["classification"], "primary_route_missing_fallback_reachable")
         self.assertEqual(result.details["fallback"]["status_code"], 200)
+
+    def test_default_fallback_detects_missing_probe_route_without_per_check_config(self) -> None:
+        with LocalHttpServer({"/bad-health": (404, "not found"), "/": (200, "home ok")}) as server:
+            result = run_http_check(
+                {
+                    "name": "site health",
+                    "url": server.url("/bad-health"),
+                }
+            )
+
+        self.assertEqual(result.status, "warning")
+        self.assertEqual(result.details["classification"], "primary_route_missing_fallback_reachable")
+        self.assertEqual(result.details["fallback"]["url"], server.url("/"))
 
     def test_unexpected_primary_status_with_reachable_fallback_is_warning_by_default(self) -> None:
         with LocalHttpServer({"/health": (204, ""), "/login": (200, "login ok")}) as server:
@@ -69,8 +82,21 @@ class HttpMonitorTest(unittest.TestCase):
             )
 
         self.assertEqual(result.status, "warning")
-        self.assertIn("Primary HTTP 204, expected 200", result.summary)
+        self.assertIn("primary HTTP 204, expected 200", result.summary)
         self.assertEqual(result.details["fallback_success_status"], "warning")
+
+    def test_primary_auth_required_is_classified_as_reachable_config_issue(self) -> None:
+        with LocalHttpServer({"/private-health": (403, "forbidden"), "/": (200, "home ok")}) as server:
+            result = run_http_check(
+                {
+                    "name": "private health",
+                    "url": server.url("/private-health"),
+                    "expected_status": 200,
+                }
+            )
+
+        self.assertEqual(result.status, "warning")
+        self.assertEqual(result.details["classification"], "primary_auth_required_fallback_reachable")
 
     def test_primary_failure_stays_critical_when_fallback_is_not_reachable(self) -> None:
         with LocalHttpServer({"/healthz": (404, "not found"), "/login": (500, "server error")}) as server:
@@ -88,6 +114,32 @@ class HttpMonitorTest(unittest.TestCase):
         self.assertIn("HTTP 404", result.summary)
         self.assertEqual(result.details["fallback_attempts"][0]["status_code"], 500)
         self.assertFalse(result.details["fallback_attempts"][0]["reachable"])
+
+    def test_primary_server_error_stays_critical_even_if_homepage_is_reachable(self) -> None:
+        with LocalHttpServer({"/healthz": (500, "db failed"), "/": (200, "home ok")}) as server:
+            result = run_http_check(
+                {
+                    "name": "site health",
+                    "url": server.url("/healthz"),
+                }
+            )
+
+        self.assertEqual(result.status, "critical")
+        self.assertIn("HTTP 500", result.summary)
+        self.assertEqual(result.details["fallback_attempts"], [])
+
+    def test_fallback_can_be_disabled_for_strict_endpoint_checks(self) -> None:
+        with LocalHttpServer({"/healthz": (404, "not found"), "/": (200, "home ok")}) as server:
+            result = run_http_check(
+                {
+                    "name": "strict health",
+                    "url": server.url("/healthz"),
+                    "fallback_enabled": False,
+                }
+            )
+
+        self.assertEqual(result.status, "critical")
+        self.assertEqual(result.details["fallback_attempts"], [])
 
 
 if __name__ == "__main__":

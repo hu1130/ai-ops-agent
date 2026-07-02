@@ -20,6 +20,7 @@
       "timeout_seconds": 5,
       "expected_status": 200,
       "max_latency_ms": 3000,
+      "fallback_enabled": true,
       "fallback_urls": ["/login", "/"],
       "fallback_expected_statuses": [200, 204, 301, 302, 401, 403],
       "fallback_success_status": "warning"

@@ -3,12 +3,14 @@ from __future__ import annotations
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from typing import Any
 
 from ops_agent.events import CheckResult
 
+DEFAULT_FALLBACK_URLS = ["/", "/login", "/signin"]
 REACHABLE_STATUS_CODES = {200, 201, 202, 204, 301, 302, 303, 307, 308, 401, 403}
+FALLBACK_DIAGNOSABLE_STATUS_CODES = {400, 401, 403, 404, 405, 410}
 
 
 def run_http_checks(checks: list[dict[str, Any]]) -> list[CheckResult]:
@@ -34,7 +36,7 @@ def run_http_check(check: dict[str, Any]) -> CheckResult:
             status_code = int(response.status)
     except urllib.error.HTTPError as exc:
         latency_ms = int((time.perf_counter() - start) * 1000)
-        attempts = fallback_attempts(check, url, timeout)
+        attempts = fallback_attempts(check, url, timeout) if should_try_fallback(exc.code, expected_status) else []
         fallback = first_reachable(attempts)
         if fallback:
             return fallback_reachable_result(name, url, exc.code, latency_ms, fallback, check)
@@ -63,7 +65,7 @@ def run_http_check(check: dict[str, Any]) -> CheckResult:
 
     latency_ms = int((time.perf_counter() - start) * 1000)
     if status_code != expected_status:
-        attempts = fallback_attempts(check, url, timeout)
+        attempts = fallback_attempts(check, url, timeout) if should_try_fallback(status_code, expected_status) else []
         fallback = first_reachable(attempts)
         if fallback:
             return fallback_reachable_result(name, url, status_code, latency_ms, fallback, check, expected_status)
@@ -115,16 +117,31 @@ def fallback_attempts(check: dict[str, Any], primary_url: str, timeout: float) -
 
 
 def fallback_urls(check: dict[str, Any], primary_url: str) -> list[str]:
-    values = check.get("fallback_urls", [])
-    if not isinstance(values, list):
+    if check.get("fallback_enabled", True) is False:
         return []
+    values = check.get("fallback_urls", DEFAULT_FALLBACK_URLS)
+    if not isinstance(values, list) or not values:
+        values = DEFAULT_FALLBACK_URLS
     urls: list[str] = []
+    seen: set[str] = set()
+    primary_key = comparable_url(primary_url)
     for value in values:
         text = str(value or "").strip()
         if not text:
             continue
-        urls.append(urljoin(primary_url, text))
+        url = urljoin(primary_url, text)
+        key = comparable_url(url)
+        if key == primary_key or key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
     return urls
+
+
+def comparable_url(url: str) -> str:
+    parsed = urlsplit(url)
+    path = parsed.path.rstrip("/") or "/"
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.query, ""))
 
 
 def fallback_expected_statuses(check: dict[str, Any]) -> set[int]:
@@ -187,8 +204,9 @@ def fallback_reachable_result(
 ) -> CheckResult:
     status = fallback_success_status(check)
     expected_text = f", expected {expected_status}" if expected_status is not None else ""
+    classification = fallback_classification(primary_status_code, expected_status)
     summary = (
-        f"Primary HTTP {primary_status_code}{expected_text}; "
+        f"{classification}: primary HTTP {primary_status_code}{expected_text}; "
         f"fallback reachable: {fallback['url']} HTTP {fallback.get('status_code')}"
     )
     return CheckResult(
@@ -200,11 +218,31 @@ def fallback_reachable_result(
             "url": primary_url,
             "status_code": primary_status_code,
             "latency_ms": primary_latency_ms,
-            "classification": "primary_failed_fallback_reachable",
+            "classification": classification,
             "fallback": fallback,
             "fallback_success_status": status,
         },
     )
+
+
+def should_try_fallback(status_code: int, expected_status: int) -> bool:
+    if status_code >= 500:
+        return False
+    if status_code in FALLBACK_DIAGNOSABLE_STATUS_CODES:
+        return True
+    return status_code != expected_status
+
+
+def fallback_classification(primary_status_code: int, expected_status: int | None = None) -> str:
+    if primary_status_code in {404, 410}:
+        return "primary_route_missing_fallback_reachable"
+    if primary_status_code in {401, 403}:
+        return "primary_auth_required_fallback_reachable"
+    if primary_status_code == 405:
+        return "primary_method_not_allowed_fallback_reachable"
+    if expected_status is not None and primary_status_code != expected_status:
+        return "primary_status_mismatch_fallback_reachable"
+    return "primary_failed_fallback_reachable"
 
 
 def fallback_success_status(check: dict[str, Any]) -> str:
