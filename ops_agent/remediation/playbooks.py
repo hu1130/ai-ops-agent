@@ -4,6 +4,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
+from ops_agent.ai.classifier import classify_signal
 from ops_agent.events import CheckResult
 from ops_agent.remediation.actions import RemediationAction
 
@@ -38,9 +39,12 @@ def remediation_playbooks(remediation: dict[str, Any]) -> list[dict[str, Any]]:
 def playbook_matches(result: CheckResult, match: dict[str, Any]) -> bool:
     if not match:
         return True
+    classification = classify_signal(result)
     if not exact_list_matches(result.source, match.get("sources")):
         return False
     if not exact_list_matches(result.status, match.get("statuses")):
+        return False
+    if not exact_list_matches(classification.category, match.get("categories")):
         return False
     if not contains_any(result.name, match.get("name_contains")):
         return False
@@ -192,10 +196,15 @@ def normalize_choice(value: str, allowed: set[str], default: str) -> str:
 def template_context(result: CheckResult) -> dict[str, Any]:
     url = str(result.details.get("url", ""))
     host, port = host_port_from_url(url)
+    classification = classify_signal(result)
     context: dict[str, Any] = {
         "source": result.source,
         "name": result.name,
         "status": result.status,
+        "category": classification.category,
+        "classification": classification.category,
+        "classification_confidence": f"{classification.confidence:.2f}",
+        "classification_summary": classification.summary,
         "summary": result.summary,
         "url": url,
         "host": host,

@@ -97,7 +97,8 @@
         "on_failure": "halt",
         "match": {
           "sources": ["http", "json_api"],
-          "statuses": ["warning", "critical"]
+          "statuses": ["warning", "critical"],
+          "categories": ["service_unavailable", "dependency_failure", "performance_degraded", "synthetic_quality_fail"]
         },
         "steps": [
           {
@@ -123,6 +124,27 @@
             "reason": "{{source}}/{{name}} 异常时，确认容器是否仍在运行。",
             "params": {
               "command": "docker ps --format table {{.Names}}\\t{{.Status}}\\t{{.Ports}}"
+            }
+          }
+        ]
+      },
+      {
+        "name": "probe config triage",
+        "enabled": true,
+        "on_failure": "continue",
+        "match": {
+          "categories": ["probe_config_issue"]
+        },
+        "steps": [
+          {
+            "id": "verify_probe_url",
+            "stage": "diagnose",
+            "on_failure": "continue",
+            "action_type": "run_diagnostic_command",
+            "title": "验证监控探针 {{url}}",
+            "reason": "{{source}}/{{name}} 分类为 {{category}}，先确认探针地址、状态码、鉴权和请求方法。",
+            "params": {
+              "command": "curl -I -L --max-time 10 {{url}}"
             }
           }
         ]
@@ -199,7 +221,7 @@
         "name": "read-only diagnostics",
         "action_type": "run_diagnostic_command",
         "enabled": true,
-        "targets": ["df", "free", "ps", "docker", "journalctl", "tail", "systemctl", "pgrep"],
+        "targets": ["df", "free", "ps", "docker", "journalctl", "tail", "systemctl", "pgrep", "curl"],
         "auto_execute": false,
         "requires_approval": false
       },

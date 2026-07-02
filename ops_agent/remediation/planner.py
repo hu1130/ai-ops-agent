@@ -3,6 +3,7 @@ from __future__ import annotations
 import shlex
 from urllib.parse import urlparse
 
+from ops_agent.ai.classifier import classify_signal
 from ops_agent.config import AppConfig
 from ops_agent.events import CheckResult
 from ops_agent.remediation.actions import RemediationAction
@@ -33,9 +34,26 @@ def build_remediation_plan(results: list[CheckResult], config: AppConfig) -> lis
 
 def plan_for_result(result: CheckResult, configured_actions: dict[str, bool]) -> list[RemediationAction]:
     actions: list[RemediationAction] = []
+    category = classify_signal(result).category
 
     if result.source in {"http", "json_api"}:
         url = str(result.details.get("url", ""))
+        if category == "probe_config_issue":
+            if url:
+                actions.append(
+                    RemediationAction(
+                        action_type="run_diagnostic_command",
+                        title="验证监控探针地址",
+                        reason=(
+                            f"{result.source}/{result.name} 被分类为探针或配置问题，"
+                            "先复测主探针地址和响应头，而不是直接按业务宕机处理。"
+                        ),
+                        params={"command": f"curl -I -L --max-time 10 {shlex.quote(url)}"},
+                        auto_execute=configured_actions.get("run_diagnostic_command", False),
+                    )
+                )
+            return actions
+
         host, port = host_port_from_url(url)
         if host and port:
             actions.append(

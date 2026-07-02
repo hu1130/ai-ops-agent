@@ -157,6 +157,86 @@ class RemediationTest(unittest.TestCase):
         issue = CheckResult(source="manual", name="Manual issue", status="warning", summary="test")
         self.assertEqual([], build_remediation_plan([issue], config))
 
+    def test_playbook_can_match_generic_incident_category(self) -> None:
+        config = AppConfig(
+            raw={
+                "remediation": {
+                    "playbooks": [
+                        {
+                            "name": "probe config triage",
+                            "match": {"categories": ["probe_config_issue"]},
+                            "steps": [
+                                {
+                                    "action_type": "run_diagnostic_command",
+                                    "title": "Category {{category}} {{url}}",
+                                    "reason": "{{classification_summary}}",
+                                    "params": {"command": "curl -I {{url}}"},
+                                }
+                            ],
+                        }
+                    ],
+                    "policies": [
+                        {
+                            "action_type": "run_diagnostic_command",
+                            "targets": ["curl"],
+                            "enabled": True,
+                        }
+                    ],
+                }
+            },
+            base_dir=Path("."),
+        )
+        issue = CheckResult(
+            source="http",
+            name="Health",
+            status="warning",
+            summary="primary_route_missing_fallback_reachable: primary HTTP 404",
+            details={
+                "url": "https://agent.example.com/healthz",
+                "status_code": 404,
+                "classification": "primary_route_missing_fallback_reachable",
+                "fallback": {"url": "https://agent.example.com/", "status_code": 200},
+            },
+        )
+
+        actions = build_remediation_plan([issue], config)
+
+        category_actions = [action for action in actions if "Category probe_config_issue" in action.title]
+        self.assertEqual(1, len(category_actions))
+        self.assertEqual("run_diagnostic_command", category_actions[0].action_type)
+        self.assertEqual("curl -I https://agent.example.com/healthz", category_actions[0].params["command"])
+
+    def test_probe_config_issue_default_plan_skips_port_check(self) -> None:
+        config = AppConfig(
+            raw={
+                "remediation": {
+                    "enabled": True,
+                    "policies": [
+                        {"action_type": "run_diagnostic_command", "targets": ["curl"], "enabled": True},
+                        {"action_type": "check_port", "targets": ["*"], "enabled": True},
+                    ],
+                }
+            },
+            base_dir=Path("."),
+        )
+        issue = CheckResult(
+            source="http",
+            name="Health",
+            status="warning",
+            summary="primary_route_missing_fallback_reachable: primary HTTP 404",
+            details={
+                "url": "https://agent.example.com/healthz",
+                "status_code": 404,
+                "classification": "primary_route_missing_fallback_reachable",
+                "fallback": {"url": "https://agent.example.com/", "status_code": 200},
+            },
+        )
+
+        actions = build_remediation_plan([issue], config)
+
+        self.assertFalse(any(action.action_type == "check_port" for action in actions))
+        self.assertTrue(any(action.params.get("command") == "curl -I -L --max-time 10 https://agent.example.com/healthz" for action in actions))
+
     def test_policy_denies_unlisted_target(self) -> None:
         config = AppConfig(
             raw={

@@ -825,7 +825,15 @@ def validate_remediation_playbooks(remediation: dict, errors: list[str]) -> None
         if match and not isinstance(match, dict):
             errors.append(f"{field}.match 必须是对象")
         elif isinstance(match, dict):
-            for key in ("sources", "statuses", "name_contains", "summary_contains", "url_contains", "path_contains"):
+            for key in (
+                "sources",
+                "statuses",
+                "categories",
+                "name_contains",
+                "summary_contains",
+                "url_contains",
+                "path_contains",
+            ):
                 if key in match:
                     validate_string_list(match[key], f"{field}.match.{key}", errors)
 

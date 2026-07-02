@@ -169,6 +169,27 @@ unknown                 未知异常
 - 资源压力和业务探针异常同时出现：优先怀疑资源或依赖引发故障
 - AI/业务合成测试返回异常结构、兜底话术或空字段：归为 `synthetic_quality_fail`
 
+Playbook 可以用 `match.categories` 绑定分类结果：
+
+```json
+{
+  "name": "probe config triage",
+  "match": {
+    "categories": ["probe_config_issue"]
+  },
+  "steps": [
+    {
+      "action_type": "run_diagnostic_command",
+      "title": "验证监控探针 {{url}}",
+      "reason": "{{source}}/{{name}} 分类为 {{category}}，先确认探针配置。",
+      "params": {
+        "command": "curl -I -L --max-time 10 {{url}}"
+      }
+    }
+  ]
+}
+```
+
 ## 自动处置后端
 
 当前已支持自动处置引擎的安全骨架：
