@@ -9,7 +9,11 @@ from urllib.parse import parse_qs, urlsplit
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.auth import AuthResult, authenticate_token, configured_api_tokens, has_role
 from ops_agent.config import AppConfig
-from ops_agent.ai.config_patches import apply_config_patch, build_config_patch_from_recommendation
+from ops_agent.ai.config_patches import (
+    apply_config_patch,
+    build_config_patch_from_recommendation,
+    preview_config_patch,
+)
 from ops_agent.ai.learning_review import build_learning_optimization_draft
 from ops_agent.remediation.approval import approve_action_log, reject_action_log
 from ops_agent.remediation.recommendations import (
@@ -455,6 +459,18 @@ def start_dashboard(
                     self.record_audit(path, 200, "success", "learning config patch rejected", actor=actor, auth=auth)
                     self.send_json(updated)
                     return
+                if action == "validate":
+                    if config is None or config.config_path is None:
+                        self.record_audit(path, 503, "error", "config path is not configured", actor=actor, auth=auth)
+                        self.send_json({"error": "config path is not configured"}, status=503)
+                        return
+                    preview = public_config_patch_preview(
+                        preview_config_patch(config.config_path, current.get("patch") or {})
+                    )
+                    outcome = "success" if preview["valid"] else "error"
+                    self.record_audit(path, 200, outcome, "learning config patch validated", actor=actor, auth=auth)
+                    self.send_json({"config_patch": current, "validation": preview})
+                    return
                 if action == "apply":
                     if str(current.get("status") or "") != "approved":
                         raise ValueError(f"learning config patch cannot be applied from {current.get('status')}")
@@ -464,6 +480,7 @@ def start_dashboard(
                         return
                     apply_result = apply_config_patch(config.config_path, current.get("patch") or {})
                     next_config = apply_result.pop("config", None)
+                    apply_result.pop("current", None)
                     if isinstance(next_config, dict):
                         config.raw.clear()
                         config.raw.update(next_config)
@@ -1121,3 +1138,12 @@ def safe(value: object) -> str:
 
 def safe_body_dict(value: object) -> dict:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def public_config_patch_preview(preview: dict) -> dict:
+    return {
+        "valid": bool(preview.get("valid")),
+        "errors": list(preview.get("errors") or []),
+        "operation_count": int(preview.get("operation_count") or 0),
+        "operations": list(preview.get("operations") or []),
+    }

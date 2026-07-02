@@ -2,7 +2,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ops_agent.ai.config_patches import apply_config_patch, build_config_patch_from_recommendation
+from ops_agent.ai.config_patches import (
+    apply_config_patch,
+    build_config_patch_from_recommendation,
+    preview_config_patch,
+)
 from ops_agent.ai.learning import build_learning_recommendations
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig
@@ -148,8 +152,40 @@ class LearningOptimizationTest(unittest.TestCase):
 
         self.assertEqual("classification_rule", patch["patch_type"])
         self.assertEqual(1, result["operation_count"])
+        self.assertEqual({"valid": True, "errors": []}, result["validation"])
         self.assertIn("classification_rules", updated_text)
         self.assertIn("learned-classifier", updated_text)
+
+    def test_config_patch_preview_blocks_invalid_config_before_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            original = '{"app":{"interval_seconds":60}}\n'
+            config_path.write_text(original, encoding="utf-8")
+            patch = {
+                "patch_type": "classification_rule",
+                "title": "Bad rule",
+                "reason": "test",
+                "operations": [
+                    {
+                        "op": "append_unique",
+                        "path": ["classification_rules"],
+                        "identity_key": "name",
+                        "value": {
+                            "name": "bad-rule",
+                            "category": "",
+                            "confidence": 2,
+                        },
+                    }
+                ],
+            }
+            preview = preview_config_patch(config_path, patch)
+            with self.assertRaises(ValueError):
+                apply_config_patch(config_path, patch)
+            current_text = config_path.read_text(encoding="utf-8")
+
+        self.assertFalse(preview["valid"])
+        self.assertTrue(any("classification_rules[0].category" in error for error in preview["errors"]))
+        self.assertEqual(original, current_text)
 
     def test_storage_tracks_learning_config_patch_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

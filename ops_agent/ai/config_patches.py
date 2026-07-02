@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ops_agent.ai.learning_review import build_learning_optimization_draft
+from ops_agent.config import AppConfig
 
 
 SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
@@ -137,6 +138,31 @@ def apply_config_patch(config_path: Path, patch: dict) -> dict:
     if not config_path:
         raise ValueError("config path is not configured")
     config_path = config_path.resolve()
+    preview = preview_config_patch(config_path, patch)
+    if not preview["valid"]:
+        raise ValueError("config patch validation failed: " + "; ".join(preview["errors"]))
+    current = preview["current"]
+    updated = preview["config"]
+    applied_operations = preview["operations"]
+
+    backup_path = config_path.with_name(f"{config_path.name}.bak-{timestamp()}")
+    backup_path.write_text(json.dumps(current, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp_path = config_path.with_name(f"{config_path.name}.tmp-{timestamp()}")
+    temp_path.write_text(json.dumps(updated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp_path.replace(config_path)
+    return {
+        "backup_path": str(backup_path),
+        "operation_count": len(applied_operations),
+        "operations": applied_operations,
+        "validation": {"valid": True, "errors": []},
+        "config": updated,
+    }
+
+
+def preview_config_patch(config_path: Path, patch: dict) -> dict:
+    if not config_path:
+        raise ValueError("config path is not configured")
+    config_path = config_path.resolve()
     current = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(current, dict):
         raise ValueError("config file must contain a JSON object")
@@ -153,17 +179,21 @@ def apply_config_patch(config_path: Path, patch: dict) -> dict:
     if not applied_operations:
         raise ValueError("config patch did not contain a supported operation")
 
-    backup_path = config_path.with_name(f"{config_path.name}.bak-{timestamp()}")
-    backup_path.write_text(json.dumps(current, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temp_path = config_path.with_name(f"{config_path.name}.tmp-{timestamp()}")
-    temp_path.write_text(json.dumps(updated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temp_path.replace(config_path)
+    errors = validate_updated_config(updated, config_path)
     return {
-        "backup_path": str(backup_path),
+        "valid": not errors,
+        "errors": errors,
         "operation_count": len(applied_operations),
         "operations": applied_operations,
+        "current": current,
         "config": updated,
     }
+
+
+def validate_updated_config(raw: dict, config_path: Path) -> list[str]:
+    from ops_agent.cli import validate_config
+
+    return validate_config(AppConfig(raw=raw, base_dir=config_path.parent, config_path=config_path))
 
 
 def apply_operation(config: dict, operation: dict) -> dict:

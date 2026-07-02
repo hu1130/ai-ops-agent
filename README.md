@@ -224,6 +224,7 @@ POST /api/learning/recommendations/1/apply
 POST /api/learning/recommendations/1/propose-config
 GET /api/learning/config-patches
 GET /api/learning/config-patches/1
+POST /api/learning/config-patches/1/validate
 POST /api/learning/config-patches/1/approve
 POST /api/learning/config-patches/1/reject
 POST /api/learning/config-patches/1/apply
@@ -234,7 +235,8 @@ Learning recommendation review flow:
 - `dismiss` closes a noisy or expected suggestion without applying changes.
 - `apply` marks the suggestion as applied after the rule/playbook change has been made and reviewed.
 - `propose-config` converts an accepted draft into a reviewable JSON config patch.
-- Config patches must be approved before `apply` writes to `config.json`. Applying a patch creates a timestamped backup and records the result in `learning_config_patches`.
+- `validate` previews the patch and runs full config validation without writing the file.
+- Config patches must be approved before `apply` writes to `config.json`. `apply` also runs the same validation again, creates a timestamped backup, and records the result in `learning_config_patches`.
 
 The system does not silently rewrite production code from learning suggestions. It stores a reviewable draft first, records actor/time/note, and writes each POST operation into `api_audit_logs`.
 
@@ -519,6 +521,7 @@ POST /api/learning/recommendations/1/apply
 POST /api/learning/recommendations/1/propose-config
 GET  /api/learning/config-patches
 GET  /api/learning/config-patches/1
+POST /api/learning/config-patches/1/validate
 POST /api/learning/config-patches/1/approve
 POST /api/learning/config-patches/1/reject
 POST /api/learning/config-patches/1/apply

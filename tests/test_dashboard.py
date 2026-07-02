@@ -257,6 +257,14 @@ class DashboardTest(unittest.TestCase):
                 ) as response:
                     proposed_rows = json.loads(response.read().decode("utf-8"))
                 request = urllib.request.Request(
+                    f"http://{host}:{port}/api/learning/config-patches/{patch_id}/validate",
+                    data=b'{"actor":"tester","note":"preflight"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    validated = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
                     f"http://{host}:{port}/api/learning/config-patches/{patch_id}/approve",
                     data=b'{"actor":"tester","note":"reviewed"}',
                     method="POST",
@@ -281,6 +289,8 @@ class DashboardTest(unittest.TestCase):
                 storage.close()
 
         self.assertEqual([patch_id], [row["id"] for row in proposed_rows])
+        self.assertTrue(validated["validation"]["valid"])
+        self.assertNotIn("config", validated["validation"])
         self.assertEqual("approved", approved["status"])
         self.assertEqual("applied", applied["status"])
         self.assertEqual("applied", current_recommendation["status"])
