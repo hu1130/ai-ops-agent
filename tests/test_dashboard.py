@@ -66,6 +66,46 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(1, body["by_status"]["open"])
         self.assertEqual(1, body["by_severity"]["critical"])
 
+    def test_learning_recommendations_api_returns_saved_suggestions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            storage.save_learning_recommendations(
+                [
+                    {
+                        "dedupe_key": "unknown:prod:normal",
+                        "priority": "high",
+                        "category": "unknown",
+                        "trigger_type": "unknown_classification",
+                        "title": "Review unknown signals",
+                        "reason": "unknown incidents exist",
+                        "recommended_action": "add classifier rules",
+                        "evidence": ["incident #1"],
+                        "incident_ids": [1],
+                        "metrics": {"incident_count": 1},
+                    }
+                ]
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/learning/recommendations?priority=high",
+                    timeout=5,
+                ) as response:
+                    rows = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(f"http://{host}:{port}/api/learning/summary", timeout=5) as response:
+                    summary = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("unknown_classification", rows[0]["trigger_type"])
+        self.assertEqual(["incident #1"], rows[0]["evidence"])
+        self.assertEqual(1, summary["open_count"])
+        self.assertEqual(1, summary["by_priority"]["high"])
+
     def test_render_page_contains_event_center_and_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

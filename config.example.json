@@ -55,6 +55,19 @@
     "enabled": true,
     "max_log_chars": 4000
   },
+  "learning": {
+    "enabled": true,
+    "interval_seconds": 21600,
+    "lookback_hours": 72,
+    "max_incidents": 1000,
+    "confidence_threshold": 0.65,
+    "frequent_occurrence_threshold": 10,
+    "frequent_open_category_threshold": 3,
+    "min_unknown_count": 1,
+    "min_low_confidence_count": 1,
+    "notify": false,
+    "notification_title": "Ops Agent learning optimization suggestions"
+  },
   "retention": {
     "enabled": true,
     "check_results_days": 30,

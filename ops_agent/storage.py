@@ -156,8 +156,30 @@ class Storage:
                     metadata_json text not null
                 );
 
+                create table if not exists learning_recommendations (
+                    id integer primary key autoincrement,
+                    created_at text not null,
+                    updated_at text,
+                    last_seen_at text,
+                    status text not null default 'open',
+                    priority text not null default 'medium',
+                    category text not null default '',
+                    trigger_type text not null default '',
+                    dedupe_key text not null default '',
+                    title text not null,
+                    reason text not null,
+                    recommended_action text not null,
+                    evidence_json text not null default '[]',
+                    incident_ids_json text not null default '[]',
+                    metrics_json text not null default '{}',
+                    source text not null default 'classification_learning',
+                    seen_count integer not null default 1
+                );
+
                 create index if not exists idx_incident_recommendations_incident
                     on incident_recommendations (incident_id, position, id);
+                create unique index if not exists idx_learning_recommendations_dedupe
+                    on learning_recommendations (dedupe_key);
                 """
             )
             self.ensure_context_columns()
@@ -797,6 +819,163 @@ class Storage:
                 (*params, limit),
             ).fetchall()
         return [recommendation_payload(row) for row in rows]
+
+    def save_learning_recommendations(self, recommendations: list[dict]) -> list[dict]:
+        if not recommendations:
+            return []
+        now = utc_now_iso()
+        saved: list[dict] = []
+        terminal_statuses = {"applied", "dismissed"}
+        with self.lock:
+            for item in recommendations:
+                payload = normalize_learning_recommendation(item)
+                if not payload["dedupe_key"]:
+                    continue
+                existing = self.connection.execute(
+                    "select * from learning_recommendations where dedupe_key = ?",
+                    (payload["dedupe_key"],),
+                ).fetchone()
+                if existing:
+                    status = str(existing["status"] or "open")
+                    next_status = status if status in terminal_statuses else "open"
+                    seen_count = int(existing["seen_count"] or 1) + 1
+                    self.connection.execute(
+                        """
+                        update learning_recommendations
+                        set updated_at = ?,
+                            last_seen_at = ?,
+                            status = ?,
+                            priority = ?,
+                            category = ?,
+                            trigger_type = ?,
+                            title = ?,
+                            reason = ?,
+                            recommended_action = ?,
+                            evidence_json = ?,
+                            incident_ids_json = ?,
+                            metrics_json = ?,
+                            source = ?,
+                            seen_count = ?
+                        where id = ?
+                        """,
+                        (
+                            now,
+                            now,
+                            next_status,
+                            payload["priority"],
+                            payload["category"],
+                            payload["trigger_type"],
+                            payload["title"],
+                            payload["reason"],
+                            payload["recommended_action"],
+                            json.dumps(payload["evidence"], ensure_ascii=False),
+                            json.dumps(payload["incident_ids"], ensure_ascii=False),
+                            json.dumps(payload["metrics"], ensure_ascii=False),
+                            payload["source"],
+                            seen_count,
+                            existing["id"],
+                        ),
+                    )
+                    row_id = int(existing["id"])
+                else:
+                    cursor = self.connection.execute(
+                        """
+                        insert into learning_recommendations (
+                            created_at, updated_at, last_seen_at, status, priority, category,
+                            trigger_type, dedupe_key, title, reason, recommended_action,
+                            evidence_json, incident_ids_json, metrics_json, source, seen_count
+                        )
+                        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            now,
+                            now,
+                            now,
+                            "open",
+                            payload["priority"],
+                            payload["category"],
+                            payload["trigger_type"],
+                            payload["dedupe_key"],
+                            payload["title"],
+                            payload["reason"],
+                            payload["recommended_action"],
+                            json.dumps(payload["evidence"], ensure_ascii=False),
+                            json.dumps(payload["incident_ids"], ensure_ascii=False),
+                            json.dumps(payload["metrics"], ensure_ascii=False),
+                            payload["source"],
+                            1,
+                        ),
+                    )
+                    row_id = int(cursor.lastrowid)
+                row = self.connection.execute(
+                    "select * from learning_recommendations where id = ?",
+                    (row_id,),
+                ).fetchone()
+                saved.append(learning_recommendation_payload(row))
+            self.connection.commit()
+        return saved
+
+    def latest_learning_recommendations(
+        self,
+        limit: int = 50,
+        statuses: Sequence[str] | None = None,
+        category: str = "",
+        priority: str = "",
+        trigger_type: str = "",
+    ) -> list[dict]:
+        with self.lock:
+            where: list[str] = []
+            params: list[object] = []
+            cleaned_statuses = [status for status in (statuses or []) if status]
+            if cleaned_statuses:
+                where.append(f"status in ({','.join('?' for _ in cleaned_statuses)})")
+                params.extend(cleaned_statuses)
+            for column, value in (
+                ("category", category),
+                ("priority", priority),
+                ("trigger_type", trigger_type),
+            ):
+                if value:
+                    where.append(f"{column} = ?")
+                    params.append(value)
+            where_sql = f"where {' and '.join(where)}" if where else ""
+            rows = self.connection.execute(
+                f"""
+                select * from learning_recommendations
+                {where_sql}
+                order by
+                    case priority when 'high' then 0 when 'medium' then 1 when 'low' then 2 else 3 end,
+                    last_seen_at desc,
+                    id desc
+                limit ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [learning_recommendation_payload(row) for row in rows]
+
+    def learning_summary(self, limit: int = 500) -> dict:
+        rows = self.latest_learning_recommendations(limit=limit)
+        by_status: dict[str, int] = {}
+        by_priority: dict[str, int] = {}
+        by_trigger_type: dict[str, int] = {}
+        open_count = 0
+        for row in rows:
+            status = str(row.get("status") or "open")
+            priority = str(row.get("priority") or "medium")
+            trigger_type = str(row.get("trigger_type") or "")
+            by_status[status] = by_status.get(status, 0) + 1
+            by_priority[priority] = by_priority.get(priority, 0) + 1
+            by_trigger_type[trigger_type] = by_trigger_type.get(trigger_type, 0) + 1
+            if status == "open":
+                open_count += 1
+        return {
+            "total": len(rows),
+            "open_count": open_count,
+            "by_status": by_status,
+            "by_priority": by_priority,
+            "by_trigger_type": by_trigger_type,
+            "latest": rows[:20],
+        }
 
     def get_incident_recommendation(self, recommendation_id: int) -> dict | None:
         with self.lock:
@@ -1646,12 +1825,32 @@ def recommendation_payload(row: sqlite3.Row) -> dict:
     return payload
 
 
+def learning_recommendation_payload(row: sqlite3.Row) -> dict:
+    payload = dict(row)
+    payload["evidence"] = parse_json_list(str(payload.get("evidence_json") or "[]"))
+    payload["incident_ids"] = [
+        safe_int(value)
+        for value in parse_json_list(str(payload.get("incident_ids_json") or "[]"))
+        if safe_int(value) > 0
+    ]
+    payload["metrics"] = parse_json_object(str(payload.get("metrics_json") or "{}"))
+    return payload
+
+
 def parse_json_object(value: str) -> dict:
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def parse_json_list(value: str) -> list:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 def normalize_classification(value: dict | None) -> dict:
@@ -1662,6 +1861,23 @@ def normalize_classification(value: dict | None) -> dict:
         "summary": str(payload.get("summary") or ""),
         "evidence": safe_list(payload.get("evidence")),
         "next_steps": safe_list(payload.get("next_steps")),
+    }
+
+
+def normalize_learning_recommendation(value: dict | None) -> dict:
+    payload = safe_dict(value)
+    return {
+        "dedupe_key": str(payload.get("dedupe_key") or ""),
+        "priority": str(payload.get("priority") or "medium"),
+        "category": str(payload.get("category") or ""),
+        "trigger_type": str(payload.get("trigger_type") or ""),
+        "title": str(payload.get("title") or ""),
+        "reason": str(payload.get("reason") or ""),
+        "recommended_action": str(payload.get("recommended_action") or ""),
+        "evidence": safe_list(payload.get("evidence")),
+        "incident_ids": [safe_int(value) for value in safe_list(payload.get("incident_ids")) if safe_int(value) > 0],
+        "metrics": safe_dict(payload.get("metrics")),
+        "source": str(payload.get("source") or "classification_learning"),
     }
 
 

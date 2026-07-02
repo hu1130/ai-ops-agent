@@ -90,6 +90,9 @@ class StorageContextTest(unittest.TestCase):
             audit_logs_exists = storage.connection.execute(
                 "select name from sqlite_master where type = 'table' and name = 'api_audit_logs'"
             ).fetchone()
+            learning_recommendations_exists = storage.connection.execute(
+                "select name from sqlite_master where type = 'table' and name = 'learning_recommendations'"
+            ).fetchone()
             storage.close()
 
         self.assertEqual("prod", rows[0]["environment"])
@@ -101,6 +104,7 @@ class StorageContextTest(unittest.TestCase):
         self.assertEqual("resolved", recovered_incident["status"])
         self.assertIsNotNone(incident_events_exists)
         self.assertIsNotNone(audit_logs_exists)
+        self.assertIsNotNone(learning_recommendations_exists)
 
 
 if __name__ == "__main__":

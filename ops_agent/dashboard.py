@@ -45,6 +45,12 @@ def start_dashboard(
             if path == "/api/classifications/summary":
                 self.send_json(storage.classification_summary(query_hours(query)))
                 return
+            if path == "/api/learning/recommendations":
+                self.send_json(storage.latest_learning_recommendations(**learning_filters_from_query(query)))
+                return
+            if path == "/api/learning/summary":
+                self.send_json(storage.learning_summary(query_limit(query, default=500, maximum=1000)))
+                return
             if path == "/api/results":
                 self.send_json(storage.latest_results())
                 return
@@ -429,6 +435,16 @@ def recommendation_filters_from_query(query: dict[str, list[str]]) -> dict:
         "risk": query_text(query, "risk"),
         "action_type": query_text(query, "action_type"),
         "source": query_text(query, "source"),
+    }
+
+
+def learning_filters_from_query(query: dict[str, list[str]]) -> dict:
+    return {
+        "limit": query_limit(query, default=50, maximum=200),
+        "statuses": query_statuses(query),
+        "category": query_text(query, "category"),
+        "priority": query_text(query, "priority"),
+        "trigger_type": query_text(query, "trigger_type"),
     }
 
 
@@ -820,6 +836,8 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/incidents": ("incident.list", "incident", None),
         "/api/incidents/escalated": ("incident.escalated", "incident", None),
         "/api/classifications/summary": ("classification.summary", "classification", None),
+        "/api/learning/recommendations": ("learning.recommendation.list", "learning", None),
+        "/api/learning/summary": ("learning.summary", "learning", None),
         "/api/recommendations": ("recommendation.list", "recommendation", None),
         "/api/recommendations/actionable": ("recommendation.actionable", "recommendation", None),
         "/api/recommendations/pending": ("recommendation.pending", "recommendation", None),

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ops_agent.ai.classifier import IncidentClassification, classify_incident
 from ops_agent.ai.analyzer import analyze_incident
+from ops_agent.ai.learning import build_learning_recommendations, format_learning_recommendations
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
@@ -48,6 +49,7 @@ class OpsScheduler:
         self._issues: dict[str, IssueState] = {}
         self._last_daily_report_date: str = ""
         self._last_retention_cleanup_date: str = ""
+        self._last_learning_optimization_at: float = 0.0
 
     def run_once(self, respect_intervals: bool = False) -> list[CheckResult]:
         cycle_started_at = time.time()
@@ -490,6 +492,33 @@ class OpsScheduler:
         print(format_retention_result(result))
         self._last_retention_cleanup_date = today
 
+    def run_learning_optimization_if_due(self, force: bool = False) -> list[dict]:
+        learning = dict(self.config.raw.get("learning", {}))
+        if not learning.get("enabled", True):
+            return []
+
+        now = time.time()
+        interval_seconds = int(learning.get("interval_seconds", 6 * 60 * 60))
+        if not force and self._last_learning_optimization_at and now - self._last_learning_optimization_at < interval_seconds:
+            return []
+
+        lookback_hours = int(learning.get("lookback_hours", 72))
+        max_incidents = int(learning.get("max_incidents", 1000))
+        since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+        incidents = self.storage.recent_incidents(since.isoformat(), limit=max_incidents)
+        recommendations = build_learning_recommendations(incidents, learning)
+        saved = self.storage.save_learning_recommendations(recommendations)
+        self._last_learning_optimization_at = now
+        if saved:
+            print(f"Learning optimization: {len(saved)} suggestion(s).")
+        if saved and learning.get("notify", False):
+            self.notifier.send(
+                str(learning.get("notification_title", "Ops Agent learning optimization suggestions")),
+                format_learning_recommendations(saved),
+                dedupe_key="learning-optimization",
+            )
+        return saved
+
     def due_checks(self, source: str, checks: list[dict], respect_intervals: bool, now: float) -> list[dict]:
         if not respect_intervals:
             return checks
@@ -514,6 +543,7 @@ class OpsScheduler:
                 results = self.run_once(respect_intervals=True)
                 self.send_daily_report_if_due()
                 self.run_retention_cleanup_if_due()
+                self.run_learning_optimization_if_due()
                 print(f"Check complete: {len(results)} result(s).")
             except Exception as exc:
                 print(f"Scheduler error: {exc}")

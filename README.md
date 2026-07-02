@@ -186,6 +186,41 @@ GET /api/classifications/summary?hours=24
 
 返回最近 N 小时事件总数、已分类数量、按分类/状态/严重级别聚合、示例事件，以及需要继续优化规则的候选分类。这个接口后续可以直接给前端图表、周报和学习优化任务使用。
 
+## 学习优化任务
+
+系统会定期读取最近事件，自动生成“规则优化建议”，并写入 `learning_recommendations` 表。它不会直接修改代码，而是把需要优化的信号沉淀成可审查队列。
+
+当前会识别：
+
+- `unknown_classification`: 事件没有稳定分类或仍是 `unknown`/`unclassified`
+- `low_confidence`: 分类置信度低于阈值
+- `frequent_unresolved`: 同一个 active 事件累计出现次数过高
+- `frequent_open_category`: 同一分类下有多个未解决事件
+
+配置示例：
+
+```json
+"learning": {
+  "enabled": true,
+  "interval_seconds": 21600,
+  "lookback_hours": 72,
+  "confidence_threshold": 0.65,
+  "frequent_occurrence_threshold": 10,
+  "frequent_open_category_threshold": 3,
+  "notify": false
+}
+```
+
+查看学习建议：
+
+```text
+GET /api/learning/recommendations
+GET /api/learning/recommendations?status=open&priority=high
+GET /api/learning/summary
+```
+
+建议字段包括 `priority`、`trigger_type`、`category`、`reason`、`recommended_action`、`evidence`、`incident_ids` 和 `metrics`。后续可以把这些建议接到前端、周报，或者人工确认后再生成分类器规则/Playbook 改动。
+
 Playbook 可以用 `match.categories` 绑定分类结果：
 
 ```json
@@ -438,6 +473,8 @@ GET  /api/incidents/1/recommendations
 GET  /api/incidents/1/actions
 GET  /api/incidents/1/failed-actions
 GET  /api/classifications/summary?hours=24
+GET  /api/learning/recommendations
+GET  /api/learning/summary
 GET  /api/recommendations
 GET  /api/recommendations/pending
 GET  /api/recommendations/actionable
