@@ -170,6 +170,74 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertEqual(2, incidents[0]["occurrence_count"])
         self.assertEqual(1, len(notifier.sent))
 
+    def test_alert_route_adds_header_and_dedupe_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {
+                        "consecutive_failures": 1,
+                        "routes": [
+                            {
+                                "name": "site-owner",
+                                "match": {"sources": ["http"], "severities": ["critical"]},
+                                "channels": ["email"],
+                            }
+                        ],
+                    },
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            scheduler.process_alert_states(
+                [CheckResult(source="http", name="Site", status="critical", summary="Request failed")]
+            )
+            storage.close()
+
+        self.assertEqual(1, len(notifier.sent))
+        self.assertIn("Alert routing:", notifier.sent[0][1])
+        self.assertIn("- routes: site-owner", notifier.sent[0][1])
+        self.assertEqual("http:Site:critical|route:site-owner:email", notifier.sent[0][2])
+
+    def test_silence_window_suppresses_notification_but_saves_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {
+                        "consecutive_failures": 1,
+                        "silence_windows": [
+                            {
+                                "name": "all-day-warning",
+                                "start": "00:00",
+                                "end": "00:00",
+                                "timezone": "+00:00",
+                                "match": {"severities": ["warning"]},
+                            }
+                        ],
+                    },
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            scheduler.process_alert_states(
+                [CheckResult(source="http", name="Site", status="warning", summary="Slow response")]
+            )
+            incidents = storage.latest_incidents(1)
+            storage.close()
+
+        self.assertEqual(0, len(notifier.sent))
+        self.assertEqual(1, len(incidents))
+        self.assertEqual("open", incidents[0]["status"])
+
     def test_repeated_problem_sends_reminder_after_repeat_interval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AppConfig(

@@ -322,6 +322,38 @@
     "escalation_enabled": true,
     "escalation_after_seconds": 1800,
     "escalation_critical_occurrences": 10,
+    "default_channels": [],
+    "routes": [
+      {
+        "name": "critical-email",
+        "enabled": false,
+        "match": {
+          "severities": ["critical"]
+        },
+        "channels": ["email"]
+      },
+      {
+        "name": "ai-api-owner",
+        "enabled": false,
+        "match": {
+          "sources": ["json_api"],
+          "categories": ["performance_degraded", "synthetic_quality_fail"]
+        },
+        "channels": ["email"]
+      }
+    ],
+    "silence_windows": [
+      {
+        "name": "night-warning-silence",
+        "enabled": false,
+        "start": "00:00",
+        "end": "08:00",
+        "timezone": "+08:00",
+        "match": {
+          "severities": ["warning"]
+        }
+      }
+    ],
     "daily_report": {
       "enabled": true,
       "hour": 9,

@@ -613,6 +613,7 @@ def validate_config(config: AppConfig) -> list[str]:
         "alerts.escalation_critical_occurrences",
         errors,
     )
+    validate_alert_routing(alerts, errors)
     validate_classification_rules(config.raw, errors)
 
     remediation = dict(config.raw.get("remediation", {}))
@@ -720,6 +721,97 @@ def validate_status_code_list(value: object, field: str, errors: list[str]) -> N
             continue
         if status_code < 100 or status_code > 599:
             errors.append(f"{field}[{index}] 必须在 100-599 之间")
+
+
+def validate_alert_routing(alerts: dict, errors: list[str]) -> None:
+    if "default_channels" in alerts:
+        validate_string_list(alerts["default_channels"], "alerts.default_channels", errors)
+
+    routes = alerts.get("routes", [])
+    if routes:
+        if not isinstance(routes, list):
+            errors.append("alerts.routes must be a list")
+        else:
+            for index, route in enumerate(routes):
+                field = f"alerts.routes[{index}]"
+                if not isinstance(route, dict):
+                    errors.append(f"{field} must be an object")
+                    continue
+                if "enabled" in route and not isinstance(route["enabled"], bool):
+                    errors.append(f"{field}.enabled must be true/false")
+                if "channels" in route:
+                    validate_string_list(route["channels"], f"{field}.channels", errors)
+                if "match" in route:
+                    validate_alert_match(route["match"], f"{field}.match", errors)
+
+    windows = alerts.get("silence_windows", [])
+    if not windows:
+        return
+    if not isinstance(windows, list):
+        errors.append("alerts.silence_windows must be a list")
+        return
+    for index, window in enumerate(windows):
+        field = f"alerts.silence_windows[{index}]"
+        if not isinstance(window, dict):
+            errors.append(f"{field} must be an object")
+            continue
+        if "enabled" in window and not isinstance(window["enabled"], bool):
+            errors.append(f"{field}.enabled must be true/false")
+        if not is_hhmm(str(window.get("start", ""))):
+            errors.append(f"{field}.start must be HH:MM")
+        if not is_hhmm(str(window.get("end", ""))):
+            errors.append(f"{field}.end must be HH:MM")
+        if not is_timezone_offset(str(window.get("timezone", "+00:00"))):
+            errors.append(f"{field}.timezone must be like +08:00")
+        if "match" in window:
+            validate_alert_match(window["match"], f"{field}.match", errors)
+
+
+def validate_alert_match(value: object, field: str, errors: list[str]) -> None:
+    if not isinstance(value, dict):
+        errors.append(f"{field} must be an object")
+        return
+    list_fields = {
+        "sources",
+        "statuses",
+        "severities",
+        "categories",
+        "names",
+        "environments",
+        "run_types",
+        "name_contains",
+        "summary_contains",
+        "title_contains",
+    }
+    for key in sorted(list_fields):
+        if key in value:
+            validate_string_list(value[key], f"{field}.{key}", errors)
+
+
+def is_hhmm(value: str) -> bool:
+    parts = value.strip().split(":")
+    if len(parts) != 2:
+        return False
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        return False
+    return 0 <= hour <= 23 and 0 <= minute <= 59
+
+
+def is_timezone_offset(value: str) -> bool:
+    text = value.strip()
+    if text in {"Z", "UTC"}:
+        return True
+    if len(text) != 6 or text[0] not in "+-" or text[3] != ":":
+        return False
+    try:
+        hour = int(text[1:3])
+        minute = int(text[4:6])
+    except ValueError:
+        return False
+    return 0 <= hour <= 23 and 0 <= minute <= 59
 
 
 def validate_api_auth_config(app: dict, errors: list[str]) -> None:

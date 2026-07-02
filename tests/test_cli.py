@@ -210,6 +210,77 @@ class CliTest(unittest.TestCase):
         )
         self.assertEqual([], validate_config(config))
 
+    def test_validate_config_accepts_alert_routing(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60},
+                "alerts": {
+                    "consecutive_failures": 2,
+                    "cooldown_seconds": 300,
+                    "default_channels": ["email"],
+                    "routes": [
+                        {
+                            "name": "critical-email",
+                            "enabled": True,
+                            "match": {"severities": ["critical"], "sources": ["http"]},
+                            "channels": ["email"],
+                        }
+                    ],
+                    "silence_windows": [
+                        {
+                            "name": "night-warning",
+                            "enabled": True,
+                            "start": "00:00",
+                            "end": "08:00",
+                            "timezone": "+08:00",
+                            "match": {"severities": ["warning"]},
+                        }
+                    ],
+                },
+            },
+            base_dir=Path("."),
+        )
+        self.assertEqual([], validate_config(config))
+
+    def test_validate_config_reports_bad_alert_routing(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60},
+                "alerts": {
+                    "consecutive_failures": 2,
+                    "cooldown_seconds": 300,
+                    "default_channels": "email",
+                    "routes": [
+                        {
+                            "enabled": "yes",
+                            "match": {"sources": "http"},
+                            "channels": "email",
+                        }
+                    ],
+                    "silence_windows": [
+                        {
+                            "enabled": "yes",
+                            "start": "25:00",
+                            "end": "bad",
+                            "timezone": "Asia/Shanghai",
+                            "match": "bad",
+                        }
+                    ],
+                },
+            },
+            base_dir=Path("."),
+        )
+        errors = validate_config(config)
+        self.assertTrue(any("alerts.default_channels" in error for error in errors))
+        self.assertTrue(any("alerts.routes[0].enabled" in error for error in errors))
+        self.assertTrue(any("alerts.routes[0].match.sources" in error for error in errors))
+        self.assertTrue(any("alerts.routes[0].channels" in error for error in errors))
+        self.assertTrue(any("alerts.silence_windows[0].enabled" in error for error in errors))
+        self.assertTrue(any("alerts.silence_windows[0].start" in error for error in errors))
+        self.assertTrue(any("alerts.silence_windows[0].end" in error for error in errors))
+        self.assertTrue(any("alerts.silence_windows[0].timezone" in error for error in errors))
+        self.assertTrue(any("alerts.silence_windows[0].match" in error for error in errors))
+
     def test_validate_config_reports_bad_classification_rules(self) -> None:
         config = AppConfig(
             raw={

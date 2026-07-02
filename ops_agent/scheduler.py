@@ -9,6 +9,12 @@ from ops_agent.ai.classifier import IncidentClassification, classify_incident
 from ops_agent.ai.analyzer import analyze_incident
 from ops_agent.ai.learning import build_learning_recommendations, format_learning_recommendations
 from ops_agent.alerts.notifier import Notifier
+from ops_agent.alerts.routing import (
+    alert_context_from_results,
+    format_routing_header,
+    route_alert,
+    routed_dedupe_key,
+)
 from ops_agent.config import AppConfig
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.diagnostics.suggestions import build_action_suggestions
@@ -180,7 +186,7 @@ class OpsScheduler:
                     note="remediation action processed",
                     metadata={"action_statuses": [item.status for item in action_results]},
                 )
-            self.notifier.send(title, analysis, dedupe_key=problem_key(new_alerts))
+            self.send_alert_notification(title, analysis, problem_key(new_alerts), new_alerts, severity)
             self.send_action_failure_escalation_if_needed(incident_id, action_results, new_alerts)
 
         if recoveries:
@@ -195,7 +201,7 @@ class OpsScheduler:
                     note="monitor recovered",
                     metadata={"recovered_checks": [check_key(result) for result in recoveries]},
                 )
-            self.notifier.send(title, text, dedupe_key="recovered:" + problem_key(recoveries))
+            self.send_alert_notification(title, text, "recovered:" + problem_key(recoveries), recoveries, "ok")
 
     def update_existing_incident(
         self,
@@ -220,6 +226,29 @@ class OpsScheduler:
         except ValueError:
             return None
 
+    def send_alert_notification(
+        self,
+        title: str,
+        text: str,
+        dedupe_key: str,
+        results: list[CheckResult] | None = None,
+        severity: str = "",
+    ) -> bool:
+        context = alert_context_from_results(
+            results or [],
+            severity=severity,
+            title=title,
+            classification_rules=self.config.classification_rules,
+        )
+        decision = route_alert(self.config.alerts, context)
+        if decision.suppressed:
+            print(f"[alert suppressed by routing] {title}: {decision.reason}")
+            return True
+
+        header = format_routing_header(decision)
+        routed_text = f"{header}\n\n{text}" if header else text
+        return self.notifier.send(title, routed_text, dedupe_key=routed_dedupe_key(dedupe_key, decision))
+
     def send_repeated_alert_if_due(self, incident: dict, results: list[CheckResult]) -> bool:
         alerts = self.config.alerts
         if not alerts.get("repeat_notification_enabled", True):
@@ -234,7 +263,13 @@ class OpsScheduler:
         incident_id = int(incident["id"])
         title = f"Ops Agent repeated issue reminder #{incident_id}"
         text = build_repeated_alert_message(incident, results, interval_seconds)
-        if self.notifier.send(title, text, dedupe_key=f"repeated:{incident_id}"):
+        if self.send_alert_notification(
+            title,
+            text,
+            f"repeated:{incident_id}",
+            results,
+            str(incident.get("severity") or ""),
+        ):
             self.storage.update_incident_notification(incident_id, kind="repeat")
             return True
         return False
@@ -250,7 +285,13 @@ class OpsScheduler:
         incident_id = int(incident["id"])
         title = f"[升级] Ops Agent incident #{incident_id} requires attention"
         text = build_escalation_message(incident, results, decision)
-        if not self.notifier.send(title, text, dedupe_key=f"escalation:{incident_id}:{decision['level']}"):
+        if not self.send_alert_notification(
+            title,
+            text,
+            f"escalation:{incident_id}:{decision['level']}",
+            results,
+            "critical",
+        ):
             return False
         self.storage.escalate_incident(
             incident_id,
@@ -283,7 +324,13 @@ class OpsScheduler:
         }
         title = f"[升级] Ops Agent incident #{incident_id} requires attention"
         text = build_action_failure_escalation_message(incident, context_results, failed_results, decision)
-        if not self.notifier.send(title, text, dedupe_key=f"escalation:{incident_id}:action-failure"):
+        if not self.send_alert_notification(
+            title,
+            text,
+            f"escalation:{incident_id}:action-failure",
+            context_results,
+            "critical",
+        ):
             return False
         self.storage.escalate_incident(
             incident_id,
@@ -441,7 +488,12 @@ class OpsScheduler:
             f"Status: {result.status}\n"
             f"Error: {result.error}"
         )
-        self.notifier.send(title, text, dedupe_key=f"playbook-escalation:{playbook_name}:{step_id}:{result.status}")
+        self.send_alert_notification(
+            title,
+            text,
+            f"playbook-escalation:{playbook_name}:{step_id}:{result.status}",
+            severity="critical",
+        )
         if not incident_id:
             return
         try:

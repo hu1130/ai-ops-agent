@@ -747,7 +747,26 @@ $env:OPENAI_MODEL="gpt-4.1-mini"
   "repeat_notification_interval_seconds": 3600,
   "escalation_enabled": true,
   "escalation_after_seconds": 1800,
-  "escalation_critical_occurrences": 10
+  "escalation_critical_occurrences": 10,
+  "default_channels": [],
+  "routes": [
+    {
+      "name": "critical-email",
+      "enabled": true,
+      "match": {"severities": ["critical"]},
+      "channels": ["email"]
+    }
+  ],
+  "silence_windows": [
+    {
+      "name": "night-warning-silence",
+      "enabled": false,
+      "start": "00:00",
+      "end": "08:00",
+      "timezone": "+08:00",
+      "match": {"severities": ["warning"]}
+    }
+  ]
 }
 ```
 
@@ -756,6 +775,9 @@ $env:OPENAI_MODEL="gpt-4.1-mini"
 - `repeat_notification_interval_seconds`: 同一 active 事件持续异常时，至少间隔多久再次提醒
 - `escalation_after_seconds`: 同一 active 事件持续多久未恢复后升级
 - `escalation_critical_occurrences`: `critical` 事件累计出现多少次后升级
+- `routes`: 按 source、status、severity、category、name、environment、run_type 等条件给告警打路由标签，并生成独立去重 key
+- `default_channels`: 没有命中 routes 时使用的默认通知通道；为空时保持旧行为
+- `silence_windows`: 在指定时间段内压制匹配告警的通知，但事件仍会落库，供统计和学习优化使用
 
 ## 目录
 
