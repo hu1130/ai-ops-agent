@@ -113,6 +113,48 @@ class IncidentLifecycleTest(unittest.TestCase):
         self.assertIn("http/Site", updated["last_summary"])
         self.assertIsNone(resolved_lookup)
 
+    def test_incident_classification_is_saved_updated_and_summarized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            incident_id = storage.save_incident(
+                "warning",
+                "Ops Agent detected 1 issue",
+                "analysis",
+                [CheckResult(source="json_api", name="Chat", status="warning", summary="Slow response")],
+                classification={
+                    "category": "performance_degraded",
+                    "confidence": 0.78,
+                    "summary": "slow synthetic response",
+                    "evidence": ["json_api/Chat slow"],
+                    "next_steps": ["check upstream latency"],
+                },
+            )
+            incident = storage.get_incident(incident_id)
+            updated = storage.update_incident_occurrence(
+                incident_id,
+                "critical",
+                "Ops Agent detected 1 issue",
+                [CheckResult(source="json_api", name="Chat", status="critical", summary="HTTP 500")],
+                classification={
+                    "category": "dependency_failure",
+                    "confidence": 0.82,
+                    "summary": "upstream failure",
+                    "evidence": ["json_api/Chat HTTP 500"],
+                    "next_steps": ["check dependency logs"],
+                },
+            )
+            summary = storage.classification_summary()
+            storage.close()
+
+        self.assertEqual("performance_degraded", incident["classification_category"])
+        self.assertEqual(0.78, incident["classification_confidence"])
+        self.assertIn("json_api/Chat slow", incident["classification_evidence_json"])
+        self.assertEqual("dependency_failure", updated["classification_category"])
+        self.assertEqual(1, summary["total_incidents"])
+        self.assertEqual(1, summary["classified_count"])
+        self.assertEqual("dependency_failure", summary["by_category"][0]["category"])
+        self.assertEqual(2, summary["by_category"][0]["occurrence_count"])
+
     def test_active_incidents_can_be_matched_by_fingerprint_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

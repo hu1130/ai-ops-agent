@@ -14,6 +14,7 @@
 - 每日发送巡检日报
 - 使用 SQLite 保存巡检和事件记录
 - 给巡检、事件、处置动作打上环境、运行类型和 trace_id 标记
+- 将异常分类、置信度、证据链和下一步动作结构化保存到事件表
 - 按生产/测试数据分别执行保留和自动清理
 - 提供本地 Web 面板查看健康概览、当前监控目标、事件中心和最近巡检
 
@@ -168,6 +169,22 @@ unknown                 未知异常
 - HTTP/API 异常同时出现日志错误：提升为真实服务故障判断
 - 资源压力和业务探针异常同时出现：优先怀疑资源或依赖引发故障
 - AI/业务合成测试返回异常结构、兜底话术或空字段：归为 `synthetic_quality_fail`
+
+分类结果会写入 `incidents` 表，字段包括：
+
+- `classification_category`
+- `classification_confidence`
+- `classification_summary`
+- `classification_evidence_json`
+- `classification_next_steps_json`
+
+后端提供分类统计接口：
+
+```text
+GET /api/classifications/summary?hours=24
+```
+
+返回最近 N 小时事件总数、已分类数量、按分类/状态/严重级别聚合、示例事件，以及需要继续优化规则的候选分类。这个接口后续可以直接给前端图表、周报和学习优化任务使用。
 
 Playbook 可以用 `match.categories` 绑定分类结果：
 
@@ -420,6 +437,7 @@ GET  /api/incidents/1/events
 GET  /api/incidents/1/recommendations
 GET  /api/incidents/1/actions
 GET  /api/incidents/1/failed-actions
+GET  /api/classifications/summary?hours=24
 GET  /api/recommendations
 GET  /api/recommendations/pending
 GET  /api/recommendations/actionable

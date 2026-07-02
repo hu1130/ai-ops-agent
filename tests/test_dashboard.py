@@ -30,6 +30,42 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("critical", summary["current_status"])
         self.assertEqual(1, summary["source_counts"]["json"])
 
+    def test_classification_summary_api_returns_category_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")
+            storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [result],
+                classification={
+                    "category": "service_unavailable",
+                    "confidence": 0.86,
+                    "summary": "HTTP 5xx",
+                    "evidence": ["http/Site HTTP 500"],
+                    "next_steps": ["check application logs"],
+                },
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/classifications/summary?hours=48",
+                    timeout=5,
+                ) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(48, body["hours"])
+        self.assertEqual(1, body["total_incidents"])
+        self.assertEqual("service_unavailable", body["by_category"][0]["category"])
+        self.assertEqual(1, body["by_status"]["open"])
+        self.assertEqual(1, body["by_severity"]["critical"])
+
     def test_render_page_contains_event_center_and_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

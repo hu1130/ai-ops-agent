@@ -89,6 +89,37 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertEqual("synthetic_test", check_port["run_type"])
         self.assertEqual("trace-1", check_port["trace_id"])
 
+    def test_alert_persists_incident_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 1},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            scheduler = OpsScheduler(config, storage, Notifier())
+            scheduler.process_alert_states(
+                [
+                    CheckResult(
+                        source="http",
+                        name="Site",
+                        status="critical",
+                        summary="HTTP 500",
+                        details={"url": "https://example.com", "status_code": 500},
+                    )
+                ]
+            )
+            incident = storage.latest_incidents(1)[0]
+            stats = storage.classification_summary()
+            storage.close()
+
+        self.assertEqual("service_unavailable", incident["classification_category"])
+        self.assertGreater(incident["classification_confidence"], 0.8)
+        self.assertEqual("service_unavailable", stats["by_category"][0]["category"])
+
     def test_recovery_resolves_open_incident(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AppConfig(

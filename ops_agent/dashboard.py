@@ -42,6 +42,9 @@ def start_dashboard(
             if path == "/api/summary":
                 self.send_json(storage.dashboard_summary())
                 return
+            if path == "/api/classifications/summary":
+                self.send_json(storage.classification_summary(query_hours(query)))
+                return
             if path == "/api/results":
                 self.send_json(storage.latest_results())
                 return
@@ -456,6 +459,17 @@ def query_limit(query: dict[str, list[str]], default: int, maximum: int) -> int:
     return min(max(value, 1), maximum)
 
 
+def query_hours(query: dict[str, list[str]], default: int = 24, maximum: int = 24 * 365) -> int:
+    text = query_text(query, "hours")
+    if not text:
+        return default
+    try:
+        value = int(text)
+    except ValueError:
+        return default
+    return min(max(value, 1), maximum)
+
+
 def query_statuses(query: dict[str, list[str]]) -> list[str]:
     raw_values = query.get("status", []) + query.get("statuses", [])
     statuses: list[str] = []
@@ -805,6 +819,7 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/actions/pending": ("action.pending", "action", None),
         "/api/incidents": ("incident.list", "incident", None),
         "/api/incidents/escalated": ("incident.escalated", "incident", None),
+        "/api/classifications/summary": ("classification.summary", "classification", None),
         "/api/recommendations": ("recommendation.list", "recommendation", None),
         "/api/recommendations/actionable": ("recommendation.actionable", "recommendation", None),
         "/api/recommendations/pending": ("recommendation.pending", "recommendation", None),

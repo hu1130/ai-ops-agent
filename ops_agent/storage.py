@@ -64,6 +64,11 @@ class Storage:
                     title text not null,
                     analysis text not null,
                     results_json text not null,
+                    classification_category text not null default '',
+                    classification_confidence real not null default 0,
+                    classification_summary text not null default '',
+                    classification_evidence_json text not null default '[]',
+                    classification_next_steps_json text not null default '[]',
                     acknowledged_at text,
                     acknowledged_by text,
                     resolved_at text,
@@ -157,6 +162,7 @@ class Storage:
             )
             self.ensure_context_columns()
             self.ensure_incident_lifecycle_columns()
+            self.ensure_incident_classification_columns()
             self.ensure_action_log_columns()
             self.ensure_recommendation_columns()
             self.connection.commit()
@@ -240,6 +246,22 @@ class Storage:
                 last_notification_at = coalesce(last_notification_at, created_at)
             """
         )
+
+    def ensure_incident_classification_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("pragma table_info(incidents)").fetchall()
+        }
+        additions = {
+            "classification_category": "alter table incidents add column classification_category text not null default ''",
+            "classification_confidence": "alter table incidents add column classification_confidence real not null default 0",
+            "classification_summary": "alter table incidents add column classification_summary text not null default ''",
+            "classification_evidence_json": "alter table incidents add column classification_evidence_json text not null default '[]'",
+            "classification_next_steps_json": "alter table incidents add column classification_next_steps_json text not null default '[]'",
+        }
+        for column, statement in additions.items():
+            if column not in columns:
+                self.connection.execute(statement)
 
     def ensure_action_log_columns(self) -> None:
         columns = {
@@ -350,11 +372,13 @@ class Storage:
         status: str | None = None,
         fingerprint: str = "",
         occurrence_count: int = 0,
+        classification: dict | None = None,
     ) -> int:
         incident_status = validate_incident_status(status or initial_incident_status(severity))
         created_at = utc_now_iso()
         occurrences = occurrence_count if occurrence_count > 0 else max(1, len(results))
         last_summary = summarize_results(results) or title
+        classification_payload = normalize_classification(classification)
         with self.lock:
             cursor = self.connection.execute(
                 """
@@ -362,9 +386,12 @@ class Storage:
                     created_at, updated_at, environment, run_type, trace_id,
                     fingerprint, occurrence_count, first_seen_at, last_seen_at, last_summary,
                     last_notification_at, last_notification_kind, status,
-                    severity, title, analysis, results_json, resolved_at
+                    severity, title, analysis, results_json,
+                    classification_category, classification_confidence, classification_summary,
+                    classification_evidence_json, classification_next_steps_json,
+                    resolved_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     created_at,
@@ -384,6 +411,11 @@ class Storage:
                     title,
                     analysis,
                     json.dumps([result.__dict__ for result in results], ensure_ascii=False),
+                    classification_payload["category"],
+                    classification_payload["confidence"],
+                    classification_payload["summary"],
+                    json.dumps(classification_payload["evidence"], ensure_ascii=False),
+                    json.dumps(classification_payload["next_steps"], ensure_ascii=False),
                     created_at if incident_status == "resolved" else None,
                 ),
             )
@@ -394,7 +426,7 @@ class Storage:
                 incident_status,
                 "system",
                 "incident created",
-                {"severity": severity},
+                {"severity": severity, "classification": classification_payload},
                 commit=False,
             )
             self.connection.commit()
@@ -514,9 +546,11 @@ class Storage:
         title: str,
         results: list[CheckResult],
         increment: int = 1,
+        classification: dict | None = None,
     ) -> dict:
         now = utc_now_iso()
         last_summary = summarize_results(results) or title
+        classification_payload = normalize_classification(classification)
         with self.lock:
             row = self.connection.execute(
                 "select * from incidents where id = ?",
@@ -535,7 +569,12 @@ class Storage:
                     occurrence_count = ?,
                     severity = ?,
                     title = ?,
-                    results_json = ?
+                    results_json = ?,
+                    classification_category = ?,
+                    classification_confidence = ?,
+                    classification_summary = ?,
+                    classification_evidence_json = ?,
+                    classification_next_steps_json = ?
                 where id = ?
                 """,
                 (
@@ -546,6 +585,11 @@ class Storage:
                     next_severity,
                     title,
                     json.dumps([result.__dict__ for result in results], ensure_ascii=False),
+                    classification_payload["category"],
+                    classification_payload["confidence"],
+                    classification_payload["summary"],
+                    json.dumps(classification_payload["evidence"], ensure_ascii=False),
+                    json.dumps(classification_payload["next_steps"], ensure_ascii=False),
                     incident_id,
                 ),
             )
@@ -1473,6 +1517,103 @@ class Storage:
             "latest_targets": list(latest.values()),
         }
 
+    def classification_summary(self, hours: int = 24) -> dict:
+        bounded_hours = min(max(int(hours), 1), 24 * 365)
+        since = datetime.now(timezone.utc) - timedelta(hours=bounded_hours)
+        incidents = self.recent_incidents(since.isoformat(), limit=1000)
+
+        by_category: dict[str, dict] = {}
+        by_status: dict[str, int] = {}
+        by_severity: dict[str, int] = {}
+        classified_count = 0
+
+        for row in incidents:
+            category = str(row.get("classification_category") or "unclassified")
+            status = str(row.get("status") or "open")
+            severity = str(row.get("severity") or "")
+            confidence = safe_float(row.get("classification_confidence"))
+            occurrence_count = safe_int(row.get("occurrence_count"), default=1)
+            latest_at = str(row.get("last_seen_at") or row.get("updated_at") or row.get("created_at") or "")
+
+            if category != "unclassified":
+                classified_count += 1
+            by_status[status] = by_status.get(status, 0) + 1
+            by_severity[severity] = by_severity.get(severity, 0) + 1
+
+            bucket = by_category.setdefault(
+                category,
+                {
+                    "category": category,
+                    "count": 0,
+                    "occurrence_count": 0,
+                    "open_count": 0,
+                    "critical_count": 0,
+                    "warning_count": 0,
+                    "resolved_count": 0,
+                    "confidence_sum": 0.0,
+                    "latest_at": "",
+                    "examples": [],
+                },
+            )
+            bucket["count"] += 1
+            bucket["occurrence_count"] += occurrence_count
+            bucket["confidence_sum"] += confidence
+            if status not in {"resolved", "closed"}:
+                bucket["open_count"] += 1
+            if severity == "critical":
+                bucket["critical_count"] += 1
+            if severity == "warning":
+                bucket["warning_count"] += 1
+            if status == "resolved":
+                bucket["resolved_count"] += 1
+            if latest_at > str(bucket.get("latest_at") or ""):
+                bucket["latest_at"] = latest_at
+            examples = bucket["examples"]
+            if len(examples) < 3:
+                examples.append(
+                    {
+                        "id": row.get("id"),
+                        "title": row.get("title"),
+                        "status": status,
+                        "severity": severity,
+                        "summary": row.get("classification_summary") or row.get("last_summary") or "",
+                        "latest_at": latest_at,
+                    }
+                )
+
+        category_rows = []
+        for bucket in by_category.values():
+            count = int(bucket["count"])
+            confidence_sum = float(bucket.pop("confidence_sum"))
+            bucket["avg_confidence"] = round(confidence_sum / count, 3) if count else 0.0
+            category_rows.append(bucket)
+        category_rows.sort(key=lambda item: (-int(item["count"]), str(item["category"])))
+
+        optimization_candidates = []
+        for item in category_rows:
+            reason = learning_candidate_reason(item)
+            if reason:
+                optimization_candidates.append(
+                    {
+                        "category": item["category"],
+                        "reason": reason,
+                        "count": item["count"],
+                        "avg_confidence": item["avg_confidence"],
+                        "open_count": item["open_count"],
+                    }
+                )
+
+        return {
+            "hours": bounded_hours,
+            "total_incidents": len(incidents),
+            "classified_count": classified_count,
+            "unclassified_count": len(incidents) - classified_count,
+            "by_category": category_rows,
+            "by_status": by_status,
+            "by_severity": by_severity,
+            "optimization_candidates": optimization_candidates,
+        }
+
     def close(self) -> None:
         with self.lock:
             self.connection.close()
@@ -1513,8 +1654,49 @@ def parse_json_object(value: str) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def normalize_classification(value: dict | None) -> dict:
+    payload = safe_dict(value)
+    return {
+        "category": str(payload.get("category") or ""),
+        "confidence": safe_float(payload.get("confidence")),
+        "summary": str(payload.get("summary") or ""),
+        "evidence": safe_list(payload.get("evidence")),
+        "next_steps": safe_list(payload.get("next_steps")),
+    }
+
+
 def safe_dict(value: object) -> dict:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def safe_list(value: object) -> list:
+    return list(value) if isinstance(value, list) else []
+
+
+def safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def learning_candidate_reason(item: dict) -> str:
+    category = str(item.get("category") or "")
+    avg_confidence = safe_float(item.get("avg_confidence"))
+    if category in {"unknown", "unclassified"}:
+        return "needs_more_rules"
+    if avg_confidence and avg_confidence < 0.65:
+        return "low_confidence"
+    if safe_int(item.get("open_count")) > 0 and safe_int(item.get("count")) >= 3:
+        return "frequent_open_incidents"
+    return ""
 
 
 def fingerprint_target_keys(fingerprint: str) -> set[str]:

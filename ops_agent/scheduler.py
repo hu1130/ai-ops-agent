@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import time
 from pathlib import Path
 
+from ops_agent.ai.classifier import IncidentClassification, classify_incident
 from ops_agent.ai.analyzer import analyze_incident
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig
@@ -151,6 +152,7 @@ class OpsScheduler:
                 new_alerts,
                 fingerprint=fingerprint,
                 occurrence_count=len(new_alerts),
+                classification=classification_payload(new_alerts),
             )
             action_results = self.process_remediation_actions(action_plan, new_alerts, incident_id=incident_id)
             self.storage.save_incident_recommendations(
@@ -211,6 +213,7 @@ class OpsScheduler:
                 merged_title,
                 results,
                 increment=len(results),
+                classification=classification_payload(results),
             )
         except ValueError:
             return None
@@ -526,6 +529,21 @@ def incident_fingerprint(results: list[CheckResult]) -> str:
     context = context_from_results(results)
     targets = sorted({check_key(result) for result in results})
     return f"{context.environment}:{context.run_type}:{'|'.join(targets)}"
+
+
+def classification_payload(results: list[CheckResult]) -> dict:
+    classification = classify_incident([result for result in results if result.is_problem])
+    return incident_classification_to_dict(classification)
+
+
+def incident_classification_to_dict(classification: IncidentClassification) -> dict:
+    return {
+        "category": classification.category,
+        "confidence": classification.confidence,
+        "summary": classification.summary,
+        "evidence": classification.evidence,
+        "next_steps": classification.next_steps,
+    }
 
 
 def check_key(result: CheckResult) -> str:
