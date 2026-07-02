@@ -173,7 +173,12 @@ class Storage:
                     incident_ids_json text not null default '[]',
                     metrics_json text not null default '{}',
                     source text not null default 'classification_learning',
-                    seen_count integer not null default 1
+                    seen_count integer not null default 1,
+                    decision_by text,
+                    decision_at text,
+                    decision_note text,
+                    applied_at text,
+                    draft_json text not null default '{}'
                 );
 
                 create index if not exists idx_incident_recommendations_incident
@@ -187,6 +192,7 @@ class Storage:
             self.ensure_incident_classification_columns()
             self.ensure_action_log_columns()
             self.ensure_recommendation_columns()
+            self.ensure_learning_recommendation_columns()
             self.connection.commit()
 
     def ensure_context_columns(self) -> None:
@@ -333,6 +339,22 @@ class Storage:
             "executed_at": "alter table incident_recommendations add column executed_at text",
             "source": "alter table incident_recommendations add column source text not null default 'planner'",
             "metadata_json": "alter table incident_recommendations add column metadata_json text not null default '{}'",
+        }
+        for column, statement in additions.items():
+            if column not in columns:
+                self.connection.execute(statement)
+
+    def ensure_learning_recommendation_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("pragma table_info(learning_recommendations)").fetchall()
+        }
+        additions = {
+            "decision_by": "alter table learning_recommendations add column decision_by text",
+            "decision_at": "alter table learning_recommendations add column decision_at text",
+            "decision_note": "alter table learning_recommendations add column decision_note text",
+            "applied_at": "alter table learning_recommendations add column applied_at text",
+            "draft_json": "alter table learning_recommendations add column draft_json text not null default '{}'",
         }
         for column, statement in additions.items():
             if column not in columns:
@@ -825,7 +847,7 @@ class Storage:
             return []
         now = utc_now_iso()
         saved: list[dict] = []
-        terminal_statuses = {"applied", "dismissed"}
+        preserved_statuses = {"accepted", "applied", "dismissed"}
         with self.lock:
             for item in recommendations:
                 payload = normalize_learning_recommendation(item)
@@ -837,7 +859,7 @@ class Storage:
                 ).fetchone()
                 if existing:
                     status = str(existing["status"] or "open")
-                    next_status = status if status in terminal_statuses else "open"
+                    next_status = status if status in preserved_statuses else "open"
                     seen_count = int(existing["seen_count"] or 1) + 1
                     self.connection.execute(
                         """
@@ -952,6 +974,88 @@ class Storage:
                 (*params, limit),
             ).fetchall()
         return [learning_recommendation_payload(row) for row in rows]
+
+    def get_learning_recommendation(self, recommendation_id: int) -> dict | None:
+        with self.lock:
+            row = self.connection.execute(
+                """
+                select * from learning_recommendations
+                where id = ?
+                """,
+                (recommendation_id,),
+            ).fetchone()
+        return learning_recommendation_payload(row) if row else None
+
+    def update_learning_recommendation_status(
+        self,
+        recommendation_id: int,
+        status: str,
+        actor: str = "",
+        note: str = "",
+        draft: dict | None = None,
+    ) -> dict:
+        allowed_statuses = {"open", "accepted", "dismissed", "applied"}
+        normalized_status = (status or "").strip().lower()
+        if normalized_status not in allowed_statuses:
+            raise ValueError(f"unsupported learning recommendation status: {status}")
+
+        now = utc_now_iso()
+        actor_value = actor.strip()
+        note_value = note.strip()
+        draft_payload = safe_dict(draft)
+        with self.lock:
+            row = self.connection.execute(
+                "select * from learning_recommendations where id = ?",
+                (recommendation_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"learning recommendation not found: #{recommendation_id}")
+
+            current_status = str(row["status"] or "open")
+            if current_status in {"dismissed", "applied"} and current_status != normalized_status:
+                raise ValueError(
+                    f"learning recommendation already {current_status}: #{recommendation_id}"
+                )
+            if normalized_status == "accepted" and current_status not in {"open", "accepted"}:
+                raise ValueError(
+                    f"learning recommendation cannot be accepted from {current_status}: #{recommendation_id}"
+                )
+            if normalized_status == "dismissed" and current_status not in {"open", "accepted", "dismissed"}:
+                raise ValueError(
+                    f"learning recommendation cannot be dismissed from {current_status}: #{recommendation_id}"
+                )
+
+            existing_draft = parse_json_object(str(row["draft_json"] or "{}"))
+            next_draft = draft_payload or existing_draft
+            self.connection.execute(
+                """
+                update learning_recommendations
+                set updated_at = ?,
+                    status = ?,
+                    decision_by = coalesce(nullif(?, ''), decision_by),
+                    decision_at = coalesce(?, decision_at),
+                    decision_note = coalesce(nullif(?, ''), decision_note),
+                    applied_at = coalesce(?, applied_at),
+                    draft_json = ?
+                where id = ?
+                """,
+                (
+                    now,
+                    normalized_status,
+                    actor_value,
+                    now if actor_value or note_value or normalized_status in {"accepted", "dismissed", "applied"} else None,
+                    note_value,
+                    now if normalized_status == "applied" else None,
+                    json.dumps(next_draft, ensure_ascii=False),
+                    recommendation_id,
+                ),
+            )
+            self.connection.commit()
+            updated = self.connection.execute(
+                "select * from learning_recommendations where id = ?",
+                (recommendation_id,),
+            ).fetchone()
+        return learning_recommendation_payload(updated)
 
     def learning_summary(self, limit: int = 500) -> dict:
         rows = self.latest_learning_recommendations(limit=limit)
@@ -1834,6 +1938,7 @@ def learning_recommendation_payload(row: sqlite3.Row) -> dict:
         if safe_int(value) > 0
     ]
     payload["metrics"] = parse_json_object(str(payload.get("metrics_json") or "{}"))
+    payload["draft"] = parse_json_object(str(payload.get("draft_json") or "{}"))
     return payload
 
 

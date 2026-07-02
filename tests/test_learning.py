@@ -88,6 +88,39 @@ class LearningOptimizationTest(unittest.TestCase):
         self.assertEqual([1], rows[0]["incident_ids"])
         self.assertEqual(1, summary["open_count"])
 
+    def test_storage_tracks_learning_review_decision_and_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            payload = {
+                "dedupe_key": "unknown:prod:normal",
+                "priority": "high",
+                "category": "unknown",
+                "trigger_type": "unknown_classification",
+                "title": "Review unknown signals",
+                "reason": "unknown incidents exist",
+                "recommended_action": "add classifier rules",
+                "evidence": ["incident #1: summary=mystery outage"],
+                "incident_ids": [1],
+                "metrics": {"incident_count": 1},
+            }
+            row = storage.save_learning_recommendations([payload])[0]
+            updated = storage.update_learning_recommendation_status(
+                row["id"],
+                "accepted",
+                actor="tester",
+                note="valid signal",
+                draft={"draft_type": "classifier_rule", "status": "draft"},
+            )
+            repeated = storage.save_learning_recommendations([payload])[0]
+            storage.close()
+
+        self.assertEqual("accepted", updated["status"])
+        self.assertEqual("tester", updated["decision_by"])
+        self.assertEqual("valid signal", updated["decision_note"])
+        self.assertEqual("classifier_rule", updated["draft"]["draft_type"])
+        self.assertEqual("accepted", repeated["status"])
+        self.assertEqual(2, repeated["seen_count"])
+
     def test_scheduler_generates_learning_recommendations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AppConfig(

@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.auth import AuthResult, authenticate_token, configured_api_tokens, has_role
 from ops_agent.config import AppConfig
+from ops_agent.ai.learning_review import build_learning_optimization_draft
 from ops_agent.remediation.approval import approve_action_log, reject_action_log
 from ops_agent.remediation.recommendations import (
     approve_recommendation,
@@ -51,6 +52,16 @@ def start_dashboard(
             if path == "/api/learning/summary":
                 self.send_json(storage.learning_summary(query_limit(query, default=500, maximum=1000)))
                 return
+            learning_request = parse_learning_recommendation_api_path(path)
+            if learning_request:
+                recommendation_id, action = learning_request
+                if action == "":
+                    row = storage.get_learning_recommendation(recommendation_id)
+                    if not row:
+                        self.send_json({"error": "learning recommendation not found"}, status=404)
+                        return
+                    self.send_json(row)
+                    return
             if path == "/api/results":
                 self.send_json(storage.latest_results())
                 return
@@ -136,6 +147,11 @@ def start_dashboard(
             path = self.path.split("?", 1)[0]
             auth = self.require_role(path, "operator")
             if auth is None:
+                return
+
+            learning_request = parse_learning_recommendation_api_path(path)
+            if learning_request:
+                self.handle_learning_recommendation_post(learning_request, auth)
                 return
 
             recommendation_request = parse_recommendation_api_path(path)
@@ -297,6 +313,74 @@ def start_dashboard(
                 auth=auth,
             )
             self.send_json({"error": f"unsupported recommendation operation: {action}"}, status=404)
+
+        def handle_learning_recommendation_post(
+            self,
+            recommendation_request: tuple[int, str],
+            auth: AuthResult,
+        ) -> None:
+            recommendation_id, action = recommendation_request
+            path = self.path.split("?", 1)[0]
+            actor = "api"
+            try:
+                body = self.read_json_body()
+                actor = self.actor_from_body(body, auth)
+                note = str(body.get("note") or body.get("reason") or "")
+                current = storage.get_learning_recommendation(recommendation_id)
+                if not current:
+                    raise ValueError(f"learning recommendation not found: #{recommendation_id}")
+
+                if action == "accept":
+                    draft = build_learning_optimization_draft(current)
+                    updated = storage.update_learning_recommendation_status(
+                        recommendation_id,
+                        "accepted",
+                        actor=actor,
+                        note=note,
+                        draft=draft,
+                    )
+                    self.record_audit(path, 200, "success", "learning recommendation accepted", actor=actor, auth=auth)
+                    self.send_json({"recommendation": updated, "draft": updated.get("draft")})
+                    return
+                if action == "dismiss":
+                    updated = storage.update_learning_recommendation_status(
+                        recommendation_id,
+                        "dismissed",
+                        actor=actor,
+                        note=note,
+                    )
+                    self.record_audit(path, 200, "success", "learning recommendation dismissed", actor=actor, auth=auth)
+                    self.send_json({"recommendation": updated})
+                    return
+                if action == "apply":
+                    draft = safe_body_dict(body.get("draft")) or current.get("draft") or build_learning_optimization_draft(current)
+                    updated = storage.update_learning_recommendation_status(
+                        recommendation_id,
+                        "applied",
+                        actor=actor,
+                        note=note,
+                        draft=draft,
+                    )
+                    self.record_audit(path, 200, "success", "learning recommendation marked applied", actor=actor, auth=auth)
+                    self.send_json({"recommendation": updated, "draft": updated.get("draft")})
+                    return
+            except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
+                return
+            self.record_audit(
+                path,
+                404,
+                "not_found",
+                f"unsupported learning recommendation operation: {action}",
+                actor=actor,
+                auth=auth,
+            )
+            self.send_json({"error": f"unsupported learning recommendation operation: {action}"}, status=404)
 
         def read_json_body(self) -> dict:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -809,7 +893,25 @@ def parse_recommendation_api_path(path: str) -> tuple[int, str] | None:
     return recommendation_id, action
 
 
+def parse_learning_recommendation_api_path(path: str) -> tuple[int, str] | None:
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 4 or parts[0] != "api" or parts[1] != "learning" or parts[2] != "recommendations":
+        return None
+    try:
+        recommendation_id = int(parts[3])
+    except ValueError:
+        return None
+    action = parts[4] if len(parts) >= 5 else ""
+    return recommendation_id, action
+
+
 def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
+    learning_request = parse_learning_recommendation_api_path(path)
+    if learning_request:
+        recommendation_id, action = learning_request
+        operation = f"learning.recommendation.{action or 'read'}"
+        return operation, "learning_recommendation", recommendation_id
+
     recommendation_request = parse_recommendation_api_path(path)
     if recommendation_request:
         recommendation_id, action = recommendation_request
@@ -865,3 +967,7 @@ def status_from_incident_action(action: str, body: dict) -> str:
 
 def safe(value: object) -> str:
     return html.escape(str(value))
+
+
+def safe_body_dict(value: object) -> dict:
+    return dict(value) if isinstance(value, dict) else {}

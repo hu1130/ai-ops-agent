@@ -217,7 +217,18 @@ GET /api/classifications/summary?hours=24
 GET /api/learning/recommendations
 GET /api/learning/recommendations?status=open&priority=high
 GET /api/learning/summary
+GET /api/learning/recommendations/1
+POST /api/learning/recommendations/1/accept
+POST /api/learning/recommendations/1/dismiss
+POST /api/learning/recommendations/1/apply
 ```
+
+Learning recommendation review flow:
+- `accept` keeps the suggestion in an accepted state and stores a generated optimization draft.
+- `dismiss` closes a noisy or expected suggestion without applying changes.
+- `apply` marks the suggestion as applied after the rule/playbook change has been made and reviewed.
+
+The system does not silently rewrite production code from learning suggestions. It stores a reviewable draft first, records actor/time/note, and writes each POST operation into `api_audit_logs`.
 
 建议字段包括 `priority`、`trigger_type`、`category`、`reason`、`recommended_action`、`evidence`、`incident_ids` 和 `metrics`。后续可以把这些建议接到前端、周报，或者人工确认后再生成分类器规则/Playbook 改动。
 
@@ -474,6 +485,10 @@ GET  /api/incidents/1/actions
 GET  /api/incidents/1/failed-actions
 GET  /api/classifications/summary?hours=24
 GET  /api/learning/recommendations
+GET  /api/learning/recommendations/1
+POST /api/learning/recommendations/1/accept
+POST /api/learning/recommendations/1/dismiss
+POST /api/learning/recommendations/1/apply
 GET  /api/learning/summary
 GET  /api/recommendations
 GET  /api/recommendations/pending

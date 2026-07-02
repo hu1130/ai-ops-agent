@@ -106,6 +106,109 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(1, summary["open_count"])
         self.assertEqual(1, summary["by_priority"]["high"])
 
+    def test_learning_recommendation_review_api_accepts_and_applies_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            saved = storage.save_learning_recommendations(
+                [
+                    {
+                        "dedupe_key": "unknown:prod:normal",
+                        "priority": "high",
+                        "category": "unknown",
+                        "trigger_type": "unknown_classification",
+                        "title": "Review unknown signals",
+                        "reason": "unknown incidents exist",
+                        "recommended_action": "add classifier rules",
+                        "evidence": ["incident #1: category=unknown, summary=mystery outage"],
+                        "incident_ids": [1],
+                        "metrics": {"incident_count": 1},
+                    }
+                ]
+            )[0]
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/learning/recommendations/{saved['id']}/accept",
+                    data=b'{"actor":"tester","note":"real recurring signal"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    accepted = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/learning/recommendations/{saved['id']}/apply",
+                    data=b'{"actor":"tester","note":"rule added in code review"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    applied = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/learning/recommendations/{saved['id']}",
+                    timeout=5,
+                ) as response:
+                    current = json.loads(response.read().decode("utf-8"))
+                audit = storage.latest_api_audit_logs(2)
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("accepted", accepted["recommendation"]["status"])
+        self.assertEqual("classifier_rule", accepted["draft"]["draft_type"])
+        self.assertEqual("applied", applied["recommendation"]["status"])
+        self.assertEqual("tester", current["decision_by"])
+        self.assertEqual("rule added in code review", current["decision_note"])
+        self.assertEqual("classifier_rule", current["draft"]["draft_type"])
+        self.assertEqual("learning.recommendation.apply", audit[0]["operation"])
+        self.assertEqual("learning_recommendation", audit[0]["target_type"])
+        self.assertEqual(saved["id"], audit[0]["target_id"])
+
+    def test_learning_recommendation_review_api_dismisses_suggestion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            saved = storage.save_learning_recommendations(
+                [
+                    {
+                        "dedupe_key": "low_confidence:perf:prod:normal",
+                        "priority": "medium",
+                        "category": "performance_degraded",
+                        "trigger_type": "low_confidence",
+                        "title": "Improve classifier confidence",
+                        "reason": "low confidence",
+                        "recommended_action": "add rules",
+                        "evidence": ["incident #2"],
+                        "incident_ids": [2],
+                        "metrics": {"avg_confidence": 0.52},
+                    }
+                ]
+            )[0]
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/learning/recommendations/{saved['id']}/dismiss",
+                    data=b'{"actor":"tester","note":"expected temporary event"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    dismissed = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/learning/recommendations?status=dismissed",
+                    timeout=5,
+                ) as response:
+                    rows = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("dismissed", dismissed["recommendation"]["status"])
+        self.assertEqual("expected temporary event", dismissed["recommendation"]["decision_note"])
+        self.assertEqual([saved["id"]], [row["id"] for row in rows])
+
     def test_render_page_contains_event_center_and_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")
