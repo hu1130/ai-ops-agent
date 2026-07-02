@@ -10,6 +10,7 @@ from typing import Any
 class AppConfig:
     raw: dict[str, Any]
     base_dir: Path
+    config_path: Path | None = None
 
     @property
     def app(self) -> dict[str, Any]:
@@ -39,6 +40,11 @@ class AppConfig:
     def alerts(self) -> dict[str, Any]:
         return self.raw.get("alerts", {})
 
+    @property
+    def classification_rules(self) -> list[dict[str, Any]]:
+        rules = self.raw.get("classification_rules", [])
+        return [item for item in rules if isinstance(item, dict)] if isinstance(rules, list) else []
+
     def resolve_path(self, value: str) -> Path:
         path = Path(value)
         if path.is_absolute():
@@ -50,4 +56,4 @@ def load_config(path: str | Path) -> AppConfig:
     config_path = Path(path).resolve()
     with config_path.open("r", encoding="utf-8") as handle:
         raw = json.load(handle)
-    return AppConfig(raw=raw, base_dir=config_path.parent)
+    return AppConfig(raw=raw, base_dir=config_path.parent, config_path=config_path)

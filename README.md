@@ -221,14 +221,41 @@ GET /api/learning/recommendations/1
 POST /api/learning/recommendations/1/accept
 POST /api/learning/recommendations/1/dismiss
 POST /api/learning/recommendations/1/apply
+POST /api/learning/recommendations/1/propose-config
+GET /api/learning/config-patches
+GET /api/learning/config-patches/1
+POST /api/learning/config-patches/1/approve
+POST /api/learning/config-patches/1/reject
+POST /api/learning/config-patches/1/apply
 ```
 
 Learning recommendation review flow:
 - `accept` keeps the suggestion in an accepted state and stores a generated optimization draft.
 - `dismiss` closes a noisy or expected suggestion without applying changes.
 - `apply` marks the suggestion as applied after the rule/playbook change has been made and reviewed.
+- `propose-config` converts an accepted draft into a reviewable JSON config patch.
+- Config patches must be approved before `apply` writes to `config.json`. Applying a patch creates a timestamped backup and records the result in `learning_config_patches`.
 
 The system does not silently rewrite production code from learning suggestions. It stores a reviewable draft first, records actor/time/note, and writes each POST operation into `api_audit_logs`.
+
+配置驱动分类规则示例：
+```json
+"classification_rules": [
+  {
+    "name": "learned slow ai response",
+    "enabled": true,
+    "category": "performance_degraded",
+    "confidence": 0.8,
+    "summary": "Configured rule matched a repeated slow AI response.",
+    "match": {
+      "sources": ["json_api"],
+      "statuses": ["warning", "critical"],
+      "summary_contains": ["slow", "response"]
+    },
+    "next_steps": ["Check API latency, model provider latency, database connection pool, and recent deployments."]
+  }
+]
+```
 
 建议字段包括 `priority`、`trigger_type`、`category`、`reason`、`recommended_action`、`evidence`、`incident_ids` 和 `metrics`。后续可以把这些建议接到前端、周报，或者人工确认后再生成分类器规则/Playbook 改动。
 
@@ -489,6 +516,12 @@ GET  /api/learning/recommendations/1
 POST /api/learning/recommendations/1/accept
 POST /api/learning/recommendations/1/dismiss
 POST /api/learning/recommendations/1/apply
+POST /api/learning/recommendations/1/propose-config
+GET  /api/learning/config-patches
+GET  /api/learning/config-patches/1
+POST /api/learning/config-patches/1/approve
+POST /api/learning/config-patches/1/reject
+POST /api/learning/config-patches/1/apply
 GET  /api/learning/summary
 GET  /api/recommendations
 GET  /api/recommendations/pending

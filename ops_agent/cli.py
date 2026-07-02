@@ -613,6 +613,7 @@ def validate_config(config: AppConfig) -> list[str]:
         "alerts.escalation_critical_occurrences",
         errors,
     )
+    validate_classification_rules(config.raw, errors)
 
     remediation = dict(config.raw.get("remediation", {}))
     if remediation:
@@ -852,6 +853,52 @@ def validate_remediation_playbooks(remediation: dict, errors: list[str]) -> None
             else:
                 for step_index, step in enumerate(rollback_steps):
                     validate_playbook_step(step, f"{field}.rollback_steps[{step_index}]", errors)
+
+
+def validate_classification_rules(raw: dict, errors: list[str]) -> None:
+    rules = raw.get("classification_rules", [])
+    if not rules:
+        return
+    if not isinstance(rules, list):
+        errors.append("classification_rules 必须是数组")
+        return
+    for index, rule in enumerate(rules):
+        field = f"classification_rules[{index}]"
+        if not isinstance(rule, dict):
+            errors.append(f"{field} 必须是对象")
+            continue
+        if "enabled" in rule and not isinstance(rule["enabled"], bool):
+            errors.append(f"{field}.enabled 必须是 true/false")
+        if not str(rule.get("category", "")).strip():
+            errors.append(f"{field}.category 不能为空")
+        confidence = rule.get("confidence")
+        if confidence is not None:
+            try:
+                confidence_value = float(confidence)
+            except (TypeError, ValueError):
+                errors.append(f"{field}.confidence 必须是 0 到 1 之间的数字")
+            else:
+                if confidence_value < 0 or confidence_value > 1:
+                    errors.append(f"{field}.confidence 必须是 0 到 1 之间的数字")
+        if "next_steps" in rule:
+            validate_string_list(rule["next_steps"], f"{field}.next_steps", errors)
+        match = rule.get("match", {})
+        if match and not isinstance(match, dict):
+            errors.append(f"{field}.match 必须是对象")
+            continue
+        if isinstance(match, dict):
+            for key in (
+                "sources",
+                "statuses",
+                "name_contains",
+                "summary_contains",
+                "url_contains",
+                "path_contains",
+            ):
+                if key in match:
+                    validate_string_list(match[key], f"{field}.match.{key}", errors)
+            if "status_codes" in match:
+                validate_status_code_list(match["status_codes"], f"{field}.match.status_codes", errors)
 
 
 def validate_playbook_step(step: object, field: str, errors: list[str]) -> None:

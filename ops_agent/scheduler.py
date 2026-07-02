@@ -142,7 +142,7 @@ class OpsScheduler:
             severity = "critical" if any(item.status == "critical" for item in new_alerts) else "warning"
             title = f"Ops Agent detected {len(new_alerts)} issue(s)"
             fingerprint = incident_fingerprint(new_alerts)
-            analysis = analyze_incident(new_alerts, self.config.ai)
+            analysis = analyze_incident(new_alerts, self.config.ai, self.config.classification_rules)
             diagnostics = format_snapshot(collect_diagnostics(new_alerts, self.config))
             suggestions = build_action_suggestions(new_alerts)
             action_plan = build_remediation_plan(new_alerts, self.config)
@@ -154,7 +154,7 @@ class OpsScheduler:
                 new_alerts,
                 fingerprint=fingerprint,
                 occurrence_count=len(new_alerts),
-                classification=classification_payload(new_alerts),
+                classification=classification_payload(new_alerts, self.config.classification_rules),
             )
             action_results = self.process_remediation_actions(action_plan, new_alerts, incident_id=incident_id)
             self.storage.save_incident_recommendations(
@@ -215,7 +215,7 @@ class OpsScheduler:
                 merged_title,
                 results,
                 increment=len(results),
-                classification=classification_payload(results),
+                classification=classification_payload(results, self.config.classification_rules),
             )
         except ValueError:
             return None
@@ -561,8 +561,14 @@ def incident_fingerprint(results: list[CheckResult]) -> str:
     return f"{context.environment}:{context.run_type}:{'|'.join(targets)}"
 
 
-def classification_payload(results: list[CheckResult]) -> dict:
-    classification = classify_incident([result for result in results if result.is_problem])
+def classification_payload(
+    results: list[CheckResult],
+    classification_rules: list[dict] | None = None,
+) -> dict:
+    classification = classify_incident(
+        [result for result in results if result.is_problem],
+        classification_rules,
+    )
     return incident_classification_to_dict(classification)
 
 

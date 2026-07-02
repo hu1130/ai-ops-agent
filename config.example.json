@@ -55,6 +55,23 @@
     "enabled": true,
     "max_log_chars": 4000
   },
+  "classification_rules": [
+    {
+      "name": "example learned slow ai response",
+      "enabled": false,
+      "category": "performance_degraded",
+      "confidence": 0.75,
+      "summary": "Configured rule matched a repeated slow AI customer service response.",
+      "match": {
+        "sources": ["json_api"],
+        "statuses": ["warning", "critical"],
+        "summary_contains": ["slow", "response"]
+      },
+      "next_steps": [
+        "Check API latency, model provider latency, database connection pool, and recent deployments."
+      ]
+    }
+  ],
   "learning": {
     "enabled": true,
     "interval_seconds": 21600,

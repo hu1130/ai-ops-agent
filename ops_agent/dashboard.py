@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.auth import AuthResult, authenticate_token, configured_api_tokens, has_role
 from ops_agent.config import AppConfig
+from ops_agent.ai.config_patches import apply_config_patch, build_config_patch_from_recommendation
 from ops_agent.ai.learning_review import build_learning_optimization_draft
 from ops_agent.remediation.approval import approve_action_log, reject_action_log
 from ops_agent.remediation.recommendations import (
@@ -52,6 +53,19 @@ def start_dashboard(
             if path == "/api/learning/summary":
                 self.send_json(storage.learning_summary(query_limit(query, default=500, maximum=1000)))
                 return
+            if path == "/api/learning/config-patches":
+                self.send_json(storage.latest_learning_config_patches(**learning_config_patch_filters_from_query(query)))
+                return
+            config_patch_request = parse_learning_config_patch_api_path(path)
+            if config_patch_request:
+                patch_id, action = config_patch_request
+                if action == "":
+                    row = storage.get_learning_config_patch(patch_id)
+                    if not row:
+                        self.send_json({"error": "learning config patch not found"}, status=404)
+                        return
+                    self.send_json(row)
+                    return
             learning_request = parse_learning_recommendation_api_path(path)
             if learning_request:
                 recommendation_id, action = learning_request
@@ -147,6 +161,11 @@ def start_dashboard(
             path = self.path.split("?", 1)[0]
             auth = self.require_role(path, "operator")
             if auth is None:
+                return
+
+            config_patch_request = parse_learning_config_patch_api_path(path)
+            if config_patch_request:
+                self.handle_learning_config_patch_post(config_patch_request, auth)
                 return
 
             learning_request = parse_learning_recommendation_api_path(path)
@@ -364,6 +383,25 @@ def start_dashboard(
                     self.record_audit(path, 200, "success", "learning recommendation marked applied", actor=actor, auth=auth)
                     self.send_json({"recommendation": updated, "draft": updated.get("draft")})
                     return
+                if action == "propose-config":
+                    if str(current.get("status") or "") != "accepted":
+                        raise ValueError("learning recommendation must be accepted before proposing config")
+                    draft = safe_body_dict(body.get("draft")) or current.get("draft") or build_learning_optimization_draft(current)
+                    if not current.get("draft"):
+                        current = storage.update_learning_recommendation_status(
+                            recommendation_id,
+                            "accepted",
+                            actor=actor,
+                            note=note,
+                            draft=draft,
+                        )
+                    patch = safe_body_dict(body.get("patch")) or build_config_patch_from_recommendation(
+                        {**current, "draft": draft}
+                    )
+                    config_patch = storage.save_learning_config_patch(recommendation_id, patch)
+                    self.record_audit(path, 200, "success", "learning config patch proposed", actor=actor, auth=auth)
+                    self.send_json({"recommendation": current, "config_patch": config_patch})
+                    return
             except ValueError as exc:
                 self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
                 self.send_json({"error": str(exc)}, status=400)
@@ -381,6 +419,90 @@ def start_dashboard(
                 auth=auth,
             )
             self.send_json({"error": f"unsupported learning recommendation operation: {action}"}, status=404)
+
+        def handle_learning_config_patch_post(
+            self,
+            patch_request: tuple[int, str],
+            auth: AuthResult,
+        ) -> None:
+            patch_id, action = patch_request
+            path = self.path.split("?", 1)[0]
+            actor = "api"
+            try:
+                body = self.read_json_body()
+                actor = self.actor_from_body(body, auth)
+                note = str(body.get("note") or body.get("reason") or "")
+                current = storage.get_learning_config_patch(patch_id)
+                if not current:
+                    raise ValueError(f"learning config patch not found: #{patch_id}")
+                if action == "approve":
+                    updated = storage.update_learning_config_patch_status(
+                        patch_id,
+                        "approved",
+                        actor=actor,
+                        note=note,
+                    )
+                    self.record_audit(path, 200, "success", "learning config patch approved", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+                if action == "reject":
+                    updated = storage.update_learning_config_patch_status(
+                        patch_id,
+                        "rejected",
+                        actor=actor,
+                        note=note,
+                    )
+                    self.record_audit(path, 200, "success", "learning config patch rejected", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+                if action == "apply":
+                    if str(current.get("status") or "") != "approved":
+                        raise ValueError(f"learning config patch cannot be applied from {current.get('status')}")
+                    if config is None or config.config_path is None:
+                        self.record_audit(path, 503, "error", "config path is not configured", actor=actor, auth=auth)
+                        self.send_json({"error": "config path is not configured"}, status=503)
+                        return
+                    apply_result = apply_config_patch(config.config_path, current.get("patch") or {})
+                    next_config = apply_result.pop("config", None)
+                    if isinstance(next_config, dict):
+                        config.raw.clear()
+                        config.raw.update(next_config)
+                    updated = storage.update_learning_config_patch_status(
+                        patch_id,
+                        "applied",
+                        actor=actor,
+                        note=note,
+                        apply_result=apply_result,
+                    )
+                    try:
+                        storage.update_learning_recommendation_status(
+                            int(current.get("recommendation_id") or 0),
+                            "applied",
+                            actor=actor,
+                            note=note,
+                        )
+                    except ValueError:
+                        pass
+                    self.record_audit(path, 200, "success", "learning config patch applied", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+            except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
+                return
+            self.record_audit(
+                path,
+                404,
+                "not_found",
+                f"unsupported learning config patch operation: {action}",
+                actor=actor,
+                auth=auth,
+            )
+            self.send_json({"error": f"unsupported learning config patch operation: {action}"}, status=404)
 
         def read_json_body(self) -> dict:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -529,6 +651,15 @@ def learning_filters_from_query(query: dict[str, list[str]]) -> dict:
         "category": query_text(query, "category"),
         "priority": query_text(query, "priority"),
         "trigger_type": query_text(query, "trigger_type"),
+    }
+
+
+def learning_config_patch_filters_from_query(query: dict[str, list[str]]) -> dict:
+    return {
+        "limit": query_limit(query, default=50, maximum=200),
+        "statuses": query_statuses(query),
+        "recommendation_id": query_optional_int(query, "recommendation_id"),
+        "patch_type": query_text(query, "patch_type"),
     }
 
 
@@ -905,7 +1036,25 @@ def parse_learning_recommendation_api_path(path: str) -> tuple[int, str] | None:
     return recommendation_id, action
 
 
+def parse_learning_config_patch_api_path(path: str) -> tuple[int, str] | None:
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 4 or parts[0] != "api" or parts[1] != "learning" or parts[2] != "config-patches":
+        return None
+    try:
+        patch_id = int(parts[3])
+    except ValueError:
+        return None
+    action = parts[4] if len(parts) >= 5 else ""
+    return patch_id, action
+
+
 def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
+    config_patch_request = parse_learning_config_patch_api_path(path)
+    if config_patch_request:
+        patch_id, action = config_patch_request
+        operation = f"learning.config_patch.{action or 'read'}"
+        return operation, "learning_config_patch", patch_id
+
     learning_request = parse_learning_recommendation_api_path(path)
     if learning_request:
         recommendation_id, action = learning_request
@@ -938,6 +1087,7 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/incidents": ("incident.list", "incident", None),
         "/api/incidents/escalated": ("incident.escalated", "incident", None),
         "/api/classifications/summary": ("classification.summary", "classification", None),
+        "/api/learning/config-patches": ("learning.config_patch.list", "learning_config_patch", None),
         "/api/learning/recommendations": ("learning.recommendation.list", "learning", None),
         "/api/learning/summary": ("learning.summary", "learning", None),
         "/api/recommendations": ("recommendation.list", "recommendation", None),

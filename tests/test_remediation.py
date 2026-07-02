@@ -131,6 +131,54 @@ class RemediationTest(unittest.TestCase):
             docker_actions[0].params["command"],
         )
 
+    def test_playbook_can_match_configured_classification_rule(self) -> None:
+        config = AppConfig(
+            raw={
+                "classification_rules": [
+                    {
+                        "name": "learned-custom-category",
+                        "enabled": True,
+                        "category": "custom_ai_failure",
+                        "confidence": 0.88,
+                        "match": {"sources": ["json_api"], "summary_contains": ["learned custom"]},
+                    }
+                ],
+                "remediation": {
+                    "enabled": True,
+                    "playbooks": [
+                        {
+                            "name": "custom ai failure triage",
+                            "match": {"categories": ["custom_ai_failure"]},
+                            "steps": [
+                                {
+                                    "id": "collect_custom",
+                                    "action_type": "run_diagnostic_command",
+                                    "title": "custom classifier matched",
+                                    "reason": "configured classifier category matched",
+                                    "params": {"command": "echo custom"},
+                                }
+                            ],
+                        }
+                    ],
+                    "policies": [
+                        {"action_type": "run_diagnostic_command", "targets": ["echo"], "enabled": True}
+                    ],
+                },
+            },
+            base_dir=Path("."),
+        )
+        issue = CheckResult(
+            source="json_api",
+            name="AI customer service",
+            status="warning",
+            summary="learned custom response issue",
+            details={"url": "https://agent.example.com/v1/chat"},
+        )
+
+        actions = build_remediation_plan([issue], config)
+
+        self.assertTrue(any(action.title == "custom classifier matched" for action in actions))
+
     def test_playbook_does_not_match_unrelated_issue(self) -> None:
         config = AppConfig(
             raw={

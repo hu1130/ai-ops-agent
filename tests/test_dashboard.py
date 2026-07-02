@@ -209,6 +209,86 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("expected temporary event", dismissed["recommendation"]["decision_note"])
         self.assertEqual([saved["id"]], [row["id"] for row in rows])
 
+    def test_learning_config_patch_api_approves_and_applies_to_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text('{"app":{"interval_seconds":60}}', encoding="utf-8")
+            config = AppConfig(raw={"app": {"interval_seconds": 60}}, base_dir=Path(tmp), config_path=config_path)
+            storage = Storage(Path(tmp) / "ops.db")
+            saved = storage.save_learning_recommendations(
+                [
+                    {
+                        "dedupe_key": "low_confidence:performance_degraded:prod:normal",
+                        "priority": "medium",
+                        "category": "performance_degraded",
+                        "trigger_type": "low_confidence",
+                        "title": "Improve classifier confidence",
+                        "reason": "low confidence",
+                        "recommended_action": "add rules",
+                        "evidence": ["incident #2: category=performance_degraded, summary=slow response"],
+                        "incident_ids": [2],
+                        "metrics": {"avg_confidence": 0.52},
+                    }
+                ]
+            )[0]
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/learning/recommendations/{saved['id']}/accept",
+                    data=b'{"actor":"tester","note":"make it configurable"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5):
+                    pass
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/learning/recommendations/{saved['id']}/propose-config",
+                    data=b'{"actor":"tester","note":"create patch"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    proposed = json.loads(response.read().decode("utf-8"))
+                patch_id = proposed["config_patch"]["id"]
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/learning/config-patches?status=proposed",
+                    timeout=5,
+                ) as response:
+                    proposed_rows = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/learning/config-patches/{patch_id}/approve",
+                    data=b'{"actor":"tester","note":"reviewed"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    approved = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/learning/config-patches/{patch_id}/apply",
+                    data=b'{"actor":"tester","note":"apply patch"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    applied = json.loads(response.read().decode("utf-8"))
+                current_recommendation = storage.get_learning_recommendation(saved["id"])
+                audit = storage.latest_api_audit_logs(1)[0]
+                config_text = config_path.read_text(encoding="utf-8")
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual([patch_id], [row["id"] for row in proposed_rows])
+        self.assertEqual("approved", approved["status"])
+        self.assertEqual("applied", applied["status"])
+        self.assertEqual("applied", current_recommendation["status"])
+        self.assertIn("classification_rules", config_text)
+        self.assertIn("learned-classifier", config_text)
+        self.assertIn("classification_rules", config.raw)
+        self.assertEqual("learning.config_patch.apply", audit["operation"])
+
     def test_render_page_contains_event_center_and_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

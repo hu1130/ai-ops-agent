@@ -31,7 +31,10 @@ class IncidentClassification:
         return CATEGORY_LABELS.get(self.category, self.category)
 
 
-def classify_incident(results: list[CheckResult]) -> IncidentClassification:
+def classify_incident(
+    results: list[CheckResult],
+    classification_rules: list[dict[str, Any]] | None = None,
+) -> IncidentClassification:
     problems = [result for result in results if result.is_problem]
     if not problems:
         return IncidentClassification(
@@ -42,14 +45,20 @@ def classify_incident(results: list[CheckResult]) -> IncidentClassification:
             next_steps=["继续观察下一轮巡检结果。"],
         )
 
-    signal_classifications = [classify_signal(result) for result in problems]
+    signal_classifications = [classify_signal(result, classification_rules) for result in problems]
     correlated = correlate_signals(problems, signal_classifications)
     if correlated:
         return correlated
     return max(signal_classifications, key=lambda item: item.confidence)
 
 
-def classify_signal(result: CheckResult) -> IncidentClassification:
+def classify_signal(
+    result: CheckResult,
+    classification_rules: list[dict[str, Any]] | None = None,
+) -> IncidentClassification:
+    configured = classify_by_configured_rules(result, classification_rules)
+    if configured:
+        return configured
     if result.source == "http":
         return classify_http(result)
     if result.source in {"json", "json_api"}:
@@ -59,6 +68,34 @@ def classify_signal(result: CheckResult) -> IncidentClassification:
     if result.source == "server":
         return classify_server(result)
     return unknown_classification(result)
+
+
+def classify_by_configured_rules(
+    result: CheckResult,
+    classification_rules: list[dict[str, Any]] | None,
+) -> IncidentClassification | None:
+    for rule in classification_rules or []:
+        if not isinstance(rule, dict) or not bool(rule.get("enabled", True)):
+            continue
+        match = rule.get("match", {})
+        if not isinstance(match, dict) or not configured_rule_matches(result, match):
+            continue
+        category = str(rule.get("category") or "unknown").strip() or "unknown"
+        confidence = bounded_float(rule.get("confidence"), default=0.75)
+        summary = str(rule.get("summary") or f"Matched configured classifier rule: {rule.get('name') or category}")
+        next_steps = safe_list(rule.get("next_steps")) or [
+            "Review the matched configured classification rule and related signal evidence."
+        ]
+        evidence = [f"configured_rule={rule.get('name') or category}"]
+        evidence.extend(base_evidence(result))
+        return IncidentClassification(
+            category=category,
+            confidence=confidence,
+            summary=summary,
+            evidence=[str(item) for item in evidence],
+            next_steps=[str(item) for item in next_steps],
+        )
+    return None
 
 
 def classify_http(result: CheckResult) -> IncidentClassification:
@@ -375,6 +412,62 @@ def latency_too_high(details: dict[str, Any]) -> bool:
     latency = int_or_none(details.get("latency_ms"))
     threshold = int_or_none(details.get("max_latency_ms"))
     return latency is not None and threshold is not None and latency > threshold
+
+
+def configured_rule_matches(result: CheckResult, match: dict[str, Any]) -> bool:
+    if not exact_list_matches(result.source, match.get("sources")):
+        return False
+    if not exact_list_matches(result.status, match.get("statuses")):
+        return False
+    if not status_code_matches(result.details.get("status_code"), match.get("status_codes")):
+        return False
+    if not contains_any(result.name, match.get("name_contains")):
+        return False
+    if not contains_any(result.summary, match.get("summary_contains")):
+        return False
+    if not contains_any(str(result.details.get("url", "")), match.get("url_contains")):
+        return False
+    if not contains_any(str(result.details.get("path", "")), match.get("path_contains")):
+        return False
+    return True
+
+
+def exact_list_matches(value: str, candidates: object) -> bool:
+    if not candidates:
+        return True
+    if not isinstance(candidates, list):
+        return False
+    normalized = {str(item).strip() for item in candidates if str(item).strip()}
+    return "*" in normalized or value in normalized
+
+
+def contains_any(value: str, candidates: object) -> bool:
+    if not candidates:
+        return True
+    if not isinstance(candidates, list):
+        return False
+    text = value.casefold()
+    return any(str(item).strip().casefold() in text for item in candidates if str(item).strip())
+
+
+def status_code_matches(value: object, candidates: object) -> bool:
+    if not candidates:
+        return True
+    if not isinstance(candidates, list):
+        return False
+    status_code = int_or_none(value)
+    if status_code is None:
+        return False
+    normalized = {int_or_none(item) for item in candidates}
+    return status_code in normalized
+
+
+def bounded_float(value: object, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return min(max(parsed, 0.0), 1.0)
 
 
 def safe_dict(value: Any) -> dict[str, Any]:

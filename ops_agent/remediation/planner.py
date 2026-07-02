@@ -17,12 +17,13 @@ def build_remediation_plan(results: list[CheckResult], config: AppConfig) -> lis
         return []
 
     configured_actions = configured_auto_actions(remediation)
+    classification_rules = config.classification_rules
     actions: list[RemediationAction] = []
     for result in results:
         if not result.is_problem:
             continue
-        actions.extend(build_playbook_actions(result, remediation, configured_actions))
-        actions.extend(plan_for_result(result, configured_actions))
+        actions.extend(build_playbook_actions(result, remediation, configured_actions, classification_rules))
+        actions.extend(plan_for_result(result, configured_actions, classification_rules))
     planned: list[RemediationAction] = []
     for action in dedupe_actions(actions):
         decision = decide_action_policy(action, config)
@@ -32,9 +33,13 @@ def build_remediation_plan(results: list[CheckResult], config: AppConfig) -> lis
     return planned
 
 
-def plan_for_result(result: CheckResult, configured_actions: dict[str, bool]) -> list[RemediationAction]:
+def plan_for_result(
+    result: CheckResult,
+    configured_actions: dict[str, bool],
+    classification_rules: list[dict] | None = None,
+) -> list[RemediationAction]:
     actions: list[RemediationAction] = []
-    category = classify_signal(result).category
+    category = classify_signal(result, classification_rules).category
 
     if result.source in {"http", "json_api"}:
         url = str(result.details.get("url", ""))

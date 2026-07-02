@@ -18,14 +18,15 @@ def build_playbook_actions(
     result: CheckResult,
     remediation: dict[str, Any],
     configured_actions: dict[str, bool],
+    classification_rules: list[dict[str, Any]] | None = None,
 ) -> list[RemediationAction]:
     actions: list[RemediationAction] = []
     for playbook in remediation_playbooks(remediation):
         if not bool(playbook.get("enabled", True)):
             continue
-        if not playbook_matches(result, dict(playbook.get("match", {}))):
+        if not playbook_matches(result, dict(playbook.get("match", {})), classification_rules):
             continue
-        actions.extend(actions_from_playbook(result, playbook, configured_actions))
+        actions.extend(actions_from_playbook(result, playbook, configured_actions, classification_rules))
     return actions
 
 
@@ -36,10 +37,14 @@ def remediation_playbooks(remediation: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in playbooks if isinstance(item, dict)]
 
 
-def playbook_matches(result: CheckResult, match: dict[str, Any]) -> bool:
+def playbook_matches(
+    result: CheckResult,
+    match: dict[str, Any],
+    classification_rules: list[dict[str, Any]] | None = None,
+) -> bool:
     if not match:
         return True
-    classification = classify_signal(result)
+    classification = classify_signal(result, classification_rules)
     if not exact_list_matches(result.source, match.get("sources")):
         return False
     if not exact_list_matches(result.status, match.get("statuses")):
@@ -79,6 +84,7 @@ def actions_from_playbook(
     result: CheckResult,
     playbook: dict[str, Any],
     configured_actions: dict[str, bool],
+    classification_rules: list[dict[str, Any]] | None = None,
 ) -> list[RemediationAction]:
     steps = playbook.get("steps", [])
     if not isinstance(steps, list):
@@ -92,6 +98,7 @@ def actions_from_playbook(
             playbook,
             playbook.get("rollback_steps", []),
             configured_actions,
+            classification_rules,
             default_on_failure="continue",
             default_stage="rollback",
             rollback_for="playbook",
@@ -102,6 +109,7 @@ def actions_from_playbook(
         playbook,
         steps,
         configured_actions,
+        classification_rules,
         default_on_failure=default_on_failure,
         default_stage="diagnose",
         rollback_actions=rollback_actions,
@@ -113,6 +121,7 @@ def actions_from_steps(
     playbook: dict[str, Any],
     steps: object,
     configured_actions: dict[str, bool],
+    classification_rules: list[dict[str, Any]] | None,
     default_on_failure: str,
     default_stage: str,
     rollback_actions: list[dict[str, Any]] | None = None,
@@ -121,7 +130,7 @@ def actions_from_steps(
     if not isinstance(steps, list):
         return []
 
-    context = template_context(result)
+    context = template_context(result, classification_rules)
     playbook_name = str(playbook.get("name") or "playbook")
     actions: list[RemediationAction] = []
     for index, step in enumerate(steps, start=1):
@@ -193,10 +202,13 @@ def normalize_choice(value: str, allowed: set[str], default: str) -> str:
     return normalized if normalized in allowed else default
 
 
-def template_context(result: CheckResult) -> dict[str, Any]:
+def template_context(
+    result: CheckResult,
+    classification_rules: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     url = str(result.details.get("url", ""))
     host, port = host_port_from_url(url)
-    classification = classify_signal(result)
+    classification = classify_signal(result, classification_rules)
     context: dict[str, Any] = {
         "source": result.source,
         "name": result.name,

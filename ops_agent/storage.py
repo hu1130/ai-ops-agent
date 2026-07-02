@@ -181,10 +181,31 @@ class Storage:
                     draft_json text not null default '{}'
                 );
 
+                create table if not exists learning_config_patches (
+                    id integer primary key autoincrement,
+                    created_at text not null,
+                    updated_at text,
+                    recommendation_id integer not null,
+                    status text not null default 'proposed',
+                    patch_type text not null default '',
+                    title text not null,
+                    reason text not null,
+                    patch_json text not null default '{}',
+                    decision_by text,
+                    decision_at text,
+                    decision_note text,
+                    applied_at text,
+                    apply_result_json text not null default '{}'
+                );
+
                 create index if not exists idx_incident_recommendations_incident
                     on incident_recommendations (incident_id, position, id);
                 create unique index if not exists idx_learning_recommendations_dedupe
                     on learning_recommendations (dedupe_key);
+                create index if not exists idx_learning_config_patches_status
+                    on learning_config_patches (status, updated_at, id);
+                create index if not exists idx_learning_config_patches_recommendation
+                    on learning_config_patches (recommendation_id, id);
                 """
             )
             self.ensure_context_columns()
@@ -193,6 +214,7 @@ class Storage:
             self.ensure_action_log_columns()
             self.ensure_recommendation_columns()
             self.ensure_learning_recommendation_columns()
+            self.ensure_learning_config_patch_columns()
             self.connection.commit()
 
     def ensure_context_columns(self) -> None:
@@ -355,6 +377,29 @@ class Storage:
             "decision_note": "alter table learning_recommendations add column decision_note text",
             "applied_at": "alter table learning_recommendations add column applied_at text",
             "draft_json": "alter table learning_recommendations add column draft_json text not null default '{}'",
+        }
+        for column, statement in additions.items():
+            if column not in columns:
+                self.connection.execute(statement)
+
+    def ensure_learning_config_patch_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("pragma table_info(learning_config_patches)").fetchall()
+        }
+        additions = {
+            "updated_at": "alter table learning_config_patches add column updated_at text",
+            "recommendation_id": "alter table learning_config_patches add column recommendation_id integer not null default 0",
+            "status": "alter table learning_config_patches add column status text not null default 'proposed'",
+            "patch_type": "alter table learning_config_patches add column patch_type text not null default ''",
+            "title": "alter table learning_config_patches add column title text not null default ''",
+            "reason": "alter table learning_config_patches add column reason text not null default ''",
+            "patch_json": "alter table learning_config_patches add column patch_json text not null default '{}'",
+            "decision_by": "alter table learning_config_patches add column decision_by text",
+            "decision_at": "alter table learning_config_patches add column decision_at text",
+            "decision_note": "alter table learning_config_patches add column decision_note text",
+            "applied_at": "alter table learning_config_patches add column applied_at text",
+            "apply_result_json": "alter table learning_config_patches add column apply_result_json text not null default '{}'",
         }
         for column, statement in additions.items():
             if column not in columns:
@@ -1056,6 +1101,180 @@ class Storage:
                 (recommendation_id,),
             ).fetchone()
         return learning_recommendation_payload(updated)
+
+    def save_learning_config_patch(self, recommendation_id: int, patch: dict) -> dict:
+        payload = normalize_learning_config_patch(patch)
+        if recommendation_id <= 0:
+            raise ValueError("recommendation_id must be positive")
+        if not payload["patch_type"]:
+            raise ValueError("learning config patch type is required")
+        now = utc_now_iso()
+        with self.lock:
+            existing = self.connection.execute(
+                """
+                select * from learning_config_patches
+                where recommendation_id = ?
+                  and patch_type = ?
+                  and status in ('proposed', 'approved')
+                order by id desc
+                limit 1
+                """,
+                (recommendation_id, payload["patch_type"]),
+            ).fetchone()
+            if existing:
+                self.connection.execute(
+                    """
+                    update learning_config_patches
+                    set updated_at = ?,
+                        title = ?,
+                        reason = ?,
+                        patch_json = ?
+                    where id = ?
+                    """,
+                    (
+                        now,
+                        payload["title"],
+                        payload["reason"],
+                        json.dumps(payload["patch"], ensure_ascii=False),
+                        existing["id"],
+                    ),
+                )
+                row_id = int(existing["id"])
+            else:
+                cursor = self.connection.execute(
+                    """
+                    insert into learning_config_patches (
+                        created_at, updated_at, recommendation_id, status, patch_type,
+                        title, reason, patch_json, apply_result_json
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        now,
+                        now,
+                        recommendation_id,
+                        "proposed",
+                        payload["patch_type"],
+                        payload["title"],
+                        payload["reason"],
+                        json.dumps(payload["patch"], ensure_ascii=False),
+                        "{}",
+                    ),
+                )
+                row_id = int(cursor.lastrowid)
+            self.connection.commit()
+            row = self.connection.execute(
+                "select * from learning_config_patches where id = ?",
+                (row_id,),
+            ).fetchone()
+        return learning_config_patch_payload(row)
+
+    def latest_learning_config_patches(
+        self,
+        limit: int = 50,
+        statuses: Sequence[str] | None = None,
+        recommendation_id: int | None = None,
+        patch_type: str = "",
+    ) -> list[dict]:
+        with self.lock:
+            where: list[str] = []
+            params: list[object] = []
+            cleaned_statuses = [status for status in (statuses or []) if status]
+            if cleaned_statuses:
+                where.append(f"status in ({','.join('?' for _ in cleaned_statuses)})")
+                params.extend(cleaned_statuses)
+            if recommendation_id:
+                where.append("recommendation_id = ?")
+                params.append(recommendation_id)
+            if patch_type:
+                where.append("patch_type = ?")
+                params.append(patch_type)
+            where_sql = f"where {' and '.join(where)}" if where else ""
+            rows = self.connection.execute(
+                f"""
+                select * from learning_config_patches
+                {where_sql}
+                order by
+                    case status when 'proposed' then 0 when 'approved' then 1 when 'applied' then 2 else 3 end,
+                    updated_at desc,
+                    id desc
+                limit ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [learning_config_patch_payload(row) for row in rows]
+
+    def get_learning_config_patch(self, patch_id: int) -> dict | None:
+        with self.lock:
+            row = self.connection.execute(
+                """
+                select * from learning_config_patches
+                where id = ?
+                """,
+                (patch_id,),
+            ).fetchone()
+        return learning_config_patch_payload(row) if row else None
+
+    def update_learning_config_patch_status(
+        self,
+        patch_id: int,
+        status: str,
+        actor: str = "",
+        note: str = "",
+        apply_result: dict | None = None,
+    ) -> dict:
+        allowed_statuses = {"proposed", "approved", "rejected", "applied"}
+        normalized_status = (status or "").strip().lower()
+        if normalized_status not in allowed_statuses:
+            raise ValueError(f"unsupported learning config patch status: {status}")
+        now = utc_now_iso()
+        actor_value = actor.strip()
+        note_value = note.strip()
+        with self.lock:
+            row = self.connection.execute(
+                "select * from learning_config_patches where id = ?",
+                (patch_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"learning config patch not found: #{patch_id}")
+            current_status = str(row["status"] or "proposed")
+            if current_status in {"rejected", "applied"} and current_status != normalized_status:
+                raise ValueError(f"learning config patch already {current_status}: #{patch_id}")
+            if normalized_status == "approved" and current_status not in {"proposed", "approved"}:
+                raise ValueError(f"learning config patch cannot be approved from {current_status}: #{patch_id}")
+            if normalized_status == "applied" and current_status not in {"approved", "applied"}:
+                raise ValueError(f"learning config patch cannot be applied from {current_status}: #{patch_id}")
+            existing_result = parse_json_object(str(row["apply_result_json"] or "{}"))
+            result_payload = safe_dict(apply_result) or existing_result
+            self.connection.execute(
+                """
+                update learning_config_patches
+                set updated_at = ?,
+                    status = ?,
+                    decision_by = coalesce(nullif(?, ''), decision_by),
+                    decision_at = coalesce(?, decision_at),
+                    decision_note = coalesce(nullif(?, ''), decision_note),
+                    applied_at = coalesce(?, applied_at),
+                    apply_result_json = ?
+                where id = ?
+                """,
+                (
+                    now,
+                    normalized_status,
+                    actor_value,
+                    now if actor_value or note_value or normalized_status in {"approved", "rejected", "applied"} else None,
+                    note_value,
+                    now if normalized_status == "applied" else None,
+                    json.dumps(result_payload, ensure_ascii=False),
+                    patch_id,
+                ),
+            )
+            self.connection.commit()
+            updated = self.connection.execute(
+                "select * from learning_config_patches where id = ?",
+                (patch_id,),
+            ).fetchone()
+        return learning_config_patch_payload(updated)
 
     def learning_summary(self, limit: int = 500) -> dict:
         rows = self.latest_learning_recommendations(limit=limit)
@@ -1942,6 +2161,13 @@ def learning_recommendation_payload(row: sqlite3.Row) -> dict:
     return payload
 
 
+def learning_config_patch_payload(row: sqlite3.Row) -> dict:
+    payload = dict(row)
+    payload["patch"] = parse_json_object(str(payload.get("patch_json") or "{}"))
+    payload["apply_result"] = parse_json_object(str(payload.get("apply_result_json") or "{}"))
+    return payload
+
+
 def parse_json_object(value: str) -> dict:
     try:
         parsed = json.loads(value)
@@ -1983,6 +2209,16 @@ def normalize_learning_recommendation(value: dict | None) -> dict:
         "incident_ids": [safe_int(value) for value in safe_list(payload.get("incident_ids")) if safe_int(value) > 0],
         "metrics": safe_dict(payload.get("metrics")),
         "source": str(payload.get("source") or "classification_learning"),
+    }
+
+
+def normalize_learning_config_patch(value: dict | None) -> dict:
+    payload = safe_dict(value)
+    return {
+        "patch_type": str(payload.get("patch_type") or ""),
+        "title": str(payload.get("title") or ""),
+        "reason": str(payload.get("reason") or ""),
+        "patch": payload,
     }
 
 

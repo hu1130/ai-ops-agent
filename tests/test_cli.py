@@ -185,6 +185,55 @@ class CliTest(unittest.TestCase):
         )
         self.assertEqual([], validate_config(config))
 
+    def test_validate_config_accepts_classification_rules(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60},
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+                "classification_rules": [
+                    {
+                        "name": "learned slow response",
+                        "enabled": True,
+                        "category": "performance_degraded",
+                        "confidence": 0.8,
+                        "match": {
+                            "sources": ["json_api"],
+                            "statuses": ["warning"],
+                            "status_codes": [200],
+                            "summary_contains": ["slow response"],
+                        },
+                        "next_steps": ["check latency"],
+                    }
+                ],
+            },
+            base_dir=Path("."),
+        )
+        self.assertEqual([], validate_config(config))
+
+    def test_validate_config_reports_bad_classification_rules(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60},
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+                "classification_rules": [
+                    {
+                        "enabled": "yes",
+                        "confidence": 2,
+                        "match": {"sources": "json_api", "status_codes": ["bad"]},
+                        "next_steps": "check",
+                    }
+                ],
+            },
+            base_dir=Path("."),
+        )
+        errors = validate_config(config)
+        self.assertTrue(any("classification_rules[0].enabled" in error for error in errors))
+        self.assertTrue(any("classification_rules[0].category" in error for error in errors))
+        self.assertTrue(any("classification_rules[0].confidence" in error for error in errors))
+        self.assertTrue(any("classification_rules[0].match.sources" in error for error in errors))
+        self.assertTrue(any("classification_rules[0].match.status_codes" in error for error in errors))
+        self.assertTrue(any("classification_rules[0].next_steps" in error for error in errors))
+
     def test_validate_config_reports_bad_remediation_playbook(self) -> None:
         config = AppConfig(
             raw={

@@ -73,6 +73,35 @@ class IncidentClassifierTest(unittest.TestCase):
 
         self.assertEqual(classification.category, "synthetic_quality_fail")
 
+    def test_configured_classification_rule_overrides_builtin_rules(self) -> None:
+        result = CheckResult(
+            source="json_api",
+            name="Synthetic chat",
+            status="warning",
+            summary="Repeated learned timeout token",
+            details={"url": "https://example.com/v1/chat", "status_code": 200},
+        )
+        rules = [
+            {
+                "name": "learned-timeout-token",
+                "enabled": True,
+                "category": "dependency_failure",
+                "confidence": 0.91,
+                "summary": "Configured learned rule matched.",
+                "match": {
+                    "sources": ["json_api"],
+                    "statuses": ["warning"],
+                    "summary_contains": ["learned timeout"],
+                },
+            }
+        ]
+
+        classification = classify_incident([result], rules)
+
+        self.assertEqual("dependency_failure", classification.category)
+        self.assertEqual(0.91, classification.confidence)
+        self.assertTrue(any("configured_rule=learned-timeout-token" in item for item in classification.evidence))
+
     def test_format_includes_evidence_chain(self) -> None:
         result = CheckResult(source="log", name="App log", status="warning", summary="Found 2 suspicious log lines")
         text = format_incident_classification(classify_incident([result]))

@@ -8,12 +8,16 @@ from ops_agent.ai.classifier import classify_incident, format_incident_classific
 from ops_agent.events import CheckResult
 
 
-def analyze_incident(results: list[CheckResult], ai_config: dict) -> str:
+def analyze_incident(
+    results: list[CheckResult],
+    ai_config: dict,
+    classification_rules: list[dict] | None = None,
+) -> str:
     problems = [result for result in results if result.is_problem]
     if not problems:
         return "本轮巡检未发现异常。"
 
-    classification_text = format_incident_classification(classify_incident(problems))
+    classification_text = format_incident_classification(classify_incident(problems, classification_rules))
 
     if ai_config.get("enabled", True) and os.getenv("OPENAI_API_KEY"):
         try:

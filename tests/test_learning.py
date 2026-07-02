@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from ops_agent.ai.config_patches import apply_config_patch, build_config_patch_from_recommendation
 from ops_agent.ai.learning import build_learning_recommendations
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig
@@ -120,6 +121,68 @@ class LearningOptimizationTest(unittest.TestCase):
         self.assertEqual("classifier_rule", updated["draft"]["draft_type"])
         self.assertEqual("accepted", repeated["status"])
         self.assertEqual(2, repeated["seen_count"])
+
+    def test_config_patch_generation_and_apply_updates_json_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text('{"app":{"interval_seconds":60}}', encoding="utf-8")
+            recommendation = {
+                "id": 7,
+                "dedupe_key": "low_confidence:performance_degraded:prod:normal",
+                "category": "performance_degraded",
+                "trigger_type": "low_confidence",
+                "title": "Improve classifier confidence",
+                "reason": "low confidence",
+                "draft": {
+                    "draft_type": "classifier_rule",
+                    "candidate": {
+                        "category": "performance_degraded",
+                        "conditions": {"summary_keywords": ["slow", "response"]},
+                        "confidence_floor": 0.8,
+                    },
+                },
+            }
+            patch = build_config_patch_from_recommendation(recommendation)
+            result = apply_config_patch(config_path, patch)
+            updated_text = config_path.read_text(encoding="utf-8")
+
+        self.assertEqual("classification_rule", patch["patch_type"])
+        self.assertEqual(1, result["operation_count"])
+        self.assertIn("classification_rules", updated_text)
+        self.assertIn("learned-classifier", updated_text)
+
+    def test_storage_tracks_learning_config_patch_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            patch = {
+                "patch_type": "classification_rule",
+                "title": "Add rule",
+                "reason": "learned",
+                "operations": [
+                    {
+                        "op": "append_unique",
+                        "path": ["classification_rules"],
+                        "identity_key": "name",
+                        "value": {"name": "learned-rule", "category": "performance_degraded"},
+                    }
+                ],
+            }
+            saved = storage.save_learning_config_patch(3, patch)
+            approved = storage.update_learning_config_patch_status(saved["id"], "approved", actor="tester")
+            applied = storage.update_learning_config_patch_status(
+                saved["id"],
+                "applied",
+                actor="tester",
+                apply_result={"operation_count": 1},
+            )
+            rows = storage.latest_learning_config_patches(statuses=["applied"])
+            storage.close()
+
+        self.assertEqual("proposed", saved["status"])
+        self.assertEqual("approved", approved["status"])
+        self.assertEqual("applied", applied["status"])
+        self.assertEqual({"operation_count": 1}, applied["apply_result"])
+        self.assertEqual([saved["id"]], [row["id"] for row in rows])
 
     def test_scheduler_generates_learning_recommendations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
