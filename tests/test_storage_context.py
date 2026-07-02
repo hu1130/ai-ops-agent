@@ -96,9 +96,16 @@ class StorageContextTest(unittest.TestCase):
             learning_config_patches_exists = storage.connection.execute(
                 "select name from sqlite_master where type = 'table' and name = 'learning_config_patches'"
             ).fetchone()
+            notification_logs_exists = storage.connection.execute(
+                "select name from sqlite_master where type = 'table' and name = 'notification_logs'"
+            ).fetchone()
             learning_columns = [
                 row["name"]
                 for row in storage.connection.execute("pragma table_info(learning_recommendations)").fetchall()
+            ]
+            notification_columns = [
+                row["name"]
+                for row in storage.connection.execute("pragma table_info(notification_logs)").fetchall()
             ]
             storage.close()
 
@@ -113,8 +120,11 @@ class StorageContextTest(unittest.TestCase):
         self.assertIsNotNone(audit_logs_exists)
         self.assertIsNotNone(learning_recommendations_exists)
         self.assertIsNotNone(learning_config_patches_exists)
+        self.assertIsNotNone(notification_logs_exists)
         self.assertIn("decision_by", learning_columns)
         self.assertIn("draft_json", learning_columns)
+        self.assertIn("dedupe_key", notification_columns)
+        self.assertIn("suppressed_reason", notification_columns)
 
 
 if __name__ == "__main__":

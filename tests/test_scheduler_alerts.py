@@ -196,12 +196,17 @@ class SchedulerAlertsTest(unittest.TestCase):
             scheduler.process_alert_states(
                 [CheckResult(source="http", name="Site", status="critical", summary="Request failed")]
             )
+            logs = storage.latest_notification_logs()
             storage.close()
 
         self.assertEqual(1, len(notifier.sent))
         self.assertIn("Alert routing:", notifier.sent[0][1])
         self.assertIn("- routes: site-owner", notifier.sent[0][1])
         self.assertEqual("http:Site:critical|route:site-owner:email", notifier.sent[0][2])
+        self.assertEqual(1, len(logs))
+        self.assertEqual("sent", logs[0]["status"])
+        self.assertEqual(["site-owner"], json.loads(logs[0]["route_names_json"]))
+        self.assertEqual(["email"], json.loads(logs[0]["channels_json"]))
 
     def test_silence_window_suppresses_notification_but_saves_incident(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,11 +237,15 @@ class SchedulerAlertsTest(unittest.TestCase):
                 [CheckResult(source="http", name="Site", status="warning", summary="Slow response")]
             )
             incidents = storage.latest_incidents(1)
+            logs = storage.latest_notification_logs()
             storage.close()
 
         self.assertEqual(0, len(notifier.sent))
         self.assertEqual(1, len(incidents))
         self.assertEqual("open", incidents[0]["status"])
+        self.assertEqual(1, len(logs))
+        self.assertEqual("suppressed", logs[0]["status"])
+        self.assertIn("all-day-warning", logs[0]["suppressed_reason"])
 
     def test_repeated_problem_sends_reminder_after_repeat_interval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -121,6 +121,9 @@ def start_dashboard(
             if path == "/api/action-logs":
                 self.send_json(storage.latest_action_logs())
                 return
+            if path == "/api/notification-logs":
+                self.send_json(storage.latest_notification_logs())
+                return
             if path == "/api/audit-logs":
                 self.send_json(storage.latest_api_audit_logs())
                 return
@@ -1099,6 +1102,7 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
     mapping = {
         "/api/audit-logs": ("audit.list", "audit", None),
         "/api/action-logs": ("action.list", "action", None),
+        "/api/notification-logs": ("notification.list", "notification", None),
         "/api/actions/failed": ("action.failed", "action", None),
         "/api/actions/pending": ("action.pending", "action", None),
         "/api/incidents": ("incident.list", "incident", None),

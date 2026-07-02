@@ -14,6 +14,7 @@ class RetentionResult:
     deleted_incidents: int = 0
     deleted_action_logs: int = 0
     deleted_api_audit_logs: int = 0
+    deleted_notification_logs: int = 0
     vacuumed: bool = False
     dry_run: bool = True
 
@@ -24,6 +25,7 @@ class RetentionResult:
             + self.deleted_incidents
             + self.deleted_action_logs
             + self.deleted_api_audit_logs
+            + self.deleted_notification_logs
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -33,6 +35,7 @@ class RetentionResult:
             "deleted_incidents": self.deleted_incidents,
             "deleted_action_logs": self.deleted_action_logs,
             "deleted_api_audit_logs": self.deleted_api_audit_logs,
+            "deleted_notification_logs": self.deleted_notification_logs,
             "total_deleted": self.total_deleted,
             "vacuumed": self.vacuumed,
             "dry_run": self.dry_run,
@@ -49,6 +52,7 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
     incident_cutoff = cutoff(now, int(config.get("incidents_days", 90)))
     action_cutoff = cutoff(now, int(config.get("action_logs_days", 90)))
     api_audit_cutoff = cutoff(now, int(config.get("api_audit_logs_days", 180)))
+    notification_cutoff = cutoff(now, int(config.get("notification_logs_days", config.get("api_audit_logs_days", 180))))
     configured_problem_days = int(config.get("problem_results_days", max(90, check_days)))
     keep_problem_days = max(check_days, configured_problem_days)
     problem_cutoff = cutoff(now, keep_problem_days)
@@ -56,6 +60,7 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
     test_incidents_days = int(config.get("test_incidents_days", max(7, test_results_days)))
     test_action_logs_days = int(config.get("test_action_logs_days", max(7, test_results_days)))
     test_api_audit_logs_days = int(config.get("test_api_audit_logs_days", max(7, test_results_days)))
+    test_notification_logs_days = int(config.get("test_notification_logs_days", test_api_audit_logs_days))
     auto_close_enabled = bool(config.get("auto_close_resolved_incidents", True))
     auto_close_cutoff = cutoff(now, int(config.get("auto_close_resolved_after_days", 7)))
     test_auto_close_cutoff = cutoff(now, int(config.get("test_auto_close_resolved_after_days", 1)))
@@ -63,6 +68,7 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
     test_incident_cutoff = cutoff(now, test_incidents_days)
     test_action_cutoff = cutoff(now, test_action_logs_days)
     test_api_audit_cutoff = cutoff(now, test_api_audit_logs_days)
+    test_notification_cutoff = cutoff(now, test_notification_logs_days)
     test_environments = string_list(config.get("test_environments", ["test"]))
     test_run_types = string_list(config.get("test_run_types", ["manual_test", "synthetic_test"]))
 
@@ -79,6 +85,8 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
             test_run_types,
             api_audit_cutoff=api_audit_cutoff,
             test_api_audit_cutoff=test_api_audit_cutoff,
+            notification_cutoff=notification_cutoff,
+            test_notification_cutoff=test_notification_cutoff,
         )
         closed_incidents = 0
         if auto_close_enabled:
@@ -96,6 +104,7 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
             deleted_incidents=counts["incidents"],
             deleted_action_logs=counts["action_logs"],
             deleted_api_audit_logs=counts["api_audit_logs"],
+            deleted_notification_logs=counts["notification_logs"],
             dry_run=True,
         )
 
@@ -121,6 +130,8 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
         test_run_types,
         api_audit_cutoff=api_audit_cutoff,
         test_api_audit_cutoff=test_api_audit_cutoff,
+        notification_cutoff=notification_cutoff,
+        test_notification_cutoff=test_notification_cutoff,
     )
     vacuumed = bool(config.get("vacuum", False)) and sum(deleted.values()) > 0
     if vacuumed:
@@ -131,6 +142,7 @@ def run_retention_cleanup(storage: Storage, config: dict[str, Any], dry_run: boo
         deleted_incidents=deleted["incidents"],
         deleted_action_logs=deleted["action_logs"],
         deleted_api_audit_logs=deleted["api_audit_logs"],
+        deleted_notification_logs=deleted["notification_logs"],
         vacuumed=vacuumed,
         dry_run=False,
     )
@@ -157,6 +169,7 @@ def format_retention_result(result: RetentionResult) -> str:
         f"- incidents: {result.deleted_incidents}\n"
         f"- action_logs: {result.deleted_action_logs}\n"
         f"- api_audit_logs: {result.deleted_api_audit_logs}\n"
+        f"- notification_logs: {result.deleted_notification_logs}\n"
         f"- total: {result.total_deleted}\n"
         f"- vacuumed: {result.vacuumed}"
     )

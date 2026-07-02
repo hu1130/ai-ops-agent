@@ -512,6 +512,7 @@ GET  /api/incidents/1/events
 GET  /api/incidents/1/recommendations
 GET  /api/incidents/1/actions
 GET  /api/incidents/1/failed-actions
+GET  /api/notification-logs
 GET  /api/classifications/summary?hours=24
 GET  /api/learning/recommendations
 GET  /api/learning/recommendations/1
@@ -539,7 +540,7 @@ POST /api/incidents/1/close
 POST /api/incidents/1/transition
 ```
 
-`GET /api/incidents/1/detail` 会一次返回事件本体、事件流、结构化处置建议、关联动作、失败动作和摘要字段，方便后续前端直接展示处理闭环和升级原因。结构化建议也可以通过 `GET /api/incidents/1/recommendations` 单独读取，字段包括动作类型、风险、是否需要人工确认、是否需要执行后验证、当前状态、参数和策略/playbook 元信息。
+`GET /api/incidents/1/detail` 会一次返回事件本体、事件流、结构化处置建议、关联动作、失败动作、通知日志和摘要字段，方便后续前端直接展示处理闭环和升级原因。结构化建议也可以通过 `GET /api/incidents/1/recommendations` 单独读取，字段包括动作类型、风险、是否需要人工确认、是否需要执行后验证、当前状态、参数和策略/playbook 元信息。
 
 推荐项状态机通过 `POST /api/recommendations/1/*` 操作：`request-approval` 会创建并绑定待确认动作；`approve` 会复用动作审批执行链路，写回执行和验证结果；`reject` 会拒绝推荐项及其待确认动作。
 
@@ -585,6 +586,7 @@ Authorization: Bearer replace-with-operator-token
 
 ```text
 GET  /api/action-logs
+GET  /api/notification-logs
 GET  /api/audit-logs
 GET  /api/actions/pending
 GET  /api/actions/failed

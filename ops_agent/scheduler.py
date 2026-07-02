@@ -186,13 +186,20 @@ class OpsScheduler:
                     note="remediation action processed",
                     metadata={"action_statuses": [item.status for item in action_results]},
                 )
-            self.send_alert_notification(title, analysis, problem_key(new_alerts), new_alerts, severity)
+            self.send_alert_notification(
+                title,
+                analysis,
+                problem_key(new_alerts),
+                new_alerts,
+                severity,
+                incident_id=incident_id,
+            )
             self.send_action_failure_escalation_if_needed(incident_id, action_results, new_alerts)
 
         if recoveries:
             title = f"Ops Agent recovered {len(recoveries)} issue(s)"
             text = build_recovery_message(recoveries)
-            self.storage.save_incident("ok", title, text, recoveries)
+            recovery_record_id = self.storage.save_incident("ok", title, text, recoveries)
             for incident_id in sorted(recovery_incident_ids):
                 self.storage.transition_incident(
                     incident_id,
@@ -201,7 +208,19 @@ class OpsScheduler:
                     note="monitor recovered",
                     metadata={"recovered_checks": [check_key(result) for result in recoveries]},
                 )
-            self.send_alert_notification(title, text, "recovered:" + problem_key(recoveries), recoveries, "ok")
+            notification_incident_id = (
+                next(iter(recovery_incident_ids))
+                if len(recovery_incident_ids) == 1
+                else recovery_record_id
+            )
+            self.send_alert_notification(
+                title,
+                text,
+                "recovered:" + problem_key(recoveries),
+                recoveries,
+                "ok",
+                incident_id=notification_incident_id,
+            )
 
     def update_existing_incident(
         self,
@@ -233,6 +252,7 @@ class OpsScheduler:
         dedupe_key: str,
         results: list[CheckResult] | None = None,
         severity: str = "",
+        incident_id: int | None = None,
     ) -> bool:
         context = alert_context_from_results(
             results or [],
@@ -241,13 +261,56 @@ class OpsScheduler:
             classification_rules=self.config.classification_rules,
         )
         decision = route_alert(self.config.alerts, context)
+        routed_key = routed_dedupe_key(dedupe_key, decision)
         if decision.suppressed:
             print(f"[alert suppressed by routing] {title}: {decision.reason}")
+            self.storage.save_notification_log(
+                title,
+                routed_key,
+                "suppressed",
+                severity=context.severity,
+                route_names=decision.route_names,
+                channels=decision.channels,
+                suppressed_reason=decision.reason,
+                environment=context.environment,
+                run_type=context.run_type,
+                trace_id=context.trace_id,
+                incident_id=incident_id,
+            )
             return True
 
         header = format_routing_header(decision)
         routed_text = f"{header}\n\n{text}" if header else text
-        return self.notifier.send(title, routed_text, dedupe_key=routed_dedupe_key(dedupe_key, decision))
+        try:
+            sent = self.notifier.send(title, routed_text, dedupe_key=routed_key)
+        except Exception as exc:
+            self.storage.save_notification_log(
+                title,
+                routed_key,
+                "failed",
+                severity=context.severity,
+                route_names=decision.route_names,
+                channels=decision.channels,
+                error=str(exc),
+                environment=context.environment,
+                run_type=context.run_type,
+                trace_id=context.trace_id,
+                incident_id=incident_id,
+            )
+            raise
+        self.storage.save_notification_log(
+            title,
+            routed_key,
+            "sent" if sent else "skipped",
+            severity=context.severity,
+            route_names=decision.route_names,
+            channels=decision.channels,
+            environment=context.environment,
+            run_type=context.run_type,
+            trace_id=context.trace_id,
+            incident_id=incident_id,
+        )
+        return sent
 
     def send_repeated_alert_if_due(self, incident: dict, results: list[CheckResult]) -> bool:
         alerts = self.config.alerts
@@ -269,6 +332,7 @@ class OpsScheduler:
             f"repeated:{incident_id}",
             results,
             str(incident.get("severity") or ""),
+            incident_id=incident_id,
         ):
             self.storage.update_incident_notification(incident_id, kind="repeat")
             return True
@@ -291,6 +355,7 @@ class OpsScheduler:
             f"escalation:{incident_id}:{decision['level']}",
             results,
             "critical",
+            incident_id=incident_id,
         ):
             return False
         self.storage.escalate_incident(
@@ -330,6 +395,7 @@ class OpsScheduler:
             f"escalation:{incident_id}:action-failure",
             context_results,
             "critical",
+            incident_id=incident_id,
         ):
             return False
         self.storage.escalate_incident(
@@ -493,6 +559,7 @@ class OpsScheduler:
             text,
             f"playbook-escalation:{playbook_name}:{step_id}:{result.status}",
             severity="critical",
+            incident_id=incident_id,
         )
         if not incident_id:
             return

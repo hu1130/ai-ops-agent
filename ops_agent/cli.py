@@ -643,6 +643,12 @@ def validate_config(config: AppConfig) -> list[str]:
             "retention.test_api_audit_logs_days",
             errors,
         )
+        validate_positive_int(retention.get("notification_logs_days", 180), "retention.notification_logs_days", errors)
+        validate_positive_int(
+            retention.get("test_notification_logs_days", 7),
+            "retention.test_notification_logs_days",
+            errors,
+        )
         validate_positive_int(
             retention.get("auto_close_resolved_after_days", 7),
             "retention.auto_close_resolved_after_days",

@@ -405,6 +405,15 @@ class DashboardTest(unittest.TestCase):
                 "diagnose",
                 {"host": "127.0.0.1", "port": 1},
             )
+            notification_id = storage.save_notification_log(
+                "Ops Agent detected 1 issue(s)",
+                "json_api:AI:warning",
+                "sent",
+                severity="warning",
+                route_names=["default"],
+                channels=["email"],
+                incident_id=incident_id,
+            )
             server = start_dashboard(storage, "127.0.0.1", 0)
             host, port = server.server_address
             try:
@@ -434,8 +443,10 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(1, detail["summary"]["recommendation_count"])
         self.assertEqual(2, detail["summary"]["action_count"])
         self.assertEqual(1, detail["summary"]["failed_action_count"])
+        self.assertEqual(1, detail["summary"]["notification_count"])
         self.assertEqual("failed remediation", detail["incident"]["escalation_reason"])
         self.assertEqual("check_port", detail["recommendations"][0]["action_type"])
+        self.assertEqual(notification_id, detail["notifications"][0]["id"])
         self.assertEqual("example.com", detail["recommendations"][0]["params"]["host"])
         self.assertTrue(any(event["note"] == "incident escalated" for event in detail["events"]))
         self.assertEqual("failed", detail["failed_actions"][0]["status"])
@@ -491,6 +502,35 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual([escalated_id], [row["id"] for row in escalated])
         self.assertEqual([failed_id], [row["id"] for row in failed_actions])
         self.assertEqual(escalated_id, failed_actions[0]["incident_id"])
+
+    def test_notification_logs_api_returns_recent_notifications(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            storage.save_notification_log(
+                "Ops Agent detected 1 issue(s)",
+                "http:Site:critical",
+                "sent",
+                severity="critical",
+                route_names=["critical-email"],
+                channels=["email"],
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/notification-logs",
+                    timeout=5,
+                ) as response:
+                    rows = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("sent", rows[0]["status"])
+        self.assertEqual("http:Site:critical", rows[0]["dedupe_key"])
+        self.assertEqual(["critical-email"], json.loads(rows[0]["route_names_json"]))
 
     def test_action_approval_api_lists_and_rejects_pending_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

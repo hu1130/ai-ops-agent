@@ -156,6 +156,24 @@ class Storage:
                     metadata_json text not null
                 );
 
+                create table if not exists notification_logs (
+                    id integer primary key autoincrement,
+                    created_at text not null,
+                    environment text not null default 'prod',
+                    run_type text not null default 'normal',
+                    trace_id text not null default '',
+                    incident_id integer,
+                    severity text not null default '',
+                    title text not null,
+                    dedupe_key text not null,
+                    status text not null,
+                    route_names_json text not null default '[]',
+                    channels_json text not null default '[]',
+                    suppressed_reason text not null default '',
+                    error text not null default '',
+                    metadata_json text not null default '{}'
+                );
+
                 create table if not exists learning_recommendations (
                     id integer primary key autoincrement,
                     created_at text not null,
@@ -206,6 +224,10 @@ class Storage:
                     on learning_config_patches (status, updated_at, id);
                 create index if not exists idx_learning_config_patches_recommendation
                     on learning_config_patches (recommendation_id, id);
+                create index if not exists idx_notification_logs_created
+                    on notification_logs (created_at, id);
+                create index if not exists idx_notification_logs_status
+                    on notification_logs (status, id);
                 """
             )
             self.ensure_context_columns()
@@ -215,6 +237,7 @@ class Storage:
             self.ensure_recommendation_columns()
             self.ensure_learning_recommendation_columns()
             self.ensure_learning_config_patch_columns()
+            self.ensure_notification_log_columns()
             self.connection.commit()
 
     def ensure_context_columns(self) -> None:
@@ -223,7 +246,7 @@ class Storage:
             "run_type": "text not null default 'normal'",
             "trace_id": "text not null default ''",
         }
-        for table in ("check_results", "incidents", "action_logs"):
+        for table in ("check_results", "incidents", "action_logs", "notification_logs"):
             columns = {
                 row["name"]
                 for row in self.connection.execute(f"pragma table_info({table})").fetchall()
@@ -330,6 +353,27 @@ class Storage:
             "decision_by": "alter table action_logs add column decision_by text",
             "decision_at": "alter table action_logs add column decision_at text",
             "decision_note": "alter table action_logs add column decision_note text",
+        }
+        for column, statement in additions.items():
+            if column not in columns:
+                self.connection.execute(statement)
+
+    def ensure_notification_log_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("pragma table_info(notification_logs)").fetchall()
+        }
+        additions = {
+            "environment": "alter table notification_logs add column environment text not null default 'prod'",
+            "run_type": "alter table notification_logs add column run_type text not null default 'normal'",
+            "trace_id": "alter table notification_logs add column trace_id text not null default ''",
+            "incident_id": "alter table notification_logs add column incident_id integer",
+            "severity": "alter table notification_logs add column severity text not null default ''",
+            "route_names_json": "alter table notification_logs add column route_names_json text not null default '[]'",
+            "channels_json": "alter table notification_logs add column channels_json text not null default '[]'",
+            "suppressed_reason": "alter table notification_logs add column suppressed_reason text not null default ''",
+            "error": "alter table notification_logs add column error text not null default ''",
+            "metadata_json": "alter table notification_logs add column metadata_json text not null default '{}'",
         }
         for column, statement in additions.items():
             if column not in columns:
@@ -802,12 +846,14 @@ class Storage:
         recommendations = self.latest_incident_recommendations(incident_id)
         actions = self.latest_action_logs(100, incident_id=incident_id)
         failed_actions = self.latest_failed_action_logs(100, incident_id=incident_id)
+        notifications = self.latest_notification_logs(100, incident_id=incident_id)
         return {
             "incident": incident,
             "events": events,
             "recommendations": recommendations,
             "actions": actions,
             "failed_actions": failed_actions,
+            "notifications": notifications,
             "summary": {
                 "is_escalated": int(incident.get("escalation_level") or 0) > 0,
                 "escalation_level": int(incident.get("escalation_level") or 0),
@@ -815,6 +861,7 @@ class Storage:
                 "recommendation_count": len(recommendations),
                 "action_count": len(actions),
                 "failed_action_count": len(failed_actions),
+                "notification_count": len(notifications),
                 "status": incident.get("status", ""),
                 "severity": incident.get("severity", ""),
             },
@@ -1716,6 +1763,79 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def save_notification_log(
+        self,
+        title: str,
+        dedupe_key: str,
+        status: str,
+        severity: str = "",
+        route_names: Sequence[str] | None = None,
+        channels: Sequence[str] | None = None,
+        suppressed_reason: str = "",
+        error: str = "",
+        environment: str = "prod",
+        run_type: str = "normal",
+        trace_id: str = "",
+        incident_id: int | None = None,
+        metadata: dict | None = None,
+    ) -> int:
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                insert into notification_logs (
+                    created_at, environment, run_type, trace_id, incident_id,
+                    severity, title, dedupe_key, status, route_names_json,
+                    channels_json, suppressed_reason, error, metadata_json
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    utc_now_iso(),
+                    environment or "prod",
+                    run_type or "normal",
+                    trace_id or "",
+                    incident_id,
+                    severity or "",
+                    title,
+                    dedupe_key,
+                    status,
+                    json.dumps(list(route_names or []), ensure_ascii=False),
+                    json.dumps(list(channels or []), ensure_ascii=False),
+                    suppressed_reason,
+                    error,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+            self.connection.commit()
+            return int(cursor.lastrowid)
+
+    def latest_notification_logs(
+        self,
+        limit: int = 50,
+        incident_id: int | None = None,
+        status: str | None = None,
+    ) -> list[dict]:
+        with self.lock:
+            where: list[str] = []
+            params: list[object] = []
+            if incident_id is not None:
+                where.append("incident_id = ?")
+                params.append(incident_id)
+            if status:
+                where.append("status = ?")
+                params.append(status)
+            where_sql = f"where {' and '.join(where)}" if where else ""
+            rows = self.connection.execute(
+                f"""
+                select * from notification_logs
+                {where_sql}
+                order by id desc
+                limit ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def update_incident_analysis(self, incident_id: int, analysis: str) -> None:
         with self.lock:
             self.connection.execute(
@@ -1807,6 +1927,8 @@ class Storage:
         test_run_types: Sequence[str] | None = None,
         api_audit_cutoff: str = "",
         test_api_audit_cutoff: str = "",
+        notification_cutoff: str = "",
+        test_notification_cutoff: str = "",
     ) -> dict[str, int]:
         test_environments = test_environments or []
         test_run_types = test_run_types or []
@@ -1835,6 +1957,13 @@ class Storage:
             "created_at < ?",
             [api_audit_cutoff or action_cutoff],
             test_api_audit_cutoff,
+            test_environments,
+            test_run_types,
+        )
+        notification_where, notification_params = build_retention_where(
+            "created_at < ?",
+            [notification_cutoff or api_audit_cutoff or action_cutoff],
+            test_notification_cutoff,
             test_environments,
             test_run_types,
         )
@@ -1855,11 +1984,16 @@ class Storage:
                 f"select count(*) from api_audit_logs where {api_audit_where}",
                 api_audit_params,
             ).fetchone()[0]
+            notification_logs = self.connection.execute(
+                f"select count(*) from notification_logs where {notification_where}",
+                notification_params,
+            ).fetchone()[0]
         return {
             "check_results": int(check_results),
             "incidents": int(incidents),
             "action_logs": int(action_logs),
             "api_audit_logs": int(api_audit_logs),
+            "notification_logs": int(notification_logs),
         }
 
     def delete_retention_candidates(
@@ -1875,6 +2009,8 @@ class Storage:
         test_run_types: Sequence[str] | None = None,
         api_audit_cutoff: str = "",
         test_api_audit_cutoff: str = "",
+        notification_cutoff: str = "",
+        test_notification_cutoff: str = "",
     ) -> dict[str, int]:
         test_environments = test_environments or []
         test_run_types = test_run_types or []
@@ -1906,6 +2042,13 @@ class Storage:
             test_environments,
             test_run_types,
         )
+        notification_where, notification_params = build_retention_where(
+            "created_at < ?",
+            [notification_cutoff or api_audit_cutoff or action_cutoff],
+            test_notification_cutoff,
+            test_environments,
+            test_run_types,
+        )
         with self.lock:
             before = self.count_retention_candidates(
                 check_cutoff,
@@ -1919,6 +2062,8 @@ class Storage:
                 test_run_types,
                 api_audit_cutoff=api_audit_cutoff,
                 test_api_audit_cutoff=test_api_audit_cutoff,
+                notification_cutoff=notification_cutoff,
+                test_notification_cutoff=test_notification_cutoff,
             )
             self.connection.execute(
                 f"delete from check_results where {check_where}",
@@ -1945,6 +2090,7 @@ class Storage:
             self.connection.execute(f"delete from incidents where {incident_where}", incident_params)
             self.connection.execute(f"delete from action_logs where {action_where}", action_params)
             self.connection.execute(f"delete from api_audit_logs where {api_audit_where}", api_audit_params)
+            self.connection.execute(f"delete from notification_logs where {notification_where}", notification_params)
             self.connection.commit()
         return before
 

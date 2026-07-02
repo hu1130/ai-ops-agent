@@ -217,6 +217,48 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(1, len(rows))
         self.assertEqual("recent", rows[0]["message"])
 
+    def test_retention_deletes_old_notification_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            old = iso_days_ago(200)
+            recent = iso_days_ago(10)
+            storage.connection.execute(
+                """
+                insert into notification_logs (
+                    created_at, environment, run_type, trace_id, severity, title,
+                    dedupe_key, status, route_names_json, channels_json,
+                    suppressed_reason, error, metadata_json
+                )
+                values (?, 'prod', 'normal', '', 'critical', 'old', 'old-key',
+                        'sent', '[]', '[]', '', '', '{}')
+                """,
+                (old,),
+            )
+            storage.connection.execute(
+                """
+                insert into notification_logs (
+                    created_at, environment, run_type, trace_id, severity, title,
+                    dedupe_key, status, route_names_json, channels_json,
+                    suppressed_reason, error, metadata_json
+                )
+                values (?, 'prod', 'normal', '', 'critical', 'recent', 'recent-key',
+                        'sent', '[]', '[]', '', '', '{}')
+                """,
+                (recent,),
+            )
+            storage.connection.commit()
+            result = run_retention_cleanup(
+                storage,
+                {"enabled": True, "notification_logs_days": 180},
+                dry_run=False,
+            )
+            rows = storage.latest_notification_logs()
+            storage.close()
+
+        self.assertEqual(1, result.deleted_notification_logs)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("recent-key", rows[0]["dedupe_key"])
+
     def test_retention_dry_run_counts_resolved_incidents_to_auto_close(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

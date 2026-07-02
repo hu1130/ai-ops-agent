@@ -19,6 +19,7 @@ class AlertContext:
     categories: list[str] = field(default_factory=list)
     environment: str = "prod"
     run_type: str = "normal"
+    trace_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ def alert_context_from_results(
         categories=categories,
         environment=common_text([result.environment for result in results], "prod"),
         run_type=common_text([result.run_type for result in results], "normal"),
+        trace_id=common_text([result.trace_id for result in results], ""),
     )
 
 
