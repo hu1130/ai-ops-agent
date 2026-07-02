@@ -143,6 +143,32 @@ python -m ops_agent.cli --config .\config.json validate-config
 }
 ```
 
+## 通用异常分类引擎
+
+新事件会先进入通用分类器，不再按单个项目写死判断逻辑。分类器会输出异常类型、置信度、证据链和下一步动作。
+
+当前内置分类：
+
+```text
+probe_config_issue      监控探针或配置问题
+service_unavailable     服务不可用
+dependency_failure      依赖故障
+performance_degraded    性能下降
+container_unhealthy     容器健康异常
+log_error_spike         日志错误增加
+synthetic_quality_fail  合成测试质量失败
+resource_pressure       服务器资源压力
+unknown                 未知异常
+```
+
+分类器会做多信号关联。例如：
+
+- 主健康接口 404，但同域名首页 200：更可能是 `probe_config_issue`
+- HTTP 5xx：仍按 `service_unavailable` 处理
+- HTTP/API 异常同时出现日志错误：提升为真实服务故障判断
+- 资源压力和业务探针异常同时出现：优先怀疑资源或依赖引发故障
+- AI/业务合成测试返回异常结构、兜底话术或空字段：归为 `synthetic_quality_fail`
+
 ## 自动处置后端
 
 当前已支持自动处置引擎的安全骨架：

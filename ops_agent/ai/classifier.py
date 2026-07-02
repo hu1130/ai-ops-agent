@@ -1,0 +1,385 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from ops_agent.events import CheckResult
+
+CATEGORY_LABELS = {
+    "probe_config_issue": "监控探针或配置问题",
+    "service_unavailable": "服务不可用",
+    "dependency_failure": "依赖故障",
+    "performance_degraded": "性能下降",
+    "container_unhealthy": "容器健康异常",
+    "log_error_spike": "日志错误增加",
+    "synthetic_quality_fail": "合成测试质量失败",
+    "resource_pressure": "服务器资源压力",
+    "unknown": "未知异常",
+}
+
+
+@dataclass
+class IncidentClassification:
+    category: str
+    confidence: float
+    summary: str
+    evidence: list[str] = field(default_factory=list)
+    next_steps: list[str] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return CATEGORY_LABELS.get(self.category, self.category)
+
+
+def classify_incident(results: list[CheckResult]) -> IncidentClassification:
+    problems = [result for result in results if result.is_problem]
+    if not problems:
+        return IncidentClassification(
+            category="unknown",
+            confidence=0.0,
+            summary="本轮没有异常信号。",
+            evidence=[],
+            next_steps=["继续观察下一轮巡检结果。"],
+        )
+
+    signal_classifications = [classify_signal(result) for result in problems]
+    correlated = correlate_signals(problems, signal_classifications)
+    if correlated:
+        return correlated
+    return max(signal_classifications, key=lambda item: item.confidence)
+
+
+def classify_signal(result: CheckResult) -> IncidentClassification:
+    if result.source == "http":
+        return classify_http(result)
+    if result.source in {"json", "json_api"}:
+        return classify_json_api(result)
+    if result.source == "log":
+        return classify_log(result)
+    if result.source == "server":
+        return classify_server(result)
+    return unknown_classification(result)
+
+
+def classify_http(result: CheckResult) -> IncidentClassification:
+    details = result.details or {}
+    classification = str(details.get("classification", ""))
+    status_code = int_or_none(details.get("status_code"))
+    latency_ms = int_or_none(details.get("latency_ms"))
+    evidence = base_evidence(result)
+
+    if classification.endswith("_fallback_reachable"):
+        fallback = safe_dict(details.get("fallback"))
+        if fallback:
+            evidence.append(
+                f"备用入口 {fallback.get('url')} 返回 HTTP {fallback.get('status_code')}，说明同域名仍可访问。"
+            )
+        return IncidentClassification(
+            category="probe_config_issue",
+            confidence=0.9,
+            summary="主探针失败，但备用入口可达，更像健康检查路径、鉴权或预期状态配置问题。",
+            evidence=evidence,
+            next_steps=[
+                "确认监控 URL 是否应该改为真实健康接口。",
+                "如果项目没有健康接口，补充 /health 或 /healthz，而不是长期用页面入口代替。",
+                "检查 expected_status、请求方法和鉴权要求是否符合实际。",
+            ],
+        )
+
+    if status_code is not None and status_code >= 500:
+        return IncidentClassification(
+            category="service_unavailable",
+            confidence=0.86,
+            summary="HTTP 5xx 表示应用、网关或上游服务返回错误，优先按真实服务故障处理。",
+            evidence=evidence,
+            next_steps=[
+                "查看 Nginx/网关和应用容器日志。",
+                "确认应用进程、端口、数据库和外部依赖是否正常。",
+                "对照最近发布、重启和配置变更。",
+            ],
+        )
+
+    if "slow response" in result.summary.lower() or latency_too_high(details):
+        return IncidentClassification(
+            category="performance_degraded",
+            confidence=0.78,
+            summary="HTTP 请求成功但响应时间超过阈值，属于性能下降。",
+            evidence=evidence,
+            next_steps=[
+                "查看慢接口日志和上游依赖耗时。",
+                "确认 CPU、内存、数据库连接池和外部 API 是否存在等待。",
+            ],
+        )
+
+    if "request failed" in result.summary.lower():
+        return IncidentClassification(
+            category="service_unavailable",
+            confidence=0.8,
+            summary="HTTP 请求未成功建立或读取，优先判断为服务不可达或网络/代理故障。",
+            evidence=evidence,
+            next_steps=[
+                "确认 DNS、证书、Nginx 反代和目标端口。",
+                "从服务器本机 curl 目标地址复现问题。",
+            ],
+        )
+
+    return unknown_classification(result)
+
+
+def classify_json_api(result: CheckResult) -> IncidentClassification:
+    details = result.details or {}
+    status_code = int_or_none(details.get("status_code"))
+    latency_ms = int_or_none(details.get("latency_ms"))
+    summary = result.summary.lower()
+    evidence = base_evidence(result)
+
+    if "suspicious phrase" in summary or "required json path" in summary or "not valid json" in summary:
+        return IncidentClassification(
+            category="synthetic_quality_fail",
+            confidence=0.82,
+            summary="合成请求返回了异常结构、异常话术或不合格内容，属于业务质量异常。",
+            evidence=evidence,
+            next_steps=[
+                "查看接口实际返回内容和提示词/知识库配置。",
+                "确认是否走到了兜底回复、空回复或错误包装。",
+                "补充多问题合成测试，避免单个问题误判。",
+            ],
+        )
+
+    if status_code is not None and status_code >= 500:
+        return IncidentClassification(
+            category="dependency_failure",
+            confidence=0.8,
+            summary="JSON/API 探针返回 5xx，常见原因是模型服务、数据库、缓存或应用依赖异常。",
+            evidence=evidence,
+            next_steps=[
+                "检查 API 服务日志和上游依赖日志。",
+                "确认数据库、Redis、模型供应商或内部服务是否可用。",
+            ],
+        )
+
+    if "slow response" in summary or latency_too_high(details):
+        return IncidentClassification(
+            category="performance_degraded",
+            confidence=0.78,
+            summary="合成 API 请求成功但响应过慢，属于性能下降。",
+            evidence=evidence,
+            next_steps=[
+                "拆分接口耗时：应用处理、数据库、模型请求、网络调用。",
+                "检查是否有排队、限流或外部模型响应变慢。",
+            ],
+        )
+
+    if "request failed" in summary:
+        return IncidentClassification(
+            category="service_unavailable",
+            confidence=0.76,
+            summary="合成 API 请求失败，优先判断为接口不可达或服务链路异常。",
+            evidence=evidence,
+            next_steps=[
+                "从服务器本机重放请求，确认网络和鉴权。",
+                "检查 API 服务进程、容器状态和最近错误日志。",
+            ],
+        )
+
+    return unknown_classification(result)
+
+
+def classify_log(result: CheckResult) -> IncidentClassification:
+    details = result.details or {}
+    match_count = int_or_none(details.get("match_count")) or 0
+    evidence = base_evidence(result)
+    matches = details.get("matches")
+    if isinstance(matches, list) and matches:
+        evidence.append(f"最近匹配日志样例: {str(matches[-1])[:180]}")
+
+    if "unhealthy" in result.summary.lower() or any("unhealthy" in str(item).lower() for item in safe_list(matches)):
+        return IncidentClassification(
+            category="container_unhealthy",
+            confidence=0.78,
+            summary="日志或容器输出出现 unhealthy 信号，需要区分容器健康检查异常和业务不可用。",
+            evidence=evidence,
+            next_steps=[
+                "查看容器 healthcheck 命令和 docker inspect 健康详情。",
+                "同时验证业务入口是否可访问，避免只凭容器状态误报。",
+            ],
+        )
+
+    if match_count > 0:
+        return IncidentClassification(
+            category="log_error_spike",
+            confidence=0.76,
+            summary="日志中出现错误关键词，说明应用内部可能存在异常。",
+            evidence=evidence,
+            next_steps=[
+                "查看错误前后上下文，定位具体接口、任务或依赖。",
+                "统计相同错误是否连续出现，判断是否升级为服务故障。",
+            ],
+        )
+
+    if "not found" in result.summary.lower() or "read failed" in result.summary.lower():
+        return IncidentClassification(
+            category="probe_config_issue",
+            confidence=0.62,
+            summary="日志读取失败或路径不存在，更像日志探针配置问题。",
+            evidence=evidence,
+            next_steps=[
+                "确认日志路径、容器名和读取权限。",
+                "容器重建后优先使用稳定容器名，不要写死容器 ID 路径。",
+            ],
+        )
+
+    return unknown_classification(result)
+
+
+def classify_server(result: CheckResult) -> IncidentClassification:
+    details = result.details or {}
+    evidence = base_evidence(result)
+    used_percent = details.get("used_percent")
+    threshold = details.get("threshold")
+    if used_percent is not None and threshold is not None:
+        evidence.append(f"资源使用率 {used_percent}% 已达到阈值 {threshold}%。")
+
+    return IncidentClassification(
+        category="resource_pressure",
+        confidence=0.84,
+        summary="服务器资源超过阈值，可能影响应用、数据库或日志写入。",
+        evidence=evidence,
+        next_steps=[
+            "先定位占用最高的进程、容器或目录。",
+            "确认是否存在日志暴涨、批处理任务、异常循环或连接堆积。",
+            "清理或重启前先保留关键诊断信息。",
+        ],
+    )
+
+
+def correlate_signals(
+    results: list[CheckResult],
+    classifications: list[IncidentClassification],
+) -> IncidentClassification | None:
+    categories = {item.category for item in classifications}
+    sources = {result.source for result in results}
+    evidence = merge_evidence(classifications)
+
+    if "resource_pressure" in categories and ({"http", "json_api"} & sources):
+        return IncidentClassification(
+            category="dependency_failure",
+            confidence=0.87,
+            summary="资源压力和业务探针异常同时出现，优先怀疑资源压力引发服务或依赖故障。",
+            evidence=evidence + ["同一轮巡检同时出现资源异常和业务探针异常。"],
+            next_steps=[
+                "先处理资源瓶颈，再复测业务入口。",
+                "查看资源最高的进程/容器是否属于当前异常项目。",
+            ],
+        )
+
+    if "log_error_spike" in categories and ({"http", "json_api"} & sources):
+        return IncidentClassification(
+            category="service_unavailable",
+            confidence=0.86,
+            summary="业务探针异常和应用日志错误同时出现，更像真实应用故障。",
+            evidence=evidence + ["HTTP/API 异常与日志错误在同一事件中同时出现。"],
+            next_steps=[
+                "以日志错误为入口定位具体代码路径或依赖。",
+                "复测 HTTP/API 探针，确认影响范围。",
+                "对照最近发布和配置变更。",
+            ],
+        )
+
+    if "probe_config_issue" in categories and len(categories) == 1:
+        return IncidentClassification(
+            category="probe_config_issue",
+            confidence=max(item.confidence for item in classifications),
+            summary="所有异常信号都指向探针或配置问题，暂不按真实业务故障处理。",
+            evidence=evidence,
+            next_steps=[
+                "修正监控地址、鉴权、请求方法或日志路径。",
+                "修正后手动跑一轮巡检，确认事件自动恢复。",
+            ],
+        )
+
+    return None
+
+
+def format_incident_classification(classification: IncidentClassification) -> str:
+    lines = [
+        "",
+        "通用异常分类:",
+        f"- 主分类: {classification.category}（{classification.label}）",
+        f"- 置信度: {classification.confidence:.2f}",
+        f"- 判断: {classification.summary}",
+        "",
+        "证据链:",
+    ]
+    if classification.evidence:
+        lines.extend(f"{index}. {item}" for index, item in enumerate(classification.evidence, start=1))
+    else:
+        lines.append("1. 暂无足够证据。")
+    lines.append("")
+    lines.append("下一步动作:")
+    lines.extend(f"{index}. {item}" for index, item in enumerate(classification.next_steps, start=1))
+    return "\n".join(lines)
+
+
+def base_evidence(result: CheckResult) -> list[str]:
+    evidence = [f"{result.source}/{result.name}: {result.summary}"]
+    details = result.details or {}
+    if details.get("url"):
+        evidence.append(f"目标 URL: {details.get('url')}")
+    if details.get("status_code") is not None:
+        evidence.append(f"HTTP 状态码: {details.get('status_code')}")
+    if details.get("latency_ms") is not None:
+        evidence.append(f"响应耗时: {details.get('latency_ms')} ms")
+    if details.get("path"):
+        evidence.append(f"路径: {details.get('path')}")
+    if details.get("container"):
+        evidence.append(f"容器: {details.get('container')}")
+    return evidence
+
+
+def merge_evidence(classifications: list[IncidentClassification]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for classification in classifications:
+        for item in classification.evidence:
+            if item in seen:
+                continue
+            seen.add(item)
+            merged.append(item)
+            if len(merged) >= 8:
+                return merged
+    return merged
+
+
+def unknown_classification(result: CheckResult) -> IncidentClassification:
+    return IncidentClassification(
+        category="unknown",
+        confidence=0.4,
+        summary="当前信号不足以稳定判断根因类型。",
+        evidence=base_evidence(result),
+        next_steps=[
+            "先确认异常是否可复现。",
+            "补充日志、资源、HTTP/API 等更多信号后再做关联判断。",
+        ],
+    )
+
+
+def int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def latency_too_high(details: dict[str, Any]) -> bool:
+    latency = int_or_none(details.get("latency_ms"))
+    threshold = int_or_none(details.get("max_latency_ms"))
+    return latency is not None and threshold is not None and latency > threshold
+
+
+def safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def safe_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
