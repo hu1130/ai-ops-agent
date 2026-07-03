@@ -103,7 +103,7 @@ def start_dashboard(
                     self.send_json({"error": str(exc)}, status=404)
                 return
             if path == "/api/incidents":
-                self.send_json(storage.latest_incidents())
+                self.send_json(storage.latest_incidents(**incident_filters_from_query(query)))
                 return
             if path == "/api/incidents/escalated":
                 self.send_json(storage.latest_escalated_incidents())
@@ -219,12 +219,63 @@ def start_dashboard(
                 self.record_audit(path, 404, "not_found", "unsupported api path", auth=auth)
                 self.send_json({"error": "not found"}, status=404)
                 return
+            self.handle_incident_post(incident_request, auth)
 
+        def handle_incident_post(self, incident_request: tuple[int, str], auth: AuthResult) -> None:
             incident_id, action = incident_request
+            path = self.path.split("?", 1)[0]
             actor = "api"
             try:
                 body = self.read_json_body()
                 actor = self.actor_from_body(body, auth)
+                note = str(body.get("note") or body.get("reason") or "")
+
+                if action == "assign":
+                    updated = storage.assign_incident(
+                        incident_id,
+                        str(body.get("assignee") or body.get("owner") or ""),
+                        actor=actor,
+                        note=note,
+                    )
+                    self.record_audit(path, 200, "success", "incident assigned", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+
+                if action == "unassign":
+                    updated = storage.assign_incident(incident_id, "", actor=actor, note=note)
+                    self.record_audit(path, 200, "success", "incident unassigned", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+
+                if action == "priority":
+                    updated = storage.set_incident_priority(
+                        incident_id,
+                        str(body.get("priority") or ""),
+                        actor=actor,
+                        note=note,
+                    )
+                    self.record_audit(path, 200, "success", "incident priority updated", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+
+                if action == "comment":
+                    comment = str(body.get("comment") or body.get("note") or "")
+                    created = storage.add_incident_comment(
+                        incident_id,
+                        actor=actor,
+                        comment=comment,
+                        metadata={"api_action": action},
+                    )
+                    self.record_audit(path, 200, "success", "incident comment added", actor=actor, auth=auth)
+                    self.send_json(created)
+                    return
+
+                if action in {"false-positive", "false_positive"}:
+                    updated = storage.mark_incident_false_positive(incident_id, actor=actor, reason=note)
+                    self.record_audit(path, 200, "success", "incident marked false positive", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+
                 to_status = status_from_incident_action(action, body)
                 updated = storage.transition_incident(
                     incident_id,
@@ -723,6 +774,17 @@ def recommendation_filters_from_query(query: dict[str, list[str]]) -> dict:
     }
 
 
+def incident_filters_from_query(query: dict[str, list[str]]) -> dict:
+    return {
+        "limit": query_limit(query, default=20, maximum=200),
+        "status": query_text(query, "status"),
+        "assignee": query_text(query, "assignee"),
+        "priority": query_text(query, "priority"),
+        "severity": query_text(query, "severity"),
+        "false_positive": query_optional_bool(query, "false_positive"),
+    }
+
+
 def learning_filters_from_query(query: dict[str, list[str]]) -> dict:
     return {
         "limit": query_limit(query, default=50, maximum=200),
@@ -756,6 +818,17 @@ def query_optional_int(query: dict[str, list[str]], key: str) -> int | None:
     except ValueError:
         return None
     return value if value > 0 else None
+
+
+def query_optional_bool(query: dict[str, list[str]], key: str) -> bool | None:
+    text = query_text(query, key).lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
 
 
 def query_limit(query: dict[str, list[str]], default: int, maximum: int) -> int:
@@ -1175,7 +1248,8 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
     incident_request = parse_incident_api_path(path)
     if incident_request:
         incident_id, action = incident_request
-        operation = f"incident.{action or 'read'}"
+        operation_name = (action or "read").replace("-", "_")
+        operation = f"incident.{operation_name}"
         return operation, "incident", incident_id
 
     mapping = {

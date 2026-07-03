@@ -73,7 +73,13 @@ class Storage:
                     acknowledged_by text,
                     resolved_at text,
                     closed_at text,
-                    closed_reason text
+                    closed_reason text,
+                    assignee text not null default '',
+                    priority text not null default 'medium',
+                    false_positive integer not null default 0,
+                    false_positive_at text,
+                    false_positive_by text,
+                    false_positive_reason text not null default ''
                 );
 
                 create table if not exists incident_events (
@@ -85,6 +91,15 @@ class Storage:
                     actor text not null,
                     note text not null,
                     metadata_json text not null
+                );
+
+                create table if not exists incident_comments (
+                    id integer primary key autoincrement,
+                    incident_id integer not null,
+                    created_at text not null,
+                    actor text not null,
+                    comment text not null,
+                    metadata_json text not null default '{}'
                 );
 
                 create table if not exists incident_recommendations (
@@ -218,6 +233,8 @@ class Storage:
 
                 create index if not exists idx_incident_recommendations_incident
                     on incident_recommendations (incident_id, position, id);
+                create index if not exists idx_incident_comments_incident
+                    on incident_comments (incident_id, id);
                 create unique index if not exists idx_learning_recommendations_dedupe
                     on learning_recommendations (dedupe_key);
                 create index if not exists idx_learning_config_patches_status
@@ -290,6 +307,12 @@ class Storage:
             "resolved_at": "alter table incidents add column resolved_at text",
             "closed_at": "alter table incidents add column closed_at text",
             "closed_reason": "alter table incidents add column closed_reason text",
+            "assignee": "alter table incidents add column assignee text not null default ''",
+            "priority": "alter table incidents add column priority text not null default 'medium'",
+            "false_positive": "alter table incidents add column false_positive integer not null default 0",
+            "false_positive_at": "alter table incidents add column false_positive_at text",
+            "false_positive_by": "alter table incidents add column false_positive_by text",
+            "false_positive_reason": "alter table incidents add column false_positive_reason text not null default ''",
         }
         for column, statement in additions.items():
             if column not in columns:
@@ -815,15 +838,42 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def latest_incidents(self, limit: int = 20) -> list[dict]:
+    def latest_incidents(
+        self,
+        limit: int = 20,
+        status: str = "",
+        assignee: str = "",
+        priority: str = "",
+        severity: str = "",
+        false_positive: bool | None = None,
+    ) -> list[dict]:
         with self.lock:
+            where: list[str] = []
+            params: list[object] = []
+            if status:
+                where.append("status = ?")
+                params.append(status)
+            if assignee:
+                where.append("assignee = ?")
+                params.append(assignee)
+            if priority:
+                where.append("priority = ?")
+                params.append(priority)
+            if severity:
+                where.append("severity = ?")
+                params.append(severity)
+            if false_positive is not None:
+                where.append("false_positive = ?")
+                params.append(1 if false_positive else 0)
+            where_sql = f"where {' and '.join(where)}" if where else ""
             rows = self.connection.execute(
-                """
+                f"""
                 select * from incidents
+                {where_sql}
                 order by id desc
                 limit ?
                 """,
-                (limit,),
+                (*params, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -843,6 +893,7 @@ class Storage:
         if not incident:
             return None
         events = self.latest_incident_events(incident_id)
+        comments = self.latest_incident_comments(incident_id)
         recommendations = self.latest_incident_recommendations(incident_id)
         actions = self.latest_action_logs(100, incident_id=incident_id)
         failed_actions = self.latest_failed_action_logs(100, incident_id=incident_id)
@@ -850,6 +901,7 @@ class Storage:
         return {
             "incident": incident,
             "events": events,
+            "comments": comments,
             "recommendations": recommendations,
             "actions": actions,
             "failed_actions": failed_actions,
@@ -858,6 +910,7 @@ class Storage:
                 "is_escalated": int(incident.get("escalation_level") or 0) > 0,
                 "escalation_level": int(incident.get("escalation_level") or 0),
                 "event_count": len(events),
+                "comment_count": len(comments),
                 "recommendation_count": len(recommendations),
                 "action_count": len(actions),
                 "failed_action_count": len(failed_actions),
@@ -1425,6 +1478,173 @@ class Storage:
                 (incident_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def latest_incident_comments(self, incident_id: int, limit: int = 100) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                """
+                select * from incident_comments
+                where incident_id = ?
+                order by id asc
+                limit ?
+                """,
+                (incident_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_incident_comment(
+        self,
+        incident_id: int,
+        actor: str,
+        comment: str,
+        metadata: dict | None = None,
+    ) -> dict:
+        text = comment.strip()
+        if not text:
+            raise ValueError("comment cannot be empty")
+        payload = lifecycle_payload(actor, text, metadata)
+        now = utc_now_iso()
+        with self.lock:
+            row = self.connection.execute("select * from incidents where id = ?", (incident_id,)).fetchone()
+            if not row:
+                raise ValueError(f"incident not found: {incident_id}")
+            cursor = self.connection.execute(
+                """
+                insert into incident_comments (incident_id, created_at, actor, comment, metadata_json)
+                values (?, ?, ?, ?, ?)
+                """,
+                (
+                    incident_id,
+                    now,
+                    payload["actor"],
+                    text,
+                    json.dumps(payload["metadata"], ensure_ascii=False),
+                ),
+            )
+            self.connection.execute(
+                "update incidents set updated_at = ? where id = ?",
+                (now, incident_id),
+            )
+            self.record_incident_event(
+                incident_id,
+                str(row["status"]),
+                str(row["status"]),
+                payload["actor"],
+                "comment added",
+                {"comment_id": int(cursor.lastrowid), **payload["metadata"]},
+                commit=False,
+            )
+            self.connection.commit()
+            created = self.connection.execute(
+                "select * from incident_comments where id = ?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        return dict(created)
+
+    def assign_incident(self, incident_id: int, assignee: str, actor: str = "system", note: str = "") -> dict:
+        assignee = assignee.strip()
+        payload = lifecycle_payload(actor, note, {"assignee": assignee})
+        now = utc_now_iso()
+        with self.lock:
+            row = self.connection.execute("select * from incidents where id = ?", (incident_id,)).fetchone()
+            if not row:
+                raise ValueError(f"incident not found: {incident_id}")
+            self.connection.execute(
+                "update incidents set assignee = ?, updated_at = ? where id = ?",
+                (assignee, now, incident_id),
+            )
+            self.record_incident_event(
+                incident_id,
+                str(row["status"]),
+                str(row["status"]),
+                payload["actor"],
+                payload["note"] or ("incident unassigned" if not assignee else f"incident assigned to {assignee}"),
+                payload["metadata"],
+                commit=False,
+            )
+            self.connection.commit()
+            updated = self.connection.execute("select * from incidents where id = ?", (incident_id,)).fetchone()
+        return dict(updated)
+
+    def set_incident_priority(self, incident_id: int, priority: str, actor: str = "system", note: str = "") -> dict:
+        normalized = validate_incident_priority(priority)
+        payload = lifecycle_payload(actor, note, {"priority": normalized})
+        now = utc_now_iso()
+        with self.lock:
+            row = self.connection.execute("select * from incidents where id = ?", (incident_id,)).fetchone()
+            if not row:
+                raise ValueError(f"incident not found: {incident_id}")
+            self.connection.execute(
+                "update incidents set priority = ?, updated_at = ? where id = ?",
+                (normalized, now, incident_id),
+            )
+            self.record_incident_event(
+                incident_id,
+                str(row["status"]),
+                str(row["status"]),
+                payload["actor"],
+                payload["note"] or f"incident priority set to {normalized}",
+                payload["metadata"],
+                commit=False,
+            )
+            self.connection.commit()
+            updated = self.connection.execute("select * from incidents where id = ?", (incident_id,)).fetchone()
+        return dict(updated)
+
+    def mark_incident_false_positive(
+        self,
+        incident_id: int,
+        actor: str = "system",
+        reason: str = "",
+    ) -> dict:
+        payload = lifecycle_payload(actor, reason, {"false_positive": True})
+        now = utc_now_iso()
+        with self.lock:
+            row = self.connection.execute("select * from incidents where id = ?", (incident_id,)).fetchone()
+            if not row:
+                raise ValueError(f"incident not found: {incident_id}")
+            current = str(row["status"])
+            target = "closed" if current != "closed" else current
+            if current != target:
+                validate_transition(current, target)
+            closed_at = row["closed_at"] or (now if target == "closed" else None)
+            closed_reason = payload["note"] or row["closed_reason"] or "false positive"
+            self.connection.execute(
+                """
+                update incidents
+                set false_positive = 1,
+                    false_positive_at = ?,
+                    false_positive_by = ?,
+                    false_positive_reason = ?,
+                    status = ?,
+                    updated_at = ?,
+                    closed_at = ?,
+                    closed_reason = ?
+                where id = ?
+                """,
+                (
+                    now,
+                    payload["actor"],
+                    payload["note"],
+                    target,
+                    now,
+                    closed_at,
+                    closed_reason,
+                    incident_id,
+                ),
+            )
+            self.record_incident_event(
+                incident_id,
+                current,
+                target,
+                payload["actor"],
+                payload["note"] or "marked false positive",
+                payload["metadata"],
+                commit=False,
+            )
+            self.connection.commit()
+            updated = self.connection.execute("select * from incidents where id = ?", (incident_id,)).fetchone()
+        return dict(updated)
 
     def transition_incident(
         self,
@@ -2087,6 +2307,15 @@ class Storage:
                 """,
                 incident_params,
             )
+            self.connection.execute(
+                f"""
+                delete from incident_comments
+                where incident_id in (
+                    select id from incidents where {incident_where}
+                )
+                """,
+                incident_params,
+            )
             self.connection.execute(f"delete from incidents where {incident_where}", incident_params)
             self.connection.execute(f"delete from action_logs where {action_where}", action_params)
             self.connection.execute(f"delete from api_audit_logs where {api_audit_where}", api_audit_params)
@@ -2339,6 +2568,13 @@ def normalize_classification(value: dict | None) -> dict:
         "evidence": safe_list(payload.get("evidence")),
         "next_steps": safe_list(payload.get("next_steps")),
     }
+
+
+def validate_incident_priority(value: str) -> str:
+    priority = str(value or "").strip().lower()
+    if priority not in {"low", "medium", "high", "critical"}:
+        raise ValueError(f"invalid incident priority: {value}")
+    return priority
 
 
 def normalize_learning_recommendation(value: dict | None) -> dict:

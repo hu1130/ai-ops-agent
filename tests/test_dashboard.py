@@ -357,6 +357,71 @@ class DashboardTest(unittest.TestCase):
         self.assertIn('"to_status": "acknowledged"', events_body)
         self.assertIn('"incident_id":', actions_body)
 
+    def test_incident_center_api_assigns_comments_prioritizes_and_marks_false_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="http", name="Site", status="warning", summary="Slow")
+            incident_id = storage.save_incident("warning", "Ops Agent detected 1 issue(s)", "analysis", [result])
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/assign",
+                    data=b'{"actor":"lead","assignee":"alice"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    assigned = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/priority",
+                    data=b'{"actor":"lead","priority":"high"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    prioritized = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/comment",
+                    data=b'{"actor":"alice","comment":"checking probe config"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    comment = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/false-positive",
+                    data=b'{"actor":"alice","reason":"probe config issue"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    false_positive = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/incidents?assignee=alice&priority=high&false_positive=true",
+                    timeout=5,
+                ) as response:
+                    filtered = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/detail",
+                    timeout=5,
+                ) as response:
+                    detail = json.loads(response.read().decode("utf-8"))
+                audit = storage.latest_api_audit_logs(4)
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("alice", assigned["assignee"])
+        self.assertEqual("high", prioritized["priority"])
+        self.assertEqual("checking probe config", comment["comment"])
+        self.assertEqual("closed", false_positive["status"])
+        self.assertEqual(1, false_positive["false_positive"])
+        self.assertEqual([incident_id], [row["id"] for row in filtered])
+        self.assertEqual(1, detail["summary"]["comment_count"])
+        self.assertEqual("incident.false_positive", audit[0]["operation"])
+
     def test_incident_detail_api_includes_escalation_and_failed_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

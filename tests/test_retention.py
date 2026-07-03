@@ -108,6 +108,7 @@ class RetentionTest(unittest.TestCase):
                     }
                 ],
             )
+            storage.add_incident_comment(incident_id, "tester", "old incident note")
             storage.connection.execute(
                 """
                 insert into action_logs (created_at, action_type, title, risk, status, reason, params_json, output, error)
@@ -124,6 +125,7 @@ class RetentionTest(unittest.TestCase):
             incidents = storage.latest_incidents()
             actions = storage.latest_action_logs()
             incident_events = storage.latest_incident_events(incident_id)
+            comments = storage.latest_incident_comments(incident_id)
             recommendations = storage.latest_incident_recommendations(incident_id)
             storage.close()
 
@@ -132,6 +134,7 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual([], incidents)
         self.assertEqual([], actions)
         self.assertEqual([], incident_events)
+        self.assertEqual([], comments)
         self.assertEqual([], recommendations)
 
     def test_test_incidents_and_actions_use_shorter_retention_policy(self) -> None:

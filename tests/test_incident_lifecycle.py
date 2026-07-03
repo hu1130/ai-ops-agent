@@ -85,6 +85,33 @@ class IncidentLifecycleTest(unittest.TestCase):
         self.assertEqual(incident_id, linked[0]["incident_id"])
         self.assertEqual([], unlinked)
 
+    def test_incident_assignment_priority_comments_and_false_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            incident_id = storage.save_incident(
+                "warning",
+                "Ops Agent detected 1 issue",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="warning", summary="Slow")],
+            )
+            assigned = storage.assign_incident(incident_id, "alice", actor="lead")
+            prioritized = storage.set_incident_priority(incident_id, "high", actor="lead")
+            comment = storage.add_incident_comment(incident_id, "alice", "checking nginx logs")
+            false_positive = storage.mark_incident_false_positive(incident_id, actor="alice", reason="probe config issue")
+            detail = storage.incident_detail(incident_id)
+            filtered = storage.latest_incidents(10, assignee="alice", priority="high", false_positive=True)
+            storage.close()
+
+        self.assertEqual("alice", assigned["assignee"])
+        self.assertEqual("high", prioritized["priority"])
+        self.assertEqual("checking nginx logs", comment["comment"])
+        self.assertEqual("closed", false_positive["status"])
+        self.assertEqual(1, false_positive["false_positive"])
+        self.assertEqual("probe config issue", false_positive["false_positive_reason"])
+        self.assertEqual(1, len(detail["comments"]))
+        self.assertEqual(1, detail["summary"]["comment_count"])
+        self.assertEqual([incident_id], [row["id"] for row in filtered])
+
     def test_incident_fingerprint_tracks_occurrences(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")
