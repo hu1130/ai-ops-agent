@@ -638,6 +638,89 @@ class Storage:
             )
             self.connection.commit()
 
+    def add_incident_recommendations(
+        self,
+        incident_id: int,
+        recommendations: list[dict],
+        source: str = "playbook_center",
+    ) -> list[dict]:
+        if not recommendations:
+            return []
+        now = utc_now_iso()
+        saved: list[dict] = []
+        with self.lock:
+            incident = self.connection.execute("select id from incidents where id = ?", (incident_id,)).fetchone()
+            if not incident:
+                raise ValueError(f"incident not found: {incident_id}")
+            existing_rows = self.connection.execute(
+                """
+                select * from incident_recommendations
+                where incident_id = ?
+                order by position asc, id asc
+                """,
+                (incident_id,),
+            ).fetchall()
+            existing_by_key = {
+                recommendation_dedupe_key(recommendation_payload(row), str(row["source"] or source)): row
+                for row in existing_rows
+            }
+            next_position = max([int(row["position"] or 0) for row in existing_rows] or [0]) + 1
+
+            for item in recommendations:
+                item_source = str(item.get("source") or source)
+                key = recommendation_dedupe_key(item, item_source)
+                if key in existing_by_key:
+                    saved.append(recommendation_payload(existing_by_key[key]))
+                    continue
+                cursor = self.connection.execute(
+                    """
+                    insert into incident_recommendations (
+                        incident_id, created_at, updated_at, environment, run_type, trace_id,
+                        position, category, action_type, title, reason, risk,
+                        approval_required, auto_execute, verification_required, status,
+                        params_json, action_log_id, decision_by, decision_at, decision_note,
+                        executed_at, source, metadata_json
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        incident_id,
+                        now,
+                        now,
+                        str(item.get("environment") or "prod"),
+                        str(item.get("run_type") or "normal"),
+                        str(item.get("trace_id") or ""),
+                        int(item.get("position") or next_position),
+                        str(item.get("category") or "diagnose"),
+                        str(item.get("action_type") or ""),
+                        str(item.get("title") or ""),
+                        str(item.get("reason") or ""),
+                        str(item.get("risk") or "low"),
+                        1 if item.get("approval_required") else 0,
+                        1 if item.get("auto_execute") else 0,
+                        1 if item.get("verification_required") else 0,
+                        str(item.get("status") or "suggested"),
+                        json.dumps(safe_dict(item.get("params")), ensure_ascii=False),
+                        item.get("action_log_id"),
+                        str(item.get("decision_by") or "") or None,
+                        str(item.get("decision_at") or "") or None,
+                        str(item.get("decision_note") or "") or None,
+                        str(item.get("executed_at") or "") or None,
+                        item_source,
+                        json.dumps(safe_dict(item.get("metadata")), ensure_ascii=False),
+                    ),
+                )
+                next_position += 1
+                row = self.connection.execute(
+                    "select * from incident_recommendations where id = ?",
+                    (int(cursor.lastrowid),),
+                ).fetchone()
+                if row:
+                    existing_by_key[key] = row
+                    saved.append(recommendation_payload(row))
+            self.connection.commit()
+        return saved
+
     def find_active_incident_by_fingerprint(self, fingerprint: str) -> dict | None:
         if not fingerprint:
             return None
@@ -2521,6 +2604,16 @@ def recommendation_payload(row: sqlite3.Row) -> dict:
     payload["params"] = parse_json_object(str(payload.get("params_json") or "{}"))
     payload["metadata"] = parse_json_object(str(payload.get("metadata_json") or "{}"))
     return payload
+
+
+def recommendation_dedupe_key(item: dict, source: str) -> str:
+    payload = {
+        "source": source,
+        "action_type": str(item.get("action_type") or ""),
+        "title": str(item.get("title") or ""),
+        "params": safe_dict(item.get("params")),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 def learning_recommendation_payload(row: sqlite3.Row) -> dict:

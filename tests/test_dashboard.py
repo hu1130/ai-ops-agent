@@ -942,6 +942,87 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual({"suggested", "pending_approval", "failed"}, {row["status"] for row in actionable})
         self.assertNotIn("verified_ok", {row["status"] for row in actionable})
 
+    def test_playbook_center_api_lists_matches_and_creates_recommendations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(
+                source="http",
+                name="Site",
+                status="critical",
+                summary="HTTP 500",
+                details={"url": "https://example.com/health"},
+                trace_id="trace-api",
+            )
+            incident_id = storage.save_incident("critical", "Site down", "analysis", [result])
+            config = AppConfig(
+                raw={
+                    "remediation": {
+                        "playbooks": [
+                            {
+                                "name": "web triage",
+                                "match": {"sources": ["http"]},
+                                "steps": [
+                                    {
+                                        "id": "check_target",
+                                        "action_type": "check_port",
+                                        "title": "Check {{host}}:{{port}}",
+                                        "reason": "Confirm target port",
+                                        "params": {"host": "{{host}}", "port": "{{port}}"},
+                                    }
+                                ],
+                            }
+                        ],
+                        "policies": [
+                            {
+                                "action_type": "check_port",
+                                "targets": ["example.com:443"],
+                                "enabled": True,
+                                "requires_approval": False,
+                            }
+                        ],
+                    }
+                },
+                base_dir=Path(tmp),
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(f"http://{host}:{port}/api/playbooks", timeout=5) as response:
+                    playbooks = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/playbooks/detail?name=web%20triage",
+                    timeout=5,
+                ) as response:
+                    detail = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/playbook-matches",
+                    timeout=5,
+                ) as response:
+                    matches = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/playbook-recommendations",
+                    data=b'{"actor":"tester"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    created = json.loads(response.read().decode("utf-8"))
+                recommendations = storage.latest_incident_recommendations(incident_id)
+                audit = storage.latest_api_audit_logs(1)
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(1, playbooks["count"])
+        self.assertEqual("web triage", detail["name"])
+        self.assertEqual(1, matches["matched_playbook_count"])
+        self.assertEqual(1, matches["action_count"])
+        self.assertEqual(1, created["saved_count"])
+        self.assertEqual("playbook_center", recommendations[0]["source"])
+        self.assertEqual("check_port", recommendations[0]["action_type"])
+        self.assertEqual("incident.playbook_recommendations", audit[0]["operation"])
+
     def test_post_api_requires_token_when_configured(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

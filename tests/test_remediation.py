@@ -8,6 +8,11 @@ from ops_agent.config import AppConfig
 from ops_agent.events import CheckResult
 from ops_agent.remediation.actions import RemediationAction
 from ops_agent.remediation.executor import execute_action
+from ops_agent.remediation.playbook_center import (
+    create_incident_playbook_recommendations,
+    list_playbooks,
+    preview_incident_playbooks,
+)
 from ops_agent.remediation.planner import build_remediation_plan
 from ops_agent.remediation.verifier import verify_after_action
 from ops_agent.storage import Storage
@@ -130,6 +135,83 @@ class RemediationTest(unittest.TestCase):
             "docker ps --format table {{.Names}}\\t{{.Status}}\\t{{.Ports}}",
             docker_actions[0].params["command"],
         )
+
+    def test_playbook_center_lists_matches_and_adds_deduped_recommendations(self) -> None:
+        config = AppConfig(
+            raw={
+                "remediation": {
+                    "enabled": True,
+                    "playbooks": [
+                        {
+                            "name": "web triage",
+                            "match": {"sources": ["http"]},
+                            "steps": [
+                                {
+                                    "id": "check_target",
+                                    "action_type": "check_port",
+                                    "title": "Check {{host}}:{{port}}",
+                                    "reason": "Confirm target port",
+                                    "params": {"host": "{{host}}", "port": "{{port}}"},
+                                },
+                                {
+                                    "id": "inspect_logs",
+                                    "action_type": "run_diagnostic_command",
+                                    "title": "Inspect logs",
+                                    "reason": "No matching policy should deny this",
+                                    "params": {"command": "journalctl -n 20 --no-pager"},
+                                },
+                            ],
+                        }
+                    ],
+                    "policies": [
+                        {
+                            "action_type": "check_port",
+                            "targets": ["example.com:443"],
+                            "enabled": True,
+                            "requires_approval": False,
+                        }
+                    ],
+                }
+            },
+            base_dir=Path("."),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            incident_id = storage.save_incident(
+                "critical",
+                "Site down",
+                "analysis",
+                [
+                    CheckResult(
+                        source="http",
+                        name="Site",
+                        status="critical",
+                        summary="HTTP 500",
+                        details={"url": "https://example.com/health"},
+                        environment="prod",
+                        run_type="normal",
+                        trace_id="trace-1",
+                    )
+                ],
+            )
+
+            playbooks = list_playbooks(config)
+            preview = preview_incident_playbooks(storage, config, incident_id)
+            created = create_incident_playbook_recommendations(storage, config, incident_id)
+            create_incident_playbook_recommendations(storage, config, incident_id)
+            recommendations = storage.latest_incident_recommendations(incident_id)
+            storage.close()
+
+        self.assertEqual(1, playbooks["count"])
+        self.assertEqual("web triage", playbooks["playbooks"][0]["name"])
+        self.assertEqual(1, preview["matched_playbook_count"])
+        self.assertEqual(1, preview["action_count"])
+        self.assertEqual(1, preview["denied_action_count"])
+        self.assertEqual(1, created["saved_count"])
+        self.assertEqual(1, len(recommendations))
+        self.assertEqual("playbook_center", recommendations[0]["source"])
+        self.assertEqual("check_port", recommendations[0]["action_type"])
+        self.assertEqual("trace-1", recommendations[0]["trace_id"])
 
     def test_playbook_can_match_configured_classification_rule(self) -> None:
         config = AppConfig(

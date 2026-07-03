@@ -21,6 +21,12 @@ from ops_agent.monitor_targets import (
     list_monitor_targets,
 )
 from ops_agent.remediation.approval import approve_action_log, reject_action_log
+from ops_agent.remediation.playbook_center import (
+    create_incident_playbook_recommendations,
+    get_playbook,
+    list_playbooks,
+    preview_incident_playbooks,
+)
 from ops_agent.remediation.recommendations import (
     approve_recommendation,
     reject_recommendation,
@@ -91,6 +97,20 @@ def start_dashboard(
             if path == "/api/monitor-targets":
                 self.send_json(list_monitor_targets(config.raw if config else {}))
                 return
+            if path == "/api/playbooks":
+                self.send_json(list_playbooks(config))
+                return
+            if path == "/api/playbooks/detail":
+                name = query_text(query, "name")
+                if not name:
+                    self.send_json({"error": "name is required"}, status=400)
+                    return
+                row = get_playbook(config, name)
+                if not row:
+                    self.send_json({"error": "playbook not found"}, status=404)
+                    return
+                self.send_json(row)
+                return
             monitor_target_request = parse_monitor_target_api_path(path)
             if monitor_target_request:
                 if config is None:
@@ -136,6 +156,15 @@ def start_dashboard(
                     return
                 if action == "failed-actions":
                     self.send_json(storage.latest_failed_action_logs(100, incident_id=incident_id))
+                    return
+                if action == "playbook-matches":
+                    if config is None:
+                        self.send_json({"error": "config is not configured"}, status=503)
+                        return
+                    try:
+                        self.send_json(preview_incident_playbooks(storage, config, incident_id))
+                    except ValueError as exc:
+                        self.send_json({"error": str(exc)}, status=404)
                     return
             if path == "/api/action-logs":
                 self.send_json(storage.latest_action_logs())
@@ -274,6 +303,23 @@ def start_dashboard(
                     updated = storage.mark_incident_false_positive(incident_id, actor=actor, reason=note)
                     self.record_audit(path, 200, "success", "incident marked false positive", actor=actor, auth=auth)
                     self.send_json(updated)
+                    return
+
+                if action == "playbook-recommendations":
+                    if config is None:
+                        self.record_audit(path, 503, "error", "config is not configured", actor=actor, auth=auth)
+                        self.send_json({"error": "config is not configured"}, status=503)
+                        return
+                    result = create_incident_playbook_recommendations(storage, config, incident_id)
+                    self.record_audit(
+                        path,
+                        200,
+                        "success",
+                        f"playbook recommendations saved={result.get('saved_count')}",
+                        actor=actor,
+                        auth=auth,
+                    )
+                    self.send_json(result)
                     return
 
                 to_status = status_from_incident_action(action, body)
@@ -1257,6 +1303,8 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/action-logs": ("action.list", "action", None),
         "/api/notification-logs": ("notification.list", "notification", None),
         "/api/monitor-targets": ("monitor_target.list", "monitor_target", None),
+        "/api/playbooks": ("playbook.list", "playbook", None),
+        "/api/playbooks/detail": ("playbook.detail", "playbook", None),
         "/api/actions/failed": ("action.failed", "action", None),
         "/api/actions/pending": ("action.pending", "action", None),
         "/api/incidents": ("incident.list", "incident", None),

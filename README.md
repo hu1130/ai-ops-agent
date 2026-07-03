@@ -512,11 +512,15 @@ GET  /api/incidents/1/events
 GET  /api/incidents/1/recommendations
 GET  /api/incidents/1/actions
 GET  /api/incidents/1/failed-actions
+GET  /api/incidents/1/playbook-matches
 POST /api/incidents/1/assign
 POST /api/incidents/1/unassign
 POST /api/incidents/1/priority
 POST /api/incidents/1/comment
 POST /api/incidents/1/false-positive
+POST /api/incidents/1/playbook-recommendations
+GET  /api/playbooks
+GET  /api/playbooks/detail?name=web%20triage
 GET  /api/monitor-targets
 GET  /api/monitor-targets/http/0
 POST /api/monitor-targets/http
@@ -556,6 +560,8 @@ POST /api/incidents/1/transition
 `GET /api/incidents/1/detail` 会一次返回事件本体、事件流、评论、结构化处置建议、关联动作、失败动作、通知日志和摘要字段，方便后续前端直接展示处理闭环和升级原因。结构化建议也可以通过 `GET /api/incidents/1/recommendations` 单独读取，字段包括动作类型、风险、是否需要人工确认、是否需要执行后验证、当前状态、参数和策略/playbook 元信息。
 
 事件列表支持筛选：`status`、`assignee`、`priority`、`severity`、`false_positive`、`limit`。例如：`GET /api/incidents?assignee=alice&priority=high&false_positive=false`。`assign`/`priority`/`comment`/`false-positive` 会写入事件审计；误报标记会把事件关闭，并保留误报原因。
+
+Playbook Center API：`GET /api/playbooks` 返回当前配置里的自愈剧本清单和步骤摘要；`GET /api/incidents/1/playbook-matches` 会按事件里的巡检结果预览匹配剧本和策略允许/拒绝的动作；`POST /api/incidents/1/playbook-recommendations` 会把允许的动作追加写入事件推荐队列，重复调用会去重，不会覆盖已有审批记录。真正执行仍然走 `/api/recommendations/1/request-approval`、`approve`、`reject`。
 
 推荐项状态机通过 `POST /api/recommendations/1/*` 操作：`request-approval` 会创建并绑定待确认动作；`approve` 会复用动作审批执行链路，写回执行和验证结果；`reject` 会拒绝推荐项及其待确认动作。
 
