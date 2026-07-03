@@ -7,8 +7,10 @@ from pathlib import Path
 from ops_agent.config import AppConfig
 from ops_agent.dashboard import start_dashboard
 from ops_agent.events import CheckResult
+from ops_agent.remediation.approval import approve_action_log
 from ops_agent.remediation.actions import RemediationAction
 from ops_agent.remediation.readiness import evaluate_action_readiness, incident_self_heal_readiness
+from ops_agent.remediation.recommendations import approve_recommendation
 from ops_agent.storage import Storage
 
 
@@ -111,6 +113,74 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(1, payload["recommendation_count"])
         self.assertEqual(1, payload["auto_ready_count"])
         self.assertEqual("auto_ready", payload["recommendations"][0]["readiness"]["status"])
+
+    def test_action_approval_is_blocked_by_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            incident_id = storage.save_incident(
+                "critical",
+                "Site down",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+                occurrence_count=3,
+            )
+            action_id = storage.save_action_log(
+                "restart_service",
+                "Restart ops-agent",
+                "medium",
+                "pending_approval",
+                "Service unavailable",
+                {"service": "ops-agent"},
+                incident_id=incident_id,
+            )
+
+            approval = approve_action_log(storage, restart_config(), action_id, actor="tester")
+            row = storage.get_action_log(action_id)
+            storage.close()
+
+        self.assertEqual("skipped", approval.result.status)
+        self.assertEqual("blocked", approval.readiness["status"])
+        self.assertIn("saved incident diagnosis", approval.result.error)
+        self.assertEqual("skipped", row["status"])
+        self.assertEqual("approved", row["decision"])
+        self.assertEqual("tester", row["approved_by"])
+
+    def test_recommendation_approval_records_readiness_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            incident_id = storage.save_incident(
+                "critical",
+                "Site down",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+                occurrence_count=3,
+            )
+            storage.save_incident_recommendations(
+                incident_id,
+                [
+                    {
+                        "position": 1,
+                        "category": "remediate",
+                        "action_type": "restart_service",
+                        "title": "Restart ops-agent",
+                        "reason": "Service unavailable",
+                        "risk": "medium",
+                        "approval_required": True,
+                        "status": "suggested",
+                        "params": {"service": "ops-agent"},
+                    }
+                ],
+            )
+            recommendation_id = storage.latest_incident_recommendations(incident_id)[0]["id"]
+
+            result = approve_recommendation(storage, restart_config(), recommendation_id, actor="tester")
+            current = storage.get_incident_recommendation(recommendation_id)
+            storage.close()
+
+        self.assertEqual("skipped", result["recommendation"]["status"])
+        self.assertEqual("blocked", result["action"]["readiness"]["status"])
+        self.assertEqual("blocked", current["metadata"]["readiness"]["status"])
+        self.assertIn("saved incident diagnosis", current["metadata"]["action_result"]["error"])
 
 
 def restart_config() -> AppConfig:

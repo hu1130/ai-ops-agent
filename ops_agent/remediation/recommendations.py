@@ -71,6 +71,7 @@ def approve_recommendation(
             "action_log_id": action_log_id,
             "action_result": approval.result.to_dict(),
             "verification": approval.verification.__dict__ if approval.verification else None,
+            "readiness": approval.readiness,
         },
     )
     return {"recommendation": updated, "action": approval.to_dict()}

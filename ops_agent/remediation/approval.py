@@ -6,8 +6,9 @@ from datetime import datetime, timedelta, timezone
 
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig
-from ops_agent.remediation.actions import ActionResult, RemediationAction
+from ops_agent.remediation.actions import ActionResult, RemediationAction, action_from_dict
 from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action
+from ops_agent.remediation.readiness import evaluate_action_readiness, latest_diagnosis
 from ops_agent.remediation.verifier import VerificationResult, verify_after_action
 from ops_agent.storage import Storage
 
@@ -22,6 +23,7 @@ class ApprovalExecution:
     result: ActionResult
     verification: VerificationResult | None
     row: dict
+    readiness: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -30,6 +32,7 @@ class ApprovalExecution:
             "result": self.result.to_dict(),
             "verification": self.verification.__dict__ if self.verification else None,
             "row": self.row,
+            "readiness": self.readiness,
         }
 
 
@@ -51,6 +54,23 @@ def approve_action_log(
         raise ValueError(expired_reason)
 
     action = action_from_log(row)
+    readiness = action_readiness_for_log(storage, config, row, action)
+    if readiness["status"] == "blocked":
+        result = ActionResult(
+            action=action_from_dict(readiness["action"]),
+            status="skipped",
+            error=format_readiness_blockers(readiness),
+        )
+        storage.update_action_log(
+            action_id,
+            result.status,
+            result.output,
+            result.error,
+            approved_by=actor,
+        )
+        updated = storage.get_action_log(action_id) or {}
+        return ApprovalExecution(action_id, result.action, result, None, updated, readiness)
+
     result = execute_action(action, config, dry_run=False, approved=True)
     storage.update_action_log(
         action_id,
@@ -61,7 +81,7 @@ def approve_action_log(
     )
     verification = verify_and_record(storage, config, action_id, action, result.status, notifier)
     updated = storage.get_action_log(action_id) or {}
-    return ApprovalExecution(action_id, action, result, verification, updated)
+    return ApprovalExecution(action_id, action, result, verification, updated, readiness)
 
 
 def reject_action_log(storage: Storage, action_id: int, actor: str = "operator", note: str = "") -> dict:
@@ -116,6 +136,28 @@ def action_from_log(row: dict) -> RemediationAction:
         params=params,
         auto_execute=True,
     )
+
+
+def action_readiness_for_log(
+    storage: Storage,
+    config: AppConfig,
+    row: dict,
+    action: RemediationAction,
+) -> dict:
+    incident = None
+    diagnosis = None
+    if row.get("incident_id"):
+        incident_id = int(row["incident_id"])
+        incident = storage.get_incident(incident_id)
+        diagnosis = latest_diagnosis(storage, incident_id)
+    return evaluate_action_readiness(action, config, incident=incident, diagnosis=diagnosis)
+
+
+def format_readiness_blockers(readiness: dict) -> str:
+    blockers = [str(item) for item in readiness.get("blockers") or [] if str(item)]
+    if not blockers:
+        return "readiness blocked action execution"
+    return "readiness blocked: " + "; ".join(blockers)
 
 
 def verify_and_record(
