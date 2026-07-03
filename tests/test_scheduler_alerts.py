@@ -37,6 +37,23 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertIn("过去 24 小时巡检记录: 2 条", report)
         self.assertIn("警告: 1 条", report)
 
+    def test_due_checks_skips_disabled_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            scheduler = OpsScheduler(
+                AppConfig(raw={"app": {"interval_seconds": 60}}, base_dir=Path(tmp)),
+                storage,
+                RecordingNotifier(),
+            )
+            checks = [
+                {"name": "Enabled", "url": "https://example.com", "enabled": True},
+                {"name": "Disabled", "url": "https://disabled.example.com", "enabled": False},
+            ]
+            due = scheduler.due_checks("http", checks, respect_intervals=False, now=0)
+            storage.close()
+
+        self.assertEqual(["Enabled"], [check["name"] for check in due])
+
     def test_alert_creates_remediation_action_logs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AppConfig(

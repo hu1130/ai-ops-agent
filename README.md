@@ -512,6 +512,14 @@ GET  /api/incidents/1/events
 GET  /api/incidents/1/recommendations
 GET  /api/incidents/1/actions
 GET  /api/incidents/1/failed-actions
+GET  /api/monitor-targets
+GET  /api/monitor-targets/http/0
+POST /api/monitor-targets/http
+POST /api/monitor-targets/http/0/update
+POST /api/monitor-targets/http/0/enable
+POST /api/monitor-targets/http/0/disable
+POST /api/monitor-targets/http/0/delete
+POST /api/monitor-targets/server/update
 GET  /api/notification-logs
 GET  /api/classifications/summary?hours=24
 GET  /api/learning/recommendations

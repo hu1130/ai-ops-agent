@@ -5,7 +5,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from ops_agent.config import AppConfig
+from ops_agent.config import AppConfig, load_config
 from ops_agent.dashboard import render_page, start_dashboard
 from ops_agent.events import CheckResult
 from ops_agent.storage import Storage
@@ -531,6 +531,65 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("sent", rows[0]["status"])
         self.assertEqual("http:Site:critical", rows[0]["dedupe_key"])
         self.assertEqual(["critical-email"], json.loads(rows[0]["route_names_json"]))
+
+    def test_monitor_targets_api_lists_updates_and_creates_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "app": {"interval_seconds": 60},
+                        "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+                        "http_checks": [{"name": "Site", "url": "https://example.com"}],
+                        "json_checks": [
+                            {
+                                "name": "Chat",
+                                "url": "https://example.com/chat",
+                                "json": {"api_key": "secret", "message": "hello"},
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            storage = Storage(Path(tmp) / "ops.db")
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(f"http://{host}:{port}/api/monitor-targets", timeout=5) as response:
+                    listed = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/monitor-targets/http/0/disable",
+                    data=b'{"actor":"tester"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    disabled = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/monitor-targets/http",
+                    data=b'{"target":{"name":"API","url":"https://api.example.com/health","timeout_seconds":3}}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    created = json.loads(response.read().decode("utf-8"))
+                audit = storage.latest_api_audit_logs(2)
+                saved = json.loads(config_path.read_text(encoding="utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("***", listed["targets"][1]["target"]["json"]["api_key"])
+        self.assertFalse(disabled["target"]["enabled"])
+        self.assertEqual("API", created["target"]["name"])
+        self.assertFalse(saved["http_checks"][0]["enabled"])
+        self.assertEqual("API", saved["http_checks"][1]["name"])
+        self.assertEqual("monitor_target.create", audit[0]["operation"])
+        self.assertEqual("monitor_target.disable", audit[1]["operation"])
 
     def test_action_approval_api_lists_and_rejects_pending_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -639,12 +639,13 @@ class OpsScheduler:
         return saved
 
     def due_checks(self, source: str, checks: list[dict], respect_intervals: bool, now: float) -> list[dict]:
+        enabled_checks = [check for check in checks if check.get("enabled", True)]
         if not respect_intervals:
-            return checks
+            return enabled_checks
 
         due: list[dict] = []
         default_interval = int(self.config.app.get("interval_seconds", 60))
-        for index, check in enumerate(checks):
+        for index, check in enumerate(enabled_checks):
             interval = int(check.get("interval_seconds", default_interval))
             key = f"{source}:{check.get('name', index)}"
             last_run = self._last_run.get(key)

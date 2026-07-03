@@ -15,6 +15,11 @@ from ops_agent.ai.config_patches import (
     preview_config_patch,
 )
 from ops_agent.ai.learning_review import build_learning_optimization_draft
+from ops_agent.monitor_targets import (
+    apply_monitor_target_change,
+    get_monitor_target,
+    list_monitor_targets,
+)
 from ops_agent.remediation.approval import approve_action_log, reject_action_log
 from ops_agent.remediation.recommendations import (
     approve_recommendation,
@@ -82,6 +87,20 @@ def start_dashboard(
                     return
             if path == "/api/results":
                 self.send_json(storage.latest_results())
+                return
+            if path == "/api/monitor-targets":
+                self.send_json(list_monitor_targets(config.raw if config else {}))
+                return
+            monitor_target_request = parse_monitor_target_api_path(path)
+            if monitor_target_request:
+                if config is None:
+                    self.send_json({"error": "config is not configured"}, status=503)
+                    return
+                target_type, index, _action = monitor_target_request
+                try:
+                    self.send_json(get_monitor_target(config.raw, target_type, index))
+                except ValueError as exc:
+                    self.send_json({"error": str(exc)}, status=404)
                 return
             if path == "/api/incidents":
                 self.send_json(storage.latest_incidents())
@@ -180,6 +199,11 @@ def start_dashboard(
                 self.handle_learning_recommendation_post(learning_request, auth)
                 return
 
+            monitor_target_request = parse_monitor_target_api_path(path)
+            if monitor_target_request:
+                self.handle_monitor_target_post(monitor_target_request, auth)
+                return
+
             recommendation_request = parse_recommendation_api_path(path)
             if recommendation_request:
                 self.handle_recommendation_post(recommendation_request, auth)
@@ -219,6 +243,41 @@ def start_dashboard(
                 return
             self.record_audit(path, 200, "success", f"incident status={updated.get('status')}", actor=actor, auth=auth)
             self.send_json(updated)
+
+        def handle_monitor_target_post(
+            self,
+            target_request: tuple[str, int | None, str],
+            auth: AuthResult,
+        ) -> None:
+            target_type, index, action = target_request
+            path = self.path.split("?", 1)[0]
+            actor = "api"
+            try:
+                if config is None or config.config_path is None:
+                    self.record_audit(path, 503, "error", "config path is not configured", actor=actor, auth=auth)
+                    self.send_json({"error": "config path is not configured"}, status=503)
+                    return
+                body = self.read_json_body()
+                actor = self.actor_from_body(body, auth)
+                result = apply_monitor_target_change(config, target_type, index, action, body)
+                self.record_audit(
+                    path,
+                    200,
+                    "success",
+                    f"monitor target {result.get('action')} {result.get('target', {}).get('id')}",
+                    actor=actor,
+                    auth=auth,
+                )
+                self.send_json(result)
+                return
+            except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
+                return
 
         def handle_action_post(self, action_request: tuple[int, str], auth: AuthResult) -> None:
             action_id, action = action_request
@@ -1068,7 +1127,27 @@ def parse_learning_config_patch_api_path(path: str) -> tuple[int, str] | None:
     return patch_id, action
 
 
+def parse_monitor_target_api_path(path: str) -> tuple[str, int | None, str] | None:
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 3 or parts[0] != "api" or parts[1] != "monitor-targets":
+        return None
+    target_type = parts[2]
+    if len(parts) == 3:
+        return target_type, None, ""
+    if parts[3].isdigit():
+        index = int(parts[3])
+        action = parts[4] if len(parts) >= 5 else ""
+        return target_type, index, action
+    return target_type, None, parts[3]
+
+
 def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
+    monitor_request = parse_monitor_target_api_path(path)
+    if monitor_request:
+        target_type, index, action = monitor_request
+        operation = f"monitor_target.{action or ('update' if index is not None or target_type == 'server' else 'create')}"
+        return operation, f"monitor_target.{target_type}", index
+
     config_patch_request = parse_learning_config_patch_api_path(path)
     if config_patch_request:
         patch_id, action = config_patch_request
@@ -1103,6 +1182,7 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/audit-logs": ("audit.list", "audit", None),
         "/api/action-logs": ("action.list", "action", None),
         "/api/notification-logs": ("notification.list", "notification", None),
+        "/api/monitor-targets": ("monitor_target.list", "monitor_target", None),
         "/api/actions/failed": ("action.failed", "action", None),
         "/api/actions/pending": ("action.pending", "action", None),
         "/api/incidents": ("incident.list", "incident", None),
