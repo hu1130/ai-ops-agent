@@ -9,6 +9,15 @@ from urllib.parse import parse_qs, urlsplit
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.auth import AuthResult, authenticate_token, configured_api_tokens, has_role
 from ops_agent.config import AppConfig
+from ops_agent.config_center import (
+    apply_config_update,
+    backup_config,
+    candidate_from_body,
+    config_snapshot,
+    list_config_backups,
+    restore_config_backup,
+    validate_config_candidate,
+)
 from ops_agent.ai.config_patches import (
     apply_config_patch,
     build_config_patch_from_recommendation,
@@ -77,6 +86,21 @@ def start_dashboard(
                 return
             if path == "/api/learning/config-patches":
                 self.send_json(storage.latest_learning_config_patches(**learning_config_patch_filters_from_query(query)))
+                return
+            if path == "/api/config":
+                if config is None:
+                    self.send_json({"error": "config is not configured"}, status=503)
+                    return
+                self.send_json(config_snapshot(config))
+                return
+            if path == "/api/config/backups":
+                if config is None:
+                    self.send_json({"error": "config is not configured"}, status=503)
+                    return
+                try:
+                    self.send_json(list_config_backups(config))
+                except ValueError as exc:
+                    self.send_json({"error": str(exc)}, status=503)
                 return
             config_patch_request = parse_learning_config_patch_api_path(path)
             if config_patch_request:
@@ -230,6 +254,10 @@ def start_dashboard(
                 self.handle_learning_config_patch_post(config_patch_request, auth)
                 return
 
+            if path.startswith("/api/config"):
+                self.handle_config_center_post(path, auth)
+                return
+
             learning_request = parse_learning_recommendation_api_path(path)
             if learning_request:
                 self.handle_learning_recommendation_post(learning_request, auth)
@@ -347,6 +375,75 @@ def start_dashboard(
                 return
             self.record_audit(path, 200, "success", f"incident status={updated.get('status')}", actor=actor, auth=auth)
             self.send_json(updated)
+
+        def handle_config_center_post(self, path: str, auth: AuthResult) -> None:
+            actor = "api"
+            try:
+                body = self.read_json_body()
+                actor = self.actor_from_body(body, auth)
+                if config is None or config.config_path is None:
+                    self.record_audit(path, 503, "error", "config path is not configured", actor=actor, auth=auth)
+                    self.send_json({"error": "config path is not configured"}, status=503)
+                    return
+
+                if path == "/api/config/validate":
+                    candidate = candidate_from_body(body)
+                    result = validate_config_candidate(config, candidate)
+                    self.record_audit(
+                        path,
+                        200,
+                        "success" if result.get("valid") else "validation_failed",
+                        "config validation passed" if result.get("valid") else "config validation failed",
+                        actor=actor,
+                        auth=auth,
+                    )
+                    self.send_json(result)
+                    return
+
+                if path == "/api/config/backup":
+                    result = backup_config(config, reason=str(body.get("reason") or "manual"))
+                    self.record_audit(path, 200, "success", f"config backup {result.get('name')}", actor=actor, auth=auth)
+                    self.send_json({"status": "backed_up", "backup": result})
+                    return
+
+                if path == "/api/config/apply":
+                    candidate = candidate_from_body(body)
+                    result = apply_config_update(config, candidate, reason=str(body.get("reason") or "api-apply"))
+                    self.record_audit(
+                        path,
+                        200,
+                        "success",
+                        f"config applied sections={','.join(result.get('changed_sections') or [])}",
+                        actor=actor,
+                        auth=auth,
+                    )
+                    self.send_json(result)
+                    return
+
+                if path == "/api/config/restore":
+                    result = restore_config_backup(config, str(body.get("backup") or body.get("name") or ""))
+                    self.record_audit(
+                        path,
+                        200,
+                        "success",
+                        f"config restored from {result.get('restored_from', {}).get('name')}",
+                        actor=actor,
+                        auth=auth,
+                    )
+                    self.send_json(result)
+                    return
+
+                self.record_audit(path, 404, "not_found", "unsupported config api path", actor=actor, auth=auth)
+                self.send_json({"error": "not found"}, status=404)
+                return
+            except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
+                return
 
         def handle_monitor_target_post(
             self,
@@ -1354,6 +1451,12 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/audit-logs": ("audit.list", "audit", None),
         "/api/action-logs": ("action.list", "action", None),
         "/api/notification-logs": ("notification.list", "notification", None),
+        "/api/config": ("config.read", "config", None),
+        "/api/config/backups": ("config.backups", "config", None),
+        "/api/config/validate": ("config.validate", "config", None),
+        "/api/config/backup": ("config.backup", "config", None),
+        "/api/config/apply": ("config.apply", "config", None),
+        "/api/config/restore": ("config.restore", "config", None),
         "/api/monitor-targets": ("monitor_target.list", "monitor_target", None),
         "/api/playbooks": ("playbook.list", "playbook", None),
         "/api/playbooks/detail": ("playbook.detail", "playbook", None),

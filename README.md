@@ -618,7 +618,21 @@ GET  /api/actions/failed
 GET  /api/actions/1
 POST /api/actions/1/approve
 POST /api/actions/1/reject
+GET  /api/config
+GET  /api/config/backups
+POST /api/config/validate
+POST /api/config/backup
+POST /api/config/apply
+POST /api/config/restore
 ```
+
+Config center behavior:
+
+- `GET /api/config` returns the active config with secrets redacted.
+- `POST /api/config/validate` validates a full candidate config without writing it.
+- `POST /api/config/backup` creates a manual backup beside `config.json`.
+- `POST /api/config/apply` validates, backs up, then replaces `config.json`.
+- `POST /api/config/restore` restores from a generated backup file name, validates it first, then backs up the current file before rollback.
 
 确认动作：
 ```json

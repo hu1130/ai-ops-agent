@@ -718,6 +718,83 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("monitor_target.create", audit[0]["operation"])
         self.assertEqual("monitor_target.disable", audit[1]["operation"])
 
+    def test_config_center_api_validates_applies_and_restores_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            original = {
+                "app": {"interval_seconds": 60},
+                "alerts": {"smtp_password": "mail-secret"},
+                "http_checks": [{"name": "Site", "url": "https://example.com"}],
+            }
+            config_path.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
+            config = load_config(config_path)
+            storage = Storage(Path(tmp) / "ops.db")
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(f"http://{host}:{port}/api/config", timeout=5) as response:
+                    snapshot = json.loads(response.read().decode("utf-8"))
+
+                candidate = json.loads(config_path.read_text(encoding="utf-8"))
+                candidate["app"]["interval_seconds"] = 120
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/config/validate",
+                    data=json.dumps({"actor": "tester", "config": candidate}).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    validation = json.loads(response.read().decode("utf-8"))
+
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/config/backup",
+                    data=b'{"actor":"tester","reason":"api-test"}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    backup = json.loads(response.read().decode("utf-8"))
+
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/config/apply",
+                    data=json.dumps({"actor": "tester", "config": candidate}).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    applied = json.loads(response.read().decode("utf-8"))
+
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/config/restore",
+                    data=json.dumps({"actor": "tester", "backup": backup["backup"]["name"]}).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    restored = json.loads(response.read().decode("utf-8"))
+
+                with urllib.request.urlopen(f"http://{host}:{port}/api/config/backups", timeout=5) as response:
+                    backups = json.loads(response.read().decode("utf-8"))
+
+                audit = storage.latest_api_audit_logs(4)
+                saved = json.loads(config_path.read_text(encoding="utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("***", snapshot["config"]["alerts"]["smtp_password"])
+        self.assertTrue(validation["valid"])
+        self.assertEqual(["app"], validation["changed_sections"])
+        self.assertEqual("applied", applied["status"])
+        self.assertEqual("restored", restored["status"])
+        self.assertEqual(60, saved["app"]["interval_seconds"])
+        self.assertGreaterEqual(len(backups["backups"]), 2)
+        self.assertEqual("config.restore", audit[0]["operation"])
+        self.assertEqual("config.apply", audit[1]["operation"])
+        self.assertEqual("config.backup", audit[2]["operation"])
+        self.assertEqual("config.validate", audit[3]["operation"])
+
     def test_action_approval_api_lists_and_rejects_pending_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")
