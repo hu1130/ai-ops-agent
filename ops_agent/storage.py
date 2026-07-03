@@ -102,6 +102,20 @@ class Storage:
                     metadata_json text not null default '{}'
                 );
 
+                create table if not exists incident_diagnoses (
+                    id integer primary key autoincrement,
+                    incident_id integer not null,
+                    created_at text not null,
+                    environment text not null default 'prod',
+                    run_type text not null default 'normal',
+                    trace_id text not null default '',
+                    top_category text not null default '',
+                    top_confidence real not null default 0,
+                    next_decision text not null default '',
+                    evidence_json text not null default '{}',
+                    payload_json text not null default '{}'
+                );
+
                 create table if not exists incident_recommendations (
                     id integer primary key autoincrement,
                     incident_id integer not null,
@@ -236,6 +250,8 @@ class Storage:
                     on incident_recommendations (incident_id, position, id);
                 create index if not exists idx_incident_comments_incident
                     on incident_comments (incident_id, id);
+                create index if not exists idx_incident_diagnoses_incident
+                    on incident_diagnoses (incident_id, id);
                 create unique index if not exists idx_learning_recommendations_dedupe
                     on learning_recommendations (dedupe_key);
                 create index if not exists idx_learning_config_patches_status
@@ -983,6 +999,7 @@ class Storage:
             return None
         events = self.latest_incident_events(incident_id)
         comments = self.latest_incident_comments(incident_id)
+        diagnoses = self.latest_incident_diagnoses(incident_id)
         recommendations = self.latest_incident_recommendations(incident_id)
         actions = self.latest_action_logs(100, incident_id=incident_id)
         failed_actions = self.latest_failed_action_logs(100, incident_id=incident_id)
@@ -991,6 +1008,8 @@ class Storage:
             "incident": incident,
             "events": events,
             "comments": comments,
+            "diagnosis": diagnoses[0] if diagnoses else None,
+            "diagnoses": diagnoses,
             "recommendations": recommendations,
             "actions": actions,
             "failed_actions": failed_actions,
@@ -1000,6 +1019,7 @@ class Storage:
                 "escalation_level": int(incident.get("escalation_level") or 0),
                 "event_count": len(events),
                 "comment_count": len(comments),
+                "diagnosis_count": len(diagnoses),
                 "recommendation_count": len(recommendations),
                 "action_count": len(actions),
                 "failed_action_count": len(failed_actions),
@@ -1843,6 +1863,51 @@ class Storage:
             if commit:
                 self.connection.commit()
             return int(cursor.lastrowid)
+
+    def save_incident_diagnosis(self, incident_id: int, diagnosis: dict) -> int:
+        context = safe_dict(diagnosis.get("context"))
+        causes = safe_list(diagnosis.get("probable_causes"))
+        top = safe_dict(causes[0]) if causes else {}
+        next_decision = safe_dict(diagnosis.get("next_decision"))
+        evidence = safe_dict(diagnosis.get("evidence"))
+        created_at = utc_now_iso()
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                insert into incident_diagnoses (
+                    incident_id, created_at, environment, run_type, trace_id,
+                    top_category, top_confidence, next_decision, evidence_json, payload_json
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    incident_id,
+                    created_at,
+                    str(context.get("environment") or "prod"),
+                    str(context.get("run_type") or "normal"),
+                    str(context.get("trace_id") or ""),
+                    str(top.get("category") or ""),
+                    safe_float(top.get("confidence")),
+                    str(next_decision.get("action") or ""),
+                    json.dumps(evidence, ensure_ascii=False),
+                    json.dumps(diagnosis, ensure_ascii=False),
+                ),
+            )
+            self.connection.commit()
+            return int(cursor.lastrowid)
+
+    def latest_incident_diagnoses(self, incident_id: int, limit: int = 10) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                """
+                select * from incident_diagnoses
+                where incident_id = ?
+                order by id desc
+                limit ?
+                """,
+                (incident_id, limit),
+            ).fetchall()
+        return [diagnosis_record_payload(row) for row in rows]
 
     def save_action_log(
         self,
@@ -2801,6 +2866,13 @@ def recommendation_payload(row: sqlite3.Row) -> dict:
     payload["verification_required"] = bool(payload.get("verification_required"))
     payload["params"] = parse_json_object(str(payload.get("params_json") or "{}"))
     payload["metadata"] = parse_json_object(str(payload.get("metadata_json") or "{}"))
+    return payload
+
+
+def diagnosis_record_payload(row: sqlite3.Row) -> dict:
+    payload = dict(row)
+    payload["evidence"] = parse_json_object(str(payload.get("evidence_json") or "{}"))
+    payload["payload"] = parse_json_object(str(payload.get("payload_json") or "{}"))
     return payload
 
 

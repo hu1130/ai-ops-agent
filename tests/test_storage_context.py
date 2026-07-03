@@ -138,6 +138,9 @@ class StorageContextTest(unittest.TestCase):
             incident_comments_exists = storage.connection.execute(
                 "select name from sqlite_master where type = 'table' and name = 'incident_comments'"
             ).fetchone()
+            incident_diagnoses_exists = storage.connection.execute(
+                "select name from sqlite_master where type = 'table' and name = 'incident_diagnoses'"
+            ).fetchone()
             learning_columns = [
                 row["name"]
                 for row in storage.connection.execute("pragma table_info(learning_recommendations)").fetchall()
@@ -161,6 +164,7 @@ class StorageContextTest(unittest.TestCase):
         self.assertEqual("resolved", recovered_incident["status"])
         self.assertIsNotNone(incident_events_exists)
         self.assertIsNotNone(incident_comments_exists)
+        self.assertIsNotNone(incident_diagnoses_exists)
         self.assertIsNotNone(audit_logs_exists)
         self.assertIsNotNone(learning_recommendations_exists)
         self.assertIsNotNone(learning_config_patches_exists)

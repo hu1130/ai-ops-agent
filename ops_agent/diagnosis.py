@@ -7,7 +7,12 @@ from ops_agent.config import AppConfig
 from ops_agent.storage import Storage
 
 
-def build_incident_diagnosis(storage: Storage, config: AppConfig | None, incident_id: int) -> dict[str, Any]:
+def build_incident_diagnosis(
+    storage: Storage,
+    config: AppConfig | None,
+    incident_id: int,
+    collected_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     incident = storage.get_incident(incident_id)
     if not incident:
         raise ValueError("incident not found")
@@ -16,6 +21,8 @@ def build_incident_diagnosis(storage: Storage, config: AppConfig | None, inciden
     causes = rank_probable_causes(incident, results)
     related = related_incidents(storage, incident, results)
     collection_plan = build_collection_plan(causes, results, config)
+    signals = normalize_signals(results)
+    evidence = build_evidence_package(incident, signals, causes, collection_plan, collected_evidence)
     return {
         "incident": incident,
         "context": {
@@ -25,11 +32,61 @@ def build_incident_diagnosis(storage: Storage, config: AppConfig | None, inciden
             "classification_category": incident.get("classification_category") or "",
             "classification_confidence": incident.get("classification_confidence") or 0,
         },
-        "signals": normalize_signals(results),
+        "signals": signals,
         "probable_causes": causes,
+        "evidence": evidence,
         "collection_plan": collection_plan,
         "related_incidents": related,
         "next_decision": next_decision(causes, incident),
+    }
+
+
+def persist_incident_diagnosis(
+    storage: Storage,
+    config: AppConfig | None,
+    incident_id: int,
+    collected_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    diagnosis = build_incident_diagnosis(storage, config, incident_id, collected_evidence=collected_evidence)
+    diagnosis_id = storage.save_incident_diagnosis(incident_id, diagnosis)
+    diagnosis["diagnosis_id"] = diagnosis_id
+    return diagnosis
+
+
+def build_evidence_package(
+    incident: dict[str, Any],
+    signals: list[dict[str, Any]],
+    causes: list[dict[str, Any]],
+    collection_plan: list[dict[str, Any]],
+    collected_evidence: dict[str, Any] | None,
+) -> dict[str, Any]:
+    top = causes[0] if causes else {}
+    return {
+        "source": "ops-agent",
+        "incident_summary": {
+            "id": incident.get("id"),
+            "title": incident.get("title"),
+            "severity": incident.get("severity"),
+            "status": incident.get("status"),
+            "last_summary": incident.get("last_summary") or "",
+        },
+        "monitor_signals": signals,
+        "top_cause": {
+            "category": top.get("category") or "",
+            "confidence": top.get("confidence") or 0,
+            "evidence": top.get("evidence") or [],
+        },
+        "collection_plan": collection_plan,
+        "collected": collected_evidence or {},
+    }
+
+
+def diagnostic_snapshot_evidence(snapshot: object) -> dict[str, Any]:
+    return {
+        "resource_lines": list(getattr(snapshot, "resource_lines", []) or []),
+        "docker_lines": list(getattr(snapshot, "docker_lines", []) or []),
+        "log_lines": list(getattr(snapshot, "log_lines", []) or []),
+        "command_lines": list(getattr(snapshot, "command_lines", []) or []),
     }
 
 

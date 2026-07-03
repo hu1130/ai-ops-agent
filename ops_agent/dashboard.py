@@ -18,7 +18,7 @@ from ops_agent.config_center import (
     restore_config_backup,
     validate_config_candidate,
 )
-from ops_agent.diagnosis import build_incident_diagnosis
+from ops_agent.diagnosis import persist_incident_diagnosis
 from ops_agent.ai.config_patches import (
     apply_config_patch,
     build_config_patch_from_recommendation,
@@ -197,9 +197,12 @@ def start_dashboard(
                 if action == "failed-actions":
                     self.send_json(storage.latest_failed_action_logs(100, incident_id=incident_id))
                     return
+                if action == "diagnoses":
+                    self.send_json(storage.latest_incident_diagnoses(incident_id))
+                    return
                 if action == "diagnosis":
                     try:
-                        self.send_json(build_incident_diagnosis(storage, config, incident_id))
+                        self.send_json(persist_incident_diagnosis(storage, config, incident_id))
                     except ValueError as exc:
                         self.send_json({"error": str(exc)}, status=404)
                     return

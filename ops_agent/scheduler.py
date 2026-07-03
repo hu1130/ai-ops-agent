@@ -18,6 +18,7 @@ from ops_agent.alerts.routing import (
 from ops_agent.config import AppConfig
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.diagnostics.suggestions import build_action_suggestions
+from ops_agent.diagnosis import diagnostic_snapshot_evidence, persist_incident_diagnosis
 from ops_agent.events import CheckResult, RunContext, apply_context
 from ops_agent.monitors.http_monitor import run_http_checks
 from ops_agent.monitors.json_api_monitor import run_json_checks
@@ -163,6 +164,12 @@ class OpsScheduler:
                 classification=classification_payload(new_alerts, self.config.classification_rules),
             )
             action_results = self.process_remediation_actions(action_plan, new_alerts, incident_id=incident_id)
+            diagnosis = persist_incident_diagnosis(
+                self.storage,
+                self.config,
+                incident_id,
+                collected_evidence=diagnostic_snapshot_evidence(diagnostics),
+            )
             self.storage.save_incident_recommendations(
                 incident_id,
                 build_incident_recommendations(
@@ -173,7 +180,8 @@ class OpsScheduler:
                 ),
             )
             remediation_text = format_action_plan(action_plan, action_results)
-            analysis = f"{analysis}{remediation_text}"
+            diagnosis_text = format_persisted_diagnosis_for_analysis(diagnosis)
+            analysis = f"{analysis}{diagnosis_text}{remediation_text}"
             self.storage.update_incident_analysis(incident_id, analysis)
             for result in new_alerts:
                 self._issues[check_key(result)].incident_id = incident_id
@@ -964,6 +972,23 @@ def build_action_failure_escalation_message(
         if result.output:
             lines.append(f"  输出: {result.output}")
     return "\n".join(lines)
+
+
+def format_persisted_diagnosis_for_analysis(diagnosis: dict) -> str:
+    causes = diagnosis.get("probable_causes") or []
+    top = causes[0] if causes else {}
+    decision = diagnosis.get("next_decision") or {}
+    evidence = diagnosis.get("evidence") or {}
+    signal_count = len(evidence.get("monitor_signals") or [])
+    collected = evidence.get("collected") or {}
+    collected_count = sum(len(value or []) for value in collected.values() if isinstance(value, list))
+    return (
+        "\n\n自动诊断记录:\n"
+        f"- 诊断ID: {diagnosis.get('diagnosis_id', '')}\n"
+        f"- 可能原因: {top.get('category', 'unknown')} confidence={top.get('confidence', 0)}\n"
+        f"- 下一步: {decision.get('action', 'manual_triage')}\n"
+        f"- 监控信号: {signal_count} 条；采集证据: {collected_count} 条\n"
+    )
 
 
 def build_recovery_message(results: list[CheckResult]) -> str:
