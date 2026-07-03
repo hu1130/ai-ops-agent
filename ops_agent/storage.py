@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import sqlite3
@@ -911,15 +911,18 @@ class Storage:
             ).fetchone()
         return dict(updated)
 
-    def latest_results(self, limit: int = 50) -> list[dict]:
+    def latest_results(self, limit: int = 50, environment: str = "", run_type: str = "") -> list[dict]:
         with self.lock:
+            where, params = context_where(environment, run_type)
+            where_sql = f"where {' and '.join(where)}" if where else ""
             rows = self.connection.execute(
-                """
+                f"""
                 select * from check_results
+                {where_sql}
                 order by id desc
                 limit ?
                 """,
-                (limit,),
+                (*params, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -931,10 +934,11 @@ class Storage:
         priority: str = "",
         severity: str = "",
         false_positive: bool | None = None,
+        environment: str = "",
+        run_type: str = "",
     ) -> list[dict]:
         with self.lock:
-            where: list[str] = []
-            params: list[object] = []
+            where, params = context_where(environment, run_type)
             if status:
                 where.append("status = ?")
                 params.append(status)
@@ -2441,72 +2445,79 @@ class Storage:
         with self.lock:
             self.connection.execute("vacuum")
 
-    def recent_results(self, since_iso: str) -> list[dict]:
+    def recent_results(self, since_iso: str, environment: str = "", run_type: str = "") -> list[dict]:
         with self.lock:
+            where, params = context_where(environment, run_type)
+            where.append("created_at >= ?")
+            params.append(since_iso)
             rows = self.connection.execute(
-                """
+                f"""
                 select * from check_results
-                where created_at >= ?
+                where {' and '.join(where)}
                 order by id asc
                 """,
-                (since_iso,),
+                params,
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def recent_incidents(self, since_iso: str, limit: int = 100) -> list[dict]:
+    def recent_incidents(
+        self,
+        since_iso: str,
+        limit: int = 100,
+        environment: str = "",
+        run_type: str = "",
+    ) -> list[dict]:
         with self.lock:
+            where, params = context_where(environment, run_type)
+            where.append("created_at >= ?")
+            params.append(since_iso)
             rows = self.connection.execute(
-                """
+                f"""
                 select * from incidents
-                where created_at >= ?
+                where {' and '.join(where)}
                 order by id desc
                 limit ?
                 """,
-                (since_iso, limit),
+                (*params, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def dashboard_summary(self, hours: int = 24) -> dict:
+    def dashboard_summary(self, hours: int = 24, environment: str = "", run_type: str = "") -> dict:
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        rows = self.recent_results(since.isoformat(), environment=environment, run_type=run_type)
+        incidents = self.recent_incidents(since.isoformat(), environment=environment, run_type=run_type)
+        return dashboard_summary_from_rows(hours, rows, incidents)
+
+    def context_summaries(self, hours: int = 24) -> list[dict]:
         since = datetime.now(timezone.utc) - timedelta(hours=hours)
         rows = self.recent_results(since.isoformat())
-        incidents = self.recent_incidents(since.isoformat())
-        latest: dict[str, dict] = {}
-        counts = {"ok": 0, "warning": 0, "critical": 0}
-        source_counts: dict[str, int] = {}
-
-        for row in rows:
-            status = str(row.get("status", ""))
-            if status in counts:
-                counts[status] += 1
-            source = str(row.get("source", "unknown"))
-            source_counts[source] = source_counts.get(source, 0) + 1
-            latest[f"{row.get('source')}/{row.get('name')}"] = row
-
-        problem_targets = [
-            row for row in latest.values() if row.get("status") in {"warning", "critical"}
-        ]
-        total = len(rows)
-        ok_rate = round((counts["ok"] / total) * 100, 1) if total else 100.0
-        current_status = "critical" if any(row.get("status") == "critical" for row in latest.values()) else (
-            "warning" if problem_targets else "ok"
+        incidents = self.recent_incidents(since.isoformat(), limit=5000)
+        keys = sorted(
+            {
+                (str(row.get("environment") or "prod"), str(row.get("run_type") or "normal"))
+                for row in [*rows, *incidents]
+            }
         )
+        summaries: list[dict] = []
+        for environment, run_type in keys:
+            context_rows = [
+                row
+                for row in rows
+                if str(row.get("environment") or "prod") == environment
+                and str(row.get("run_type") or "normal") == run_type
+            ]
+            context_incidents = [
+                row
+                for row in incidents
+                if str(row.get("environment") or "prod") == environment
+                and str(row.get("run_type") or "normal") == run_type
+            ]
+            summary = dashboard_summary_from_rows(hours, context_rows, context_incidents)
+            summary["environment"] = environment
+            summary["run_type"] = run_type
+            summaries.append(summary)
+        return summaries
 
-        return {
-            "hours": hours,
-            "total_checks": total,
-            "ok": counts["ok"],
-            "warning": counts["warning"],
-            "critical": counts["critical"],
-            "ok_rate": ok_rate,
-            "current_status": current_status,
-            "active_problem_count": len(problem_targets),
-            "incident_count": len(incidents),
-            "open_incident_count": sum(
-                1 for row in incidents if row.get("status", "open") not in {"resolved", "closed"}
-            ),
-            "source_counts": source_counts,
-            "latest_targets": list(latest.values()),
-        }
 
     def classification_summary(self, hours: int = 24) -> dict:
         bounded_hours = min(max(int(hours), 1), 24 * 365)
@@ -2712,6 +2723,58 @@ class Storage:
     def close(self) -> None:
         with self.lock:
             self.connection.close()
+
+
+def dashboard_summary_from_rows(hours: int, rows: list[dict], incidents: list[dict]) -> dict:
+    latest: dict[str, dict] = {}
+    counts = {"ok": 0, "warning": 0, "critical": 0}
+    source_counts: dict[str, int] = {}
+
+    for row in rows:
+        status = str(row.get("status", ""))
+        if status in counts:
+            counts[status] += 1
+        source = str(row.get("source", "unknown"))
+        source_counts[source] = source_counts.get(source, 0) + 1
+        latest[f"{row.get('environment')}/{row.get('run_type')}/{row.get('source')}/{row.get('name')}"] = row
+
+    problem_targets = [
+        row for row in latest.values() if row.get("status") in {"warning", "critical"}
+    ]
+    total = len(rows)
+    ok_rate = round((counts["ok"] / total) * 100, 1) if total else 100.0
+    current_status = "critical" if any(row.get("status") == "critical" for row in latest.values()) else (
+        "warning" if problem_targets else "ok"
+    )
+
+    return {
+        "hours": hours,
+        "total_checks": total,
+        "ok": counts["ok"],
+        "warning": counts["warning"],
+        "critical": counts["critical"],
+        "ok_rate": ok_rate,
+        "current_status": current_status,
+        "active_problem_count": len(problem_targets),
+        "incident_count": len(incidents),
+        "open_incident_count": sum(
+            1 for row in incidents if row.get("status", "open") not in {"resolved", "closed"}
+        ),
+        "source_counts": source_counts,
+        "latest_targets": list(latest.values()),
+    }
+
+
+def context_where(environment: str = "", run_type: str = "") -> tuple[list[str], list[object]]:
+    where: list[str] = []
+    params: list[object] = []
+    if environment:
+        where.append("environment = ?")
+        params.append(environment)
+    if run_type:
+        where.append("run_type = ?")
+        params.append(run_type)
+    return where, params
 
 
 def common_value(values: list[str], default: str) -> str:

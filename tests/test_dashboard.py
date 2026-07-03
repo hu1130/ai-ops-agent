@@ -66,6 +66,73 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(1, body["by_status"]["open"])
         self.assertEqual(1, body["by_severity"]["critical"])
 
+    def test_projects_api_returns_project_summaries_and_context_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            prod = CheckResult(
+                source="http",
+                name="Prod Site",
+                status="ok",
+                summary="HTTP 200",
+                environment="prod",
+                run_type="normal",
+            )
+            staging = CheckResult(
+                source="http",
+                name="Staging Site",
+                status="critical",
+                summary="HTTP 500",
+                environment="staging",
+                run_type="synthetic_test",
+            )
+            storage.save_results([prod, staging])
+            storage.save_incident("critical", "Staging down", "analysis", [staging])
+            config = AppConfig(
+                raw={
+                    "app": {"name": "ops", "environment": "prod", "run_type": "normal"},
+                    "projects": [
+                        {"id": "prod", "name": "Production", "environment": "prod", "run_types": ["normal"]},
+                        {
+                            "id": "staging",
+                            "name": "Staging",
+                            "environment": "staging",
+                            "run_types": ["synthetic_test"],
+                        },
+                    ],
+                },
+                base_dir=Path(tmp),
+                config_path=Path(tmp) / "config.json",
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(f"http://{host}:{port}/api/projects", timeout=5) as response:
+                    projects = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(f"http://{host}:{port}/api/projects/summary", timeout=5) as response:
+                    summary = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/results?environment=staging",
+                    timeout=5,
+                ) as response:
+                    results = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/incidents?environment=staging&run_type=synthetic_test",
+                    timeout=5,
+                ) as response:
+                    incidents = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(["prod", "staging"], [row["id"] for row in projects["projects"]])
+        summary_by_id = {row["id"]: row for row in summary["projects"]}
+        self.assertEqual("ok", summary_by_id["prod"]["summary"]["current_status"])
+        self.assertEqual("critical", summary_by_id["staging"]["summary"]["current_status"])
+        self.assertEqual(1, summary_by_id["staging"]["summary"]["incident_count"])
+        self.assertEqual(["Staging Site"], [row["name"] for row in results])
+        self.assertEqual(["Staging down"], [row["title"] for row in incidents])
+
     def test_ops_metrics_and_report_api_return_enterprise_scorecard(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

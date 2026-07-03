@@ -29,6 +29,7 @@ from ops_agent.monitor_targets import (
     get_monitor_target,
     list_monitor_targets,
 )
+from ops_agent.projects import list_projects, project_summary_payload
 from ops_agent.remediation.approval import approval_expiry_from_config, approve_action_log, reject_action_log
 from ops_agent.remediation.playbook_center import (
     create_incident_playbook_recommendations,
@@ -66,7 +67,7 @@ def start_dashboard(
                 if auth is None:
                     return
             if path == "/api/summary":
-                self.send_json(storage.dashboard_summary())
+                self.send_json(storage.dashboard_summary(**summary_filters_from_query(query)))
                 return
             if path == "/api/ops/metrics":
                 self.send_json(storage.ops_metrics(query_hours(query)))
@@ -123,7 +124,14 @@ def start_dashboard(
                     self.send_json(row)
                     return
             if path == "/api/results":
-                self.send_json(storage.latest_results())
+                self.send_json(storage.latest_results(**result_filters_from_query(query)))
+                return
+            if path == "/api/projects":
+                self.send_json({"projects": list_projects(config)})
+                return
+            if path == "/api/projects/summary":
+                hours = query_hours(query)
+                self.send_json(project_summary_payload(config, storage.context_summaries(hours), hours))
                 return
             if path == "/api/monitor-targets":
                 self.send_json(list_monitor_targets(config.raw if config else {}))
@@ -938,6 +946,24 @@ def incident_filters_from_query(query: dict[str, list[str]]) -> dict:
         "priority": query_text(query, "priority"),
         "severity": query_text(query, "severity"),
         "false_positive": query_optional_bool(query, "false_positive"),
+        "environment": query_text(query, "environment"),
+        "run_type": query_text(query, "run_type"),
+    }
+
+
+def result_filters_from_query(query: dict[str, list[str]]) -> dict:
+    return {
+        "limit": query_limit(query, default=50, maximum=500),
+        "environment": query_text(query, "environment"),
+        "run_type": query_text(query, "run_type"),
+    }
+
+
+def summary_filters_from_query(query: dict[str, list[str]]) -> dict:
+    return {
+        "hours": query_hours(query),
+        "environment": query_text(query, "environment"),
+        "run_type": query_text(query, "run_type"),
     }
 
 
@@ -1460,6 +1486,8 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/monitor-targets": ("monitor_target.list", "monitor_target", None),
         "/api/playbooks": ("playbook.list", "playbook", None),
         "/api/playbooks/detail": ("playbook.detail", "playbook", None),
+        "/api/projects": ("project.list", "project", None),
+        "/api/projects/summary": ("project.summary", "project", None),
         "/api/actions/failed": ("action.failed", "action", None),
         "/api/actions/pending": ("action.pending", "action", None),
         "/api/incidents": ("incident.list", "incident", None),

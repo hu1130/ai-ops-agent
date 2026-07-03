@@ -552,6 +552,7 @@ def validate_config(config: AppConfig) -> list[str]:
     if config.app.get("cli_run_type"):
         validate_context_name(config.app.get("cli_run_type"), "app.cli_run_type", errors)
     validate_api_auth_config(config.app, errors)
+    validate_projects(config.raw, errors)
 
     for index, check in enumerate(config.http_checks):
         validate_url(str(check.get("url", "")), f"http_checks[{index}].url", errors)
@@ -703,6 +704,39 @@ def validate_context_name(value: object, field: str, errors: list[str]) -> None:
         return
     if any(char.isspace() for char in text):
         errors.append(f"{field} 不能包含空格")
+
+
+def validate_projects(raw: dict, errors: list[str]) -> None:
+    projects = raw.get("projects", [])
+    if not projects:
+        return
+    if not isinstance(projects, list):
+        errors.append("projects 必须是数组")
+        return
+    seen: set[str] = set()
+    for index, project in enumerate(projects):
+        field = f"projects[{index}]"
+        if not isinstance(project, dict):
+            errors.append(f"{field} 必须是对象")
+            continue
+        project_id = str(project.get("id") or project.get("key") or "").strip()
+        if project_id:
+            validate_context_name(project_id, f"{field}.id", errors)
+            if project_id in seen:
+                errors.append(f"{field}.id 不能重复")
+            seen.add(project_id)
+        validate_context_name(project.get("environment", "prod"), f"{field}.environment", errors)
+        if "run_type" in project:
+            validate_context_name(project.get("run_type"), f"{field}.run_type", errors)
+        if "run_types" in project:
+            validate_string_list(project["run_types"], f"{field}.run_types", errors)
+            if isinstance(project["run_types"], list):
+                for run_type_index, run_type in enumerate(project["run_types"]):
+                    validate_context_name(run_type, f"{field}.run_types[{run_type_index}]", errors)
+        if "enabled" in project and not isinstance(project["enabled"], bool):
+            errors.append(f"{field}.enabled 必须是 true/false")
+        if "tags" in project:
+            validate_string_list(project["tags"], f"{field}.tags", errors)
 
 
 def validate_string_list(value: object, field: str, errors: list[str]) -> None:

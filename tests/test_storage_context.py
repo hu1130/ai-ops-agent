@@ -31,6 +31,42 @@ class StorageContextTest(unittest.TestCase):
         self.assertEqual("synthetic_test", rows[0]["run_type"])
         self.assertEqual("trace-1", rows[0]["trace_id"])
 
+    def test_context_filters_and_summaries_split_project_contexts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            prod = CheckResult(
+                source="http",
+                name="Prod Site",
+                status="ok",
+                summary="HTTP 200",
+                environment="prod",
+                run_type="normal",
+            )
+            staging = CheckResult(
+                source="http",
+                name="Staging Site",
+                status="critical",
+                summary="HTTP 500",
+                environment="staging",
+                run_type="synthetic_test",
+            )
+            storage.save_results([prod, staging])
+            storage.save_incident("critical", "Staging down", "analysis", [staging])
+
+            prod_rows = storage.latest_results(environment="prod")
+            staging_incidents = storage.latest_incidents(environment="staging", run_type="synthetic_test")
+            summaries = storage.context_summaries(hours=24)
+            storage.close()
+
+        self.assertEqual(1, len(prod_rows))
+        self.assertEqual("Prod Site", prod_rows[0]["name"])
+        self.assertEqual(1, len(staging_incidents))
+        self.assertEqual("Staging down", staging_incidents[0]["title"])
+        by_context = {(row["environment"], row["run_type"]): row for row in summaries}
+        self.assertEqual("ok", by_context[("prod", "normal")]["current_status"])
+        self.assertEqual("critical", by_context[("staging", "synthetic_test")]["current_status"])
+        self.assertEqual(1, by_context[("staging", "synthetic_test")]["incident_count"])
+
     def test_existing_database_is_migrated_with_context_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "ops.db"

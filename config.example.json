@@ -12,6 +12,17 @@
     "api_tokens": [],
     "api_auth_required_for_reads": false
   },
+  "projects": [
+    {
+      "id": "prod",
+      "name": "Production",
+      "enabled": true,
+      "environment": "prod",
+      "run_types": ["normal"],
+      "description": "Default production monitoring context",
+      "tags": ["default"]
+    }
+  ],
   "http_checks": [
     {
       "name": "Example homepage",
