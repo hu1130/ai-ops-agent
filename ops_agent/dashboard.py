@@ -78,6 +78,14 @@ def start_dashboard(
                 metrics = storage.ops_metrics(query_hours(query))
                 self.send_json(ops_report_payload(metrics))
                 return
+            if path == "/api/remediation/audit":
+                self.send_json(
+                    storage.remediation_audit(
+                        query_hours(query),
+                        query_limit(query, default=50, maximum=500),
+                    )
+                )
+                return
             if path == "/api/classifications/summary":
                 self.send_json(storage.classification_summary(query_hours(query)))
                 return
@@ -1042,6 +1050,7 @@ def ops_report_payload(metrics: dict) -> dict:
             "critical_incidents": incidents.get("critical", 0),
             "action_success_rate": actions.get("success_rate", 100.0),
             "expired_approvals": actions.get("expired", 0),
+            "readiness_blocked_actions": actions.get("readiness_blocked", 0),
             "notification_failures": notifications.get("failed", 0),
             "mttr_seconds_avg": safe_nested_number(incidents, ["mttr_seconds", "avg"]),
         },
@@ -1518,6 +1527,7 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/learning/summary": ("learning.summary", "learning", None),
         "/api/ops/metrics": ("ops.metrics", "ops", None),
         "/api/ops/report": ("ops.report", "ops", None),
+        "/api/remediation/audit": ("remediation.audit", "remediation", None),
         "/api/recommendations": ("recommendation.list", "recommendation", None),
         "/api/recommendations/actionable": ("recommendation.actionable", "recommendation", None),
         "/api/recommendations/pending": ("recommendation.pending", "recommendation", None),

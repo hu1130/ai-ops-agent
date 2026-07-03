@@ -2710,6 +2710,7 @@ class Storage:
 
         actions = [dict(row) for row in action_rows]
         notifications = [dict(row) for row in notification_rows]
+        readiness_blockers = readiness_blocker_counts(actions, [])
         check_status_counts = count_by_key(results, "status")
         incident_status_counts = count_by_key(incidents, "status")
         action_status_counts = count_by_key(actions, "status")
@@ -2770,6 +2771,8 @@ class Storage:
                 "by_type": count_by_key(actions, "action_type"),
                 "by_risk": count_by_key(actions, "risk"),
                 "verification": count_by_key(actions, "verify_status", default="not_verified"),
+                "readiness_blocked": sum(1 for row in actions if action_was_readiness_blocked(row)),
+                "readiness_blockers": readiness_blockers,
             },
             "notifications": {
                 "total": len(notifications),
@@ -2782,6 +2785,110 @@ class Storage:
                 "incidents": incidents[:10],
                 "actions": actions[:10],
                 "notifications": notifications[:10],
+            },
+        }
+
+    def remediation_audit(self, hours: int = 24, limit: int = 50) -> dict:
+        bounded_hours = min(max(int(hours), 1), 24 * 365)
+        bounded_limit = min(max(int(limit), 1), 500)
+        generated_at = datetime.now(timezone.utc)
+        since = generated_at - timedelta(hours=bounded_hours)
+        since_iso = since.isoformat()
+        with self.lock:
+            action_rows = self.connection.execute(
+                """
+                select * from action_logs
+                where created_at >= ?
+                order by id desc
+                limit 5000
+                """,
+                (since_iso,),
+            ).fetchall()
+            recommendation_rows = self.connection.execute(
+                """
+                select * from incident_recommendations
+                where coalesce(updated_at, created_at) >= ?
+                order by coalesce(updated_at, created_at) desc, id desc
+                limit 5000
+                """,
+                (since_iso,),
+            ).fetchall()
+
+        actions = [action_log_payload(row) for row in action_rows]
+        recommendations = [recommendation_payload(row) for row in recommendation_rows]
+        action_status_counts = count_by_key(actions, "status")
+        recommendation_status_counts = count_by_key(recommendations, "status")
+        readiness_blocked_actions = [row for row in actions if action_was_readiness_blocked(row)]
+        readiness_blocked_recommendations = [
+            row for row in recommendations if recommendation_was_readiness_blocked(row)
+        ]
+        readiness_blockers = readiness_blocker_counts(actions, recommendations)
+        mutating_actions = [row for row in actions if is_mutating_action(str(row.get("action_type") or ""))]
+        verified_actions = [row for row in actions if row.get("verify_status")]
+        failed_or_blocked_actions = [
+            row
+            for row in actions
+            if row.get("status") in {"failed", "verified_failed"}
+            or action_was_readiness_blocked(row)
+        ]
+
+        return {
+            "generated_at": generated_at.isoformat(),
+            "window": {
+                "hours": bounded_hours,
+                "since": since_iso,
+                "until": generated_at.isoformat(),
+            },
+            "actions": {
+                "total": len(actions),
+                "mutating": len(mutating_actions),
+                "read_only": len(actions) - len(mutating_actions),
+                "pending_approval": int(action_status_counts.get("pending_approval", 0)),
+                "approved": sum(1 for row in actions if row.get("decision") == "approved"),
+                "rejected": sum(1 for row in actions if row.get("decision") == "rejected"),
+                "expired": sum(1 for row in actions if row.get("decision") == "expired"),
+                "executed": int(action_status_counts.get("executed", 0)),
+                "failed": int(action_status_counts.get("failed", 0)),
+                "verified_ok": int(action_status_counts.get("verified_ok", 0)),
+                "verified_failed": int(action_status_counts.get("verified_failed", 0)),
+                "skipped": int(action_status_counts.get("skipped", 0)),
+                "readiness_blocked": len(readiness_blocked_actions),
+                "by_status": action_status_counts,
+                "by_type": count_by_key(actions, "action_type"),
+                "by_risk": count_by_key(actions, "risk"),
+                "verification": count_by_key(actions, "verify_status", default="not_verified"),
+            },
+            "recommendations": {
+                "total": len(recommendations),
+                "approval_required": sum(1 for row in recommendations if row.get("approval_required")),
+                "auto_execute": sum(1 for row in recommendations if row.get("auto_execute")),
+                "verification_required": sum(1 for row in recommendations if row.get("verification_required")),
+                "readiness_blocked": len(readiness_blocked_recommendations),
+                "by_status": recommendation_status_counts,
+                "by_risk": count_by_key(recommendations, "risk"),
+                "by_type": count_by_key(recommendations, "action_type"),
+                "by_source": count_by_key(recommendations, "source"),
+            },
+            "readiness": {
+                "blocked_actions": len(readiness_blocked_actions),
+                "blocked_recommendations": len(readiness_blocked_recommendations),
+                "by_blocker": readiness_blockers,
+                "recent_blocks": [
+                    *[
+                        readiness_action_block_payload(row)
+                        for row in readiness_blocked_actions[:bounded_limit]
+                    ],
+                    *[
+                        readiness_recommendation_block_payload(row)
+                        for row in readiness_blocked_recommendations[:bounded_limit]
+                    ],
+                ][:bounded_limit],
+            },
+            "latest": {
+                "actions": actions[:bounded_limit],
+                "recommendations": recommendations[:bounded_limit],
+                "failed_or_blocked_actions": failed_or_blocked_actions[:bounded_limit],
+                "verified_actions": verified_actions[:bounded_limit],
             },
         }
 
@@ -2866,6 +2973,12 @@ def recommendation_payload(row: sqlite3.Row) -> dict:
     payload["verification_required"] = bool(payload.get("verification_required"))
     payload["params"] = parse_json_object(str(payload.get("params_json") or "{}"))
     payload["metadata"] = parse_json_object(str(payload.get("metadata_json") or "{}"))
+    return payload
+
+
+def action_log_payload(row: sqlite3.Row) -> dict:
+    payload = dict(row)
+    payload["params"] = parse_json_object(str(payload.get("params_json") or "{}"))
     return payload
 
 
@@ -2995,6 +3108,79 @@ def count_by_key(rows: list[dict], key: str, default: str = "unknown") -> dict[s
         value = str(row.get(key) or default)
         counts[value] = counts.get(value, 0) + 1
     return counts
+
+
+MUTATING_ACTION_TYPES = {"restart_service", "restart_docker_container", "cleanup_temp_files", "rotate_large_log"}
+READINESS_BLOCK_PREFIX = "readiness blocked:"
+
+
+def is_mutating_action(action_type: str) -> bool:
+    return action_type in MUTATING_ACTION_TYPES
+
+
+def action_was_readiness_blocked(row: dict) -> bool:
+    return str(row.get("status") or "") == "skipped" and str(row.get("error") or "").startswith(READINESS_BLOCK_PREFIX)
+
+
+def recommendation_was_readiness_blocked(row: dict) -> bool:
+    readiness = safe_dict(safe_dict(row.get("metadata")).get("readiness"))
+    return str(readiness.get("status") or "") == "blocked"
+
+
+def readiness_blocker_counts(actions: list[dict], recommendations: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in actions:
+        for blocker in readiness_blockers_from_action(row):
+            counts[blocker] = counts.get(blocker, 0) + 1
+    for row in recommendations:
+        for blocker in readiness_blockers_from_recommendation(row):
+            counts[blocker] = counts.get(blocker, 0) + 1
+    return counts
+
+
+def readiness_blockers_from_action(row: dict) -> list[str]:
+    error = str(row.get("error") or "")
+    if not error.startswith(READINESS_BLOCK_PREFIX):
+        return []
+    raw = error[len(READINESS_BLOCK_PREFIX):].strip()
+    return [item.strip() for item in raw.split(";") if item.strip()]
+
+
+def readiness_blockers_from_recommendation(row: dict) -> list[str]:
+    readiness = safe_dict(safe_dict(row.get("metadata")).get("readiness"))
+    blockers = readiness.get("blockers")
+    if not isinstance(blockers, list):
+        return []
+    return [str(item).strip() for item in blockers if str(item).strip()]
+
+
+def readiness_action_block_payload(row: dict) -> dict:
+    return {
+        "kind": "action",
+        "id": row.get("id"),
+        "incident_id": row.get("incident_id"),
+        "created_at": row.get("created_at"),
+        "action_type": row.get("action_type"),
+        "title": row.get("title"),
+        "risk": row.get("risk"),
+        "status": row.get("status"),
+        "blockers": readiness_blockers_from_action(row),
+    }
+
+
+def readiness_recommendation_block_payload(row: dict) -> dict:
+    return {
+        "kind": "recommendation",
+        "id": row.get("id"),
+        "incident_id": row.get("incident_id"),
+        "updated_at": row.get("updated_at"),
+        "action_type": row.get("action_type"),
+        "title": row.get("title"),
+        "risk": row.get("risk"),
+        "status": row.get("status"),
+        "source": row.get("source"),
+        "blockers": readiness_blockers_from_recommendation(row),
+    }
 
 
 def seconds_between(start: object, end: object) -> float:

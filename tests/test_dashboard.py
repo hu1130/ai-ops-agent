@@ -195,6 +195,81 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(0, report["scorecard"]["open_incidents"])
         self.assertEqual(1, report["scorecard"]["notification_failures"])
 
+    def test_remediation_audit_api_summarizes_readiness_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            incident_id = storage.save_incident(
+                "critical",
+                "Site down",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            storage.save_action_log(
+                "check_port",
+                "Check port",
+                "low",
+                "executed",
+                "diagnose",
+                {"host": "example.com", "port": 443},
+                incident_id=incident_id,
+            )
+            storage.save_action_log(
+                "restart_service",
+                "Restart web",
+                "medium",
+                "skipped",
+                "remediate",
+                {"service": "web"},
+                error="readiness blocked: mutating action requires saved incident diagnosis; mutating action requires verify_after before execution",
+                incident_id=incident_id,
+            )
+            storage.save_incident_recommendations(
+                incident_id,
+                [
+                    {
+                        "position": 1,
+                        "category": "remediate",
+                        "action_type": "restart_service",
+                        "title": "Restart web",
+                        "reason": "Site down",
+                        "risk": "medium",
+                        "status": "skipped",
+                        "params": {"service": "web"},
+                        "metadata": {
+                            "readiness": {
+                                "status": "blocked",
+                                "blockers": ["mutating action requires saved incident diagnosis"],
+                            }
+                        },
+                    }
+                ],
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/remediation/audit?hours=24",
+                    timeout=5,
+                ) as response:
+                    audit = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(f"http://{host}:{port}/api/ops/metrics?hours=24", timeout=5) as response:
+                    metrics = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(f"http://{host}:{port}/api/ops/report?hours=24", timeout=5) as response:
+                    report = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(2, audit["actions"]["total"])
+        self.assertEqual(1, audit["actions"]["readiness_blocked"])
+        self.assertEqual(1, audit["recommendations"]["readiness_blocked"])
+        self.assertEqual(2, audit["readiness"]["by_blocker"]["mutating action requires saved incident diagnosis"])
+        self.assertEqual(1, audit["readiness"]["by_blocker"]["mutating action requires verify_after before execution"])
+        self.assertEqual({"action", "recommendation"}, {row["kind"] for row in audit["readiness"]["recent_blocks"]})
+        self.assertEqual(1, metrics["actions"]["readiness_blocked"])
+        self.assertEqual(1, report["scorecard"]["readiness_blocked_actions"])
+
     def test_learning_recommendations_api_returns_saved_suggestions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")
