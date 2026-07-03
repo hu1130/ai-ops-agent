@@ -133,6 +133,12 @@
       "interval_seconds": 5,
       "timeout_seconds": 5
     },
+    "guardrails": {
+      "min_diagnosis_confidence_for_mutating": 0.8,
+      "min_occurrences_for_mutating": 2,
+      "diagnosis_required_for_mutating": true,
+      "verification_required_for_mutating": true
+    },
     "playbooks": [
       {
         "name": "web availability triage",

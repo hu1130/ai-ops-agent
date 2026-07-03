@@ -15,6 +15,7 @@ from ops_agent.remediation.playbooks import (
     remediation_playbooks,
 )
 from ops_agent.remediation.policy import MUTATING_ACTIONS, apply_policy_defaults, decide_action_policy
+from ops_agent.remediation.readiness import evaluate_action_readiness, latest_diagnosis
 from ops_agent.storage import Storage
 
 
@@ -42,14 +43,19 @@ def get_playbook(config: AppConfig | None, name: str) -> dict | None:
 def preview_incident_playbooks(storage: Storage, config: AppConfig, incident_id: int) -> dict:
     incident = require_incident(storage, incident_id)
     results = incident_check_results(incident)
-    preview_actions = planned_playbook_actions(results, config)
+    diagnosis = latest_diagnosis(storage, incident_id)
+    preview_actions = planned_playbook_actions(results, config, incident=incident, diagnosis=diagnosis)
     playbooks = matched_playbook_summaries(preview_actions)
     return {
         "incident": incident_overview(incident),
+        "diagnosis": diagnosis,
         "result_count": len(results),
         "matched_playbook_count": len(playbooks),
         "action_count": len([item for item in preview_actions if item["policy"]["allowed"]]),
         "denied_action_count": len([item for item in preview_actions if not item["policy"]["allowed"]]),
+        "blocked_action_count": len([item for item in preview_actions if safe_dict(item.get("readiness")).get("status") == "blocked"]),
+        "auto_ready_action_count": len([item for item in preview_actions if safe_dict(item.get("readiness")).get("auto_ready")]),
+        "approval_ready_action_count": len([item for item in preview_actions if safe_dict(item.get("readiness")).get("approval_ready")]),
         "playbooks": playbooks,
         "actions": preview_actions,
     }
@@ -114,7 +120,12 @@ def step_summary(step: dict[str, Any], position: int) -> dict:
     }
 
 
-def planned_playbook_actions(results: list[CheckResult], config: AppConfig) -> list[dict]:
+def planned_playbook_actions(
+    results: list[CheckResult],
+    config: AppConfig,
+    incident: dict | None = None,
+    diagnosis: dict | None = None,
+) -> list[dict]:
     remediation = config.raw.get("remediation", {})
     remediation_config = remediation if isinstance(remediation, dict) else {}
     auto_actions = configured_auto_actions(remediation_config)
@@ -127,6 +138,7 @@ def planned_playbook_actions(results: list[CheckResult], config: AppConfig) -> l
     for action in dedupe_actions(planned):
         decision = decide_action_policy(action, config)
         effective = apply_policy_defaults(action, config) if decision.allowed else action
+        readiness = evaluate_action_readiness(effective, config, incident=incident, diagnosis=diagnosis)
         preview.append(
             {
                 **effective.to_dict(),
@@ -142,6 +154,7 @@ def planned_playbook_actions(results: list[CheckResult], config: AppConfig) -> l
                     "verification_required": decision.verification_required,
                     "reason": decision.reason,
                 },
+                "readiness": readiness,
             }
         )
     return preview
@@ -198,6 +211,7 @@ def action_recommendation(item: dict, position: int, incident: dict) -> dict:
         "metadata": {
             "playbook": playbook,
             "policy": policy,
+            "readiness": safe_dict(item.get("readiness")),
         },
     }
 

@@ -38,6 +38,7 @@ from ops_agent.remediation.playbook_center import (
     list_playbooks,
     preview_incident_playbooks,
 )
+from ops_agent.remediation.readiness import incident_self_heal_readiness
 from ops_agent.remediation.recommendations import (
     approve_recommendation,
     reject_recommendation,
@@ -212,6 +213,15 @@ def start_dashboard(
                         return
                     try:
                         self.send_json(preview_incident_playbooks(storage, config, incident_id))
+                    except ValueError as exc:
+                        self.send_json({"error": str(exc)}, status=404)
+                    return
+                if action in {"self-heal-readiness", "readiness"}:
+                    if config is None:
+                        self.send_json({"error": "config is not configured"}, status=503)
+                        return
+                    try:
+                        self.send_json(incident_self_heal_readiness(storage, config, incident_id))
                     except ValueError as exc:
                         self.send_json({"error": str(exc)}, status=404)
                     return
