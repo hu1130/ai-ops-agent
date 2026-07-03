@@ -2605,6 +2605,110 @@ class Storage:
             "optimization_candidates": optimization_candidates,
         }
 
+    def ops_metrics(self, hours: int = 24) -> dict:
+        bounded_hours = min(max(int(hours), 1), 24 * 365)
+        generated_at = datetime.now(timezone.utc)
+        since = generated_at - timedelta(hours=bounded_hours)
+        since_iso = since.isoformat()
+        results = self.recent_results(since_iso)
+        incidents = self.recent_incidents(since_iso, limit=5000)
+        with self.lock:
+            action_rows = self.connection.execute(
+                """
+                select * from action_logs
+                where created_at >= ?
+                order by id desc
+                limit 5000
+                """,
+                (since_iso,),
+            ).fetchall()
+            notification_rows = self.connection.execute(
+                """
+                select * from notification_logs
+                where created_at >= ?
+                order by id desc
+                limit 5000
+                """,
+                (since_iso,),
+            ).fetchall()
+
+        actions = [dict(row) for row in action_rows]
+        notifications = [dict(row) for row in notification_rows]
+        check_status_counts = count_by_key(results, "status")
+        incident_status_counts = count_by_key(incidents, "status")
+        action_status_counts = count_by_key(actions, "status")
+        notification_status_counts = count_by_key(notifications, "status")
+        mttr_samples = [
+            seconds_between(row.get("created_at"), row.get("resolved_at") or row.get("closed_at"))
+            for row in incidents
+            if row.get("resolved_at") or row.get("closed_at")
+        ]
+        mttr_samples = [value for value in mttr_samples if value >= 0]
+        total_checks = len(results)
+        ok_checks = int(check_status_counts.get("ok", 0))
+        problem_checks = int(check_status_counts.get("warning", 0)) + int(check_status_counts.get("critical", 0))
+        total_actions = len(actions)
+        successful_actions = sum(
+            int(action_status_counts.get(status, 0))
+            for status in ("executed", "verified_ok", "dry_run")
+        )
+        return {
+            "generated_at": generated_at.isoformat(),
+            "window": {
+                "hours": bounded_hours,
+                "since": since_iso,
+                "until": generated_at.isoformat(),
+            },
+            "availability": {
+                "total_checks": total_checks,
+                "ok_checks": ok_checks,
+                "warning_checks": int(check_status_counts.get("warning", 0)),
+                "critical_checks": int(check_status_counts.get("critical", 0)),
+                "problem_checks": problem_checks,
+                "ok_rate": round((ok_checks / total_checks) * 100, 2) if total_checks else 100.0,
+                "by_status": check_status_counts,
+                "by_source": count_by_key(results, "source"),
+            },
+            "incidents": {
+                "total": len(incidents),
+                "open": sum(1 for row in incidents if row.get("status") not in {"resolved", "closed"}),
+                "resolved": int(incident_status_counts.get("resolved", 0)),
+                "closed": int(incident_status_counts.get("closed", 0)),
+                "critical": sum(1 for row in incidents if row.get("severity") == "critical"),
+                "warning": sum(1 for row in incidents if row.get("severity") == "warning"),
+                "false_positive": sum(1 for row in incidents if int(row.get("false_positive") or 0) == 1),
+                "by_status": incident_status_counts,
+                "by_severity": count_by_key(incidents, "severity"),
+                "by_category": count_by_key(incidents, "classification_category", default="unclassified"),
+                "mttr_seconds": {
+                    "avg": round(sum(mttr_samples) / len(mttr_samples), 2) if mttr_samples else 0.0,
+                    "samples": len(mttr_samples),
+                },
+            },
+            "actions": {
+                "total": total_actions,
+                "success_rate": round((successful_actions / total_actions) * 100, 2) if total_actions else 100.0,
+                "pending_approval": int(action_status_counts.get("pending_approval", 0)),
+                "expired": sum(1 for row in actions if row.get("decision") == "expired"),
+                "by_status": action_status_counts,
+                "by_type": count_by_key(actions, "action_type"),
+                "by_risk": count_by_key(actions, "risk"),
+                "verification": count_by_key(actions, "verify_status", default="not_verified"),
+            },
+            "notifications": {
+                "total": len(notifications),
+                "suppressed": sum(1 for row in notifications if row.get("suppressed_reason")),
+                "failed": sum(1 for row in notifications if row.get("error")),
+                "by_status": notification_status_counts,
+                "by_severity": count_by_key(notifications, "severity"),
+            },
+            "latest": {
+                "incidents": incidents[:10],
+                "actions": actions[:10],
+                "notifications": notifications[:10],
+            },
+        }
+
     def close(self) -> None:
         with self.lock:
             self.connection.close()
@@ -2748,6 +2852,35 @@ def safe_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def count_by_key(rows: list[dict], key: str, default: str = "unknown") -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        value = str(row.get(key) or default)
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def seconds_between(start: object, end: object) -> float:
+    start_dt = parse_iso_datetime(start)
+    end_dt = parse_iso_datetime(end)
+    if not start_dt or not end_dt:
+        return -1.0
+    return max(0.0, (end_dt - start_dt).total_seconds())
+
+
+def parse_iso_datetime(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def learning_candidate_reason(item: dict) -> str:

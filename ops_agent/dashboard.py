@@ -59,6 +59,13 @@ def start_dashboard(
             if path == "/api/summary":
                 self.send_json(storage.dashboard_summary())
                 return
+            if path == "/api/ops/metrics":
+                self.send_json(storage.ops_metrics(query_hours(query)))
+                return
+            if path == "/api/ops/report":
+                metrics = storage.ops_metrics(query_hours(query))
+                self.send_json(ops_report_payload(metrics))
+                return
             if path == "/api/classifications/summary":
                 self.send_json(storage.classification_summary(query_hours(query)))
                 return
@@ -872,6 +879,45 @@ def query_optional_int(query: dict[str, list[str]], key: str) -> int | None:
     return value if value > 0 else None
 
 
+def ops_report_payload(metrics: dict) -> dict:
+    availability = metrics.get("availability", {})
+    incidents = metrics.get("incidents", {})
+    actions = metrics.get("actions", {})
+    notifications = metrics.get("notifications", {})
+    return {
+        "generated_at": metrics.get("generated_at"),
+        "window": metrics.get("window"),
+        "executive_summary": [
+            f"OK rate {availability.get('ok_rate', 100.0)}% across {availability.get('total_checks', 0)} checks.",
+            f"{incidents.get('total', 0)} incident(s), {incidents.get('open', 0)} still open.",
+            f"{actions.get('total', 0)} remediation action(s), success rate {actions.get('success_rate', 100.0)}%.",
+            f"{notifications.get('total', 0)} notification record(s), {notifications.get('failed', 0)} failed.",
+        ],
+        "scorecard": {
+            "ok_rate": availability.get("ok_rate", 100.0),
+            "open_incidents": incidents.get("open", 0),
+            "critical_incidents": incidents.get("critical", 0),
+            "action_success_rate": actions.get("success_rate", 100.0),
+            "expired_approvals": actions.get("expired", 0),
+            "notification_failures": notifications.get("failed", 0),
+            "mttr_seconds_avg": safe_nested_number(incidents, ["mttr_seconds", "avg"]),
+        },
+        "metrics": metrics,
+    }
+
+
+def safe_nested_number(payload: dict, keys: list[str]) -> float:
+    current: object = payload
+    for key in keys:
+        if not isinstance(current, dict):
+            return 0.0
+        current = current.get(key)
+    try:
+        return float(current or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def query_optional_bool(query: dict[str, list[str]], key: str) -> bool | None:
     text = query_text(query, key).lower()
     if not text:
@@ -1319,6 +1365,8 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/learning/config-patches": ("learning.config_patch.list", "learning_config_patch", None),
         "/api/learning/recommendations": ("learning.recommendation.list", "learning", None),
         "/api/learning/summary": ("learning.summary", "learning", None),
+        "/api/ops/metrics": ("ops.metrics", "ops", None),
+        "/api/ops/report": ("ops.report", "ops", None),
         "/api/recommendations": ("recommendation.list", "recommendation", None),
         "/api/recommendations/actionable": ("recommendation.actionable", "recommendation", None),
         "/api/recommendations/pending": ("recommendation.pending", "recommendation", None),

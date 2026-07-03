@@ -611,6 +611,8 @@ Authorization: Bearer replace-with-operator-token
 GET  /api/action-logs
 GET  /api/notification-logs
 GET  /api/audit-logs
+GET  /api/ops/metrics?hours=24
+GET  /api/ops/report?hours=24
 GET  /api/actions/pending
 GET  /api/actions/failed
 GET  /api/actions/1
@@ -642,6 +644,8 @@ python -m ops_agent.cli --config .\config.json audit-logs
 ```
 
 所有 `POST /api/*` 写接口都会记录到 `api_audit_logs`，包括成功、失败和未授权请求。记录字段包括操作者、来源 IP、HTTP 方法、路径、操作名、目标对象、状态码和结果摘要。
+
+企业级指标接口：`GET /api/ops/metrics?hours=24` 返回可用率、事件、动作、通知、分类和 MTTR 等结构化指标；`GET /api/ops/report?hours=24` 在同一份指标基础上增加 `executive_summary` 和 `scorecard`，方便后续前端报表、日报或管理驾驶舱直接展示。
 
 `POST /api/incidents/1/transition` 的 JSON 示例：
 

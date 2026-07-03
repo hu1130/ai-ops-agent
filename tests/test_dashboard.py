@@ -66,6 +66,68 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(1, body["by_status"]["open"])
         self.assertEqual(1, body["by_severity"]["critical"])
 
+    def test_ops_metrics_and_report_api_return_enterprise_scorecard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            storage.save_results(
+                [
+                    CheckResult(source="http", name="Site", status="ok", summary="HTTP 200"),
+                    CheckResult(source="server", name="CPU", status="critical", summary="CPU high"),
+                ]
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "CPU high",
+                "analysis",
+                [CheckResult(source="server", name="CPU", status="critical", summary="CPU high")],
+                classification={"category": "resource_saturation", "confidence": 0.9},
+            )
+            storage.transition_incident(incident_id, "resolved", actor="tester", note="fixed")
+            storage.save_action_log(
+                "check_port",
+                "Check port",
+                "low",
+                "executed",
+                "test",
+                {"host": "127.0.0.1", "port": 80},
+            )
+            storage.save_action_log(
+                "restart_service",
+                "Restart service",
+                "medium",
+                "pending_approval",
+                "test",
+                {"service": "app"},
+            )
+            storage.save_notification_log("sent", "sent", "sent", severity="critical", incident_id=incident_id)
+            storage.save_notification_log(
+                "failed",
+                "failed",
+                "failed",
+                severity="critical",
+                incident_id=incident_id,
+                error="smtp failed",
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(f"http://{host}:{port}/api/ops/metrics?hours=24", timeout=5) as response:
+                    metrics = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(f"http://{host}:{port}/api/ops/report?hours=24", timeout=5) as response:
+                    report = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(2, metrics["availability"]["total_checks"])
+        self.assertEqual(50.0, metrics["availability"]["ok_rate"])
+        self.assertEqual(1, metrics["incidents"]["resolved"])
+        self.assertEqual(1, metrics["actions"]["pending_approval"])
+        self.assertEqual(1, metrics["notifications"]["failed"])
+        self.assertEqual(0, report["scorecard"]["open_incidents"])
+        self.assertEqual(1, report["scorecard"]["notification_failures"])
+
     def test_learning_recommendations_api_returns_saved_suggestions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")
