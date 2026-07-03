@@ -148,6 +148,7 @@ class Storage:
                     error text not null,
                     approved_by text,
                     approved_at text,
+                    approval_expires_at text,
                     verify_status text,
                     verify_output text,
                     verified_at text
@@ -369,6 +370,7 @@ class Storage:
             "updated_at": "alter table action_logs add column updated_at text",
             "approved_by": "alter table action_logs add column approved_by text",
             "approved_at": "alter table action_logs add column approved_at text",
+            "approval_expires_at": "alter table action_logs add column approval_expires_at text",
             "verify_status": "alter table action_logs add column verify_status text",
             "verify_output": "alter table action_logs add column verify_output text",
             "verified_at": "alter table action_logs add column verified_at text",
@@ -1852,15 +1854,17 @@ class Storage:
         run_type: str = "normal",
         trace_id: str = "",
         incident_id: int | None = None,
+        approval_expires_at: str = "",
     ) -> int:
         with self.lock:
             cursor = self.connection.execute(
                 """
                 insert into action_logs (
                     incident_id, created_at, environment, run_type, trace_id,
-                    action_type, title, risk, status, reason, params_json, output, error
+                    action_type, title, risk, status, reason, params_json, output, error,
+                    approval_expires_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     incident_id,
@@ -1876,6 +1880,7 @@ class Storage:
                     json.dumps(params, ensure_ascii=False),
                     output,
                     error,
+                    approval_expires_at or None,
                 ),
             )
             self.connection.commit()
@@ -1931,6 +1936,32 @@ class Storage:
                 ),
             )
             self.connection.commit()
+
+    def expire_action_log(self, action_id: int, actor: str = "operator", note: str = "") -> dict:
+        now = utc_now_iso()
+        actor_value = actor.strip() or "operator"
+        note_value = note.strip() or "approval expired"
+        with self.lock:
+            self.connection.execute(
+                """
+                update action_logs
+                set updated_at = ?,
+                    status = 'skipped',
+                    error = ?,
+                    decision = 'expired',
+                    decision_by = ?,
+                    decision_at = ?,
+                    decision_note = ?
+                where id = ?
+                """,
+                (now, note_value, actor_value, now, note_value, action_id),
+            )
+            self.connection.commit()
+            row = self.connection.execute(
+                "select * from action_logs where id = ?",
+                (action_id,),
+            ).fetchone()
+        return dict(row) if row else {}
 
     def reject_action_log(self, action_id: int, rejected_by: str, note: str = "") -> dict:
         now = utc_now_iso()

@@ -567,6 +567,8 @@ Playbook Center API：`GET /api/playbooks` 返回当前配置里的自愈剧本�
 
 推荐项列表支持筛选参数：`status`/`statuses`、`incident_id`、`category`、`risk`、`action_type`、`source`、`limit`。例如：`GET /api/recommendations?status=suggested,pending_approval&risk=medium`。`/pending` 只返回待审批建议，`/actionable` 返回仍需要处理的建议队列。
 
+审批安全配置：`remediation.approval_ttl_seconds` 可以设置待审批动作有效期。例如设置为 `3600` 后，通过 CLI 或 API 创建的 `pending_approval` 动作会写入 `action_logs.approval_expires_at`；超过时间再审批时，系统会把动作标记为 `skipped`，`decision=expired`，并拒绝执行。
+
 API 鉴权：
 
 ```json

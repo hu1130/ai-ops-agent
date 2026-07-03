@@ -116,6 +116,7 @@ class StorageContextTest(unittest.TestCase):
         self.assertEqual("normal", rows[0]["run_type"])
         self.assertIn("trace_id", rows[0])
         self.assertIn("incident_id", action_columns)
+        self.assertIn("approval_expires_at", action_columns)
         self.assertIn("classification_category", incident_columns)
         self.assertIn("assignee", incident_columns)
         self.assertIn("priority", incident_columns)

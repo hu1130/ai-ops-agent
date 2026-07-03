@@ -767,7 +767,8 @@ class DashboardTest(unittest.TestCase):
                 ],
             )
             recommendation_id = storage.latest_incident_recommendations(incident_id)[0]["id"]
-            server = start_dashboard(storage, "127.0.0.1", 0)
+            config = AppConfig(raw={"remediation": {"approval_ttl_seconds": 60}}, base_dir=Path(tmp))
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
             host, port = server.server_address
             try:
                 request = urllib.request.Request(
@@ -798,6 +799,7 @@ class DashboardTest(unittest.TestCase):
 
         self.assertEqual("pending_approval", requested["recommendation"]["status"])
         self.assertEqual("pending_approval", requested["action"]["status"])
+        self.assertTrue(requested["action"]["approval_expires_at"])
         self.assertEqual(requested["action"]["id"], requested["recommendation"]["action_log_id"])
         self.assertEqual("rejected", rejected["recommendation"]["status"])
         self.assertEqual("rejected", rejected["action"]["status"])

@@ -1,11 +1,13 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 
 from ops_agent.config import AppConfig
 from ops_agent.events import CheckResult
+from ops_agent.remediation.approval import approve_action_log
 from ops_agent.remediation.actions import RemediationAction
 from ops_agent.remediation.executor import execute_action
 from ops_agent.remediation.playbook_center import (
@@ -526,6 +528,30 @@ class RemediationTest(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual("skipped", row["status"])
         self.assertEqual("tester", row["approved_by"])
+
+    def test_expired_approval_is_marked_skipped_and_not_executed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            action_id = storage.save_action_log(
+                "check_port",
+                "Check expired approval",
+                "low",
+                "pending_approval",
+                "test",
+                {"host": "127.0.0.1", "port": 1, "timeout_seconds": 0.01},
+                approval_expires_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+            )
+            config = AppConfig(raw={"remediation": {"allowed_actions": ["check_port"]}}, base_dir=Path(tmp))
+
+            with self.assertRaises(ValueError) as raised:
+                approve_action_log(storage, config, action_id, actor="tester")
+            row = storage.get_action_log(action_id)
+            storage.close()
+
+        self.assertIn("approval expired", str(raised.exception))
+        self.assertEqual("skipped", row["status"])
+        self.assertEqual("expired", row["decision"])
+        self.assertEqual("tester", row["decision_by"])
 
     def test_verify_after_action_http_success(self) -> None:
         server = start_test_server(200)

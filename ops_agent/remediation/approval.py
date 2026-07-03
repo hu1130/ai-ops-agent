@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig
@@ -44,6 +45,10 @@ def approve_action_log(
         raise ValueError(f"action not found: #{action_id}")
     if row["status"] not in APPROVABLE_STATUSES:
         raise ValueError(f"action status cannot be approved: {row['status']}")
+    expired_reason = approval_expired_reason(row)
+    if expired_reason:
+        storage.expire_action_log(action_id, actor, expired_reason)
+        raise ValueError(expired_reason)
 
     action = action_from_log(row)
     result = execute_action(action, config, dry_run=False, approved=True)
@@ -66,6 +71,36 @@ def reject_action_log(storage: Storage, action_id: int, actor: str = "operator",
     if row["status"] != "pending_approval":
         raise ValueError(f"action status cannot be rejected: {row['status']}")
     return storage.reject_action_log(action_id, actor, note)
+
+
+def approval_expiry_from_config(config: AppConfig | None) -> str:
+    if config is None:
+        return ""
+    remediation = config.raw.get("remediation", {})
+    if not isinstance(remediation, dict):
+        return ""
+    try:
+        ttl_seconds = int(remediation.get("approval_ttl_seconds") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if ttl_seconds <= 0:
+        return ""
+    return (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+
+
+def approval_expired_reason(row: dict) -> str:
+    expires_at = str(row.get("approval_expires_at") or "").strip()
+    if not expires_at:
+        return ""
+    try:
+        expires = datetime.fromisoformat(expires_at)
+    except ValueError:
+        return ""
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) <= expires:
+        return ""
+    return f"approval expired at {expires_at}"
 
 
 def action_from_log(row: dict) -> RemediationAction:

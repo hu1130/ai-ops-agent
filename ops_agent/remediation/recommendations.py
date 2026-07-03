@@ -3,7 +3,7 @@ from __future__ import annotations
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig
 from ops_agent.remediation.actions import RemediationAction
-from ops_agent.remediation.approval import approve_action_log, reject_action_log
+from ops_agent.remediation.approval import approval_expiry_from_config, approve_action_log, reject_action_log
 from ops_agent.storage import Storage
 
 
@@ -16,6 +16,7 @@ def request_recommendation_approval(
     recommendation_id: int,
     actor: str = "operator",
     note: str = "",
+    approval_expires_at: str = "",
 ) -> dict:
     recommendation = require_recommendation(storage, recommendation_id)
     status = str(recommendation.get("status") or "")
@@ -25,7 +26,11 @@ def request_recommendation_approval(
     if status not in REQUESTABLE_STATUSES:
         raise ValueError(f"recommendation status cannot request approval: {status}")
 
-    action_id = int(action["id"]) if action else create_pending_action_log(storage, recommendation)
+    action_id = int(action["id"]) if action else create_pending_action_log(
+        storage,
+        recommendation,
+        approval_expires_at=approval_expires_at,
+    )
     updated = storage.update_incident_recommendation_status(
         recommendation_id,
         "pending_approval",
@@ -45,7 +50,13 @@ def approve_recommendation(
     note: str = "",
     notifier: Notifier | None = None,
 ) -> dict:
-    requested = request_recommendation_approval(storage, recommendation_id, actor=actor, note=note)
+    requested = request_recommendation_approval(
+        storage,
+        recommendation_id,
+        actor=actor,
+        note=note,
+        approval_expires_at=approval_expiry_from_config(config),
+    )
     recommendation = requested["recommendation"]
     action_log_id = int(recommendation["action_log_id"])
     approval = approve_action_log(storage, config, action_log_id, actor=actor, notifier=notifier)
@@ -105,7 +116,11 @@ def existing_action(storage: Storage, recommendation: dict) -> dict | None:
     return storage.get_action_log(int(action_log_id))
 
 
-def create_pending_action_log(storage: Storage, recommendation: dict) -> int:
+def create_pending_action_log(
+    storage: Storage,
+    recommendation: dict,
+    approval_expires_at: str = "",
+) -> int:
     return storage.save_action_log(
         str(recommendation.get("action_type") or ""),
         str(recommendation.get("title") or ""),
@@ -119,6 +134,7 @@ def create_pending_action_log(storage: Storage, recommendation: dict) -> int:
         run_type=str(recommendation.get("run_type") or "normal"),
         trace_id=str(recommendation.get("trace_id") or ""),
         incident_id=int(recommendation["incident_id"]) if recommendation.get("incident_id") else None,
+        approval_expires_at=approval_expires_at,
     )
 
 

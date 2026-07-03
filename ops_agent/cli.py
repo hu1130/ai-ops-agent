@@ -218,6 +218,7 @@ def run_action_command(args: argparse.Namespace, config: AppConfig) -> int:
             run_type=context.run_type,
             trace_id=context.trace_id,
             incident_id=args.incident_id or None,
+            approval_expires_at=approval.approval_expiry_from_config(config),
         )
         storage.close()
         print(format_action_plan([action], [result]))

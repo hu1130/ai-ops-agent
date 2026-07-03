@@ -20,7 +20,7 @@ from ops_agent.monitor_targets import (
     get_monitor_target,
     list_monitor_targets,
 )
-from ops_agent.remediation.approval import approve_action_log, reject_action_log
+from ops_agent.remediation.approval import approval_expiry_from_config, approve_action_log, reject_action_log
 from ops_agent.remediation.playbook_center import (
     create_incident_playbook_recommendations,
     get_playbook,
@@ -439,7 +439,13 @@ def start_dashboard(
                 actor = self.actor_from_body(body, auth)
                 note = str(body.get("note") or body.get("reason") or "")
                 if action == "request-approval":
-                    result = request_recommendation_approval(storage, recommendation_id, actor=actor, note=note)
+                    result = request_recommendation_approval(
+                        storage,
+                        recommendation_id,
+                        actor=actor,
+                        note=note,
+                        approval_expires_at=approval_expiry_from_config(config),
+                    )
                     self.record_audit(path, 200, "success", "recommendation pending approval", actor=actor, auth=auth)
                     self.send_json(result)
                     return
