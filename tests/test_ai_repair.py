@@ -645,6 +645,11 @@ class AiRepairTest(unittest.TestCase):
             "eligible_for_human_approval",
             tested["test_result"]["approval_report"]["risk_assessment"]["recommended_next_action"],
         )
+        execution_plan = tested["test_result"]["approval_report"]["execution_plan"]
+        self.assertEqual("ready_for_approval", execution_plan["status"])
+        self.assertEqual(["sample.txt"], execution_plan["impact"]["changed_files"])
+        self.assertTrue(execution_plan["rollback_plan"]["automatic"])
+        self.assertTrue(any(step["type"] == "deploy_verification" for step in execution_plan["validation_steps"]))
         self.assertEqual("old\n", original_content)
 
     def test_sandbox_guardrails_block_unsafe_test_commands(self) -> None:
@@ -777,6 +782,7 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual("ready_for_approval", ready["items"][0]["queue_state"])
         self.assertEqual(1, ready["summary"]["ready_for_approval"])
         self.assertTrue(ready["items"][0]["can_approve"])
+        self.assertEqual("ready_for_approval", ready["items"][0]["test"]["execution_plan"]["status"])
         self.assertEqual("approve", ready["items"][0]["next_action"]["type"])
         self.assertEqual("approved_needs_branch", approved["items"][0]["queue_state"])
         self.assertTrue(approved["items"][0]["can_prepare_branch"])
@@ -1145,6 +1151,9 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual(7, published["test_result"]["pull_request"]["pr_number"])
         self.assertEqual("gh", published["test_result"]["pull_request"]["method"])
         self.assertTrue(published["test_result"]["pull_request"]["pushed"])
+        self.assertIn("## Execution Plan", published["test_result"]["pull_request"]["body"])
+        self.assertIn("## Rollback Plan", published["test_result"]["pull_request"]["body"])
+        self.assertIn("restore_previous_git_commit_and_rerun_safe_commands", published["test_result"]["pull_request"]["body"])
         self.assertIn(branch_name, remote_branches)
 
     def test_deploy_after_merge_fast_forwards_runs_tests_and_verifies_health(self) -> None:

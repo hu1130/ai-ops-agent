@@ -478,6 +478,7 @@ def ai_repair_approval_queue_item(storage: Storage, repair: dict[str, Any]) -> d
             "approval_decision": str(approval_report.get("decision") or ""),
             "guardrail_status": str(guardrails.get("status") or ""),
             "risk_assessment": safe_dict(approval_report.get("risk_assessment")),
+            "execution_plan": safe_dict(approval_report.get("execution_plan")),
             "sandbox_status": str(safe_dict(test_result.get("sandbox")).get("status") or ""),
             "controlled_branch_ready": bool(controlled_apply.get("ready_for_pr")),
             "pull_request_ready": bool(pull_request.get("ready_for_review")),
@@ -2735,10 +2736,15 @@ def pull_request_title(repair: dict[str, Any], branch_name: str) -> str:
 def pull_request_body(repair: dict[str, Any], controlled_apply: dict[str, Any], base: str) -> str:
     test_result = safe_dict(repair.get("test_result"))
     approval_report = safe_dict(test_result.get("approval_report"))
+    execution_plan = safe_dict(approval_report.get("execution_plan"))
+    impact = safe_dict(execution_plan.get("impact"))
+    rollback_plan = safe_dict(execution_plan.get("rollback_plan"))
     sandbox = safe_dict(test_result.get("sandbox"))
     changed_files = [str(item) for item in safe_list(controlled_apply.get("changed_files"))]
     command_results = safe_list(controlled_apply.get("command_results"))
     commands = [str(item.get("command") or "") for item in command_results if isinstance(item, dict)]
+    pre_deploy_checks = [str(item) for item in safe_list(execution_plan.get("pre_deploy_checks")) if str(item).strip()]
+    validation_steps = execution_plan_validation_lines(safe_list(execution_plan.get("validation_steps")))
     body = [
         "## AI Ops Repair",
         "",
@@ -2746,6 +2752,7 @@ def pull_request_body(repair: dict[str, Any], controlled_apply: dict[str, Any], 
         f"- Incident ID: #{repair.get('incident_id')}",
         f"- Base branch: `{base}`",
         f"- Risk: `{repair.get('risk') or 'medium'}`",
+        f"- Assessed risk: `{safe_dict(approval_report.get('risk_assessment')).get('level') or 'unknown'}`",
         f"- Commit: `{controlled_apply.get('commit') or ''}`",
         "",
         "## Summary",
@@ -2757,18 +2764,46 @@ def pull_request_body(repair: dict[str, Any], controlled_apply: dict[str, Any], 
         "## Changed Files",
         "\n".join(f"- `{path}`" for path in changed_files) if changed_files else "- No files reported",
         "",
+        "## Execution Plan",
+        f"- Plan status: `{execution_plan.get('status') or 'unknown'}`",
+        f"- Patch type: `{impact.get('patch_type') or 'unknown'}`",
+        f"- Changed files: `{impact.get('changed_file_count', len(changed_files))}`",
+        "\n".join(f"- {item}" for item in pre_deploy_checks) if pre_deploy_checks else "- Review approval report before merge.",
+        "",
         "## Validation",
         f"- Sandbox status: `{sandbox.get('status') or 'unknown'}`",
         f"- Approval readiness: `{approval_report.get('decision') or 'unknown'}`",
         f"- Controlled branch status: `{controlled_apply.get('status') or 'unknown'}`",
+        "\n".join(f"- {item}" for item in validation_steps) if validation_steps else "- No validation steps reported",
         "",
         "## Test Commands",
         "\n".join(f"- `{command}`" for command in commands) if commands else "- No commands reported",
+        "",
+        "## Rollback Plan",
+        f"- Automatic rollback: `{bool(rollback_plan.get('automatic'))}`",
+        f"- Strategy: `{rollback_plan.get('strategy') or 'restore_previous_git_commit_and_rerun_safe_commands'}`",
+        f"- Target: {rollback_plan.get('target') or 'deploy_result.before_commit'}",
+        f"- Commands: {rollback_plan.get('commands') or 'rollback_commands or deployment commands'}",
+        f"- Verification: {rollback_plan.get('verification') or 'rollback_verify_urls or deploy verification URLs'}",
         "",
         "## Operator Note",
         "Review before merge. This PR was prepared by Ops Agent after sandbox validation and human approval.",
     ]
     return "\n".join(body)
+
+
+def execution_plan_validation_lines(steps: list[Any]) -> list[str]:
+    lines: list[str] = []
+    for item in steps:
+        step = safe_dict(item)
+        command = str(step.get("command") or "").strip()
+        summary = str(step.get("summary") or "").strip()
+        step_type = str(step.get("type") or "validation").strip()
+        if command:
+            lines.append(f"{step_type}: `{command}`")
+        elif summary:
+            lines.append(f"{step_type}: {summary}")
+    return lines
 
 
 def first_url(value: str) -> str:
@@ -2874,6 +2909,15 @@ def build_approval_report(
         blockers,
         warnings,
     )
+    execution_plan = build_repair_execution_plan(
+        repair,
+        validation,
+        sandbox,
+        guardrail_report,
+        risk_assessment,
+        blockers,
+        warnings,
+    )
     ready = not blockers
     return {
         "ready_to_approve": ready,
@@ -2882,6 +2926,7 @@ def build_approval_report(
         "warnings": warnings,
         "guardrail_status": str(guardrail_report.get("status") or ""),
         "risk_assessment": risk_assessment,
+        "execution_plan": execution_plan,
         "repair_id": repair.get("id"),
         "incident_id": repair.get("incident_id"),
         "checked_files": safe_list(validation.get("checked_files")),
@@ -2978,6 +3023,94 @@ def build_repair_risk_assessment(
         "warning_count": len(warnings),
         "changed_file_count": len(checked_files),
         "recommended_next_action": next_action,
+    }
+
+
+def build_repair_execution_plan(
+    repair: dict[str, Any],
+    validation: dict[str, Any],
+    sandbox: dict[str, Any],
+    guardrails: dict[str, Any],
+    risk_assessment: dict[str, Any],
+    blockers: list[str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    patch = safe_dict(repair.get("patch"))
+    changed_files = [str(path) for path in safe_list(validation.get("checked_files")) if str(path).strip()]
+    commands = [str(item) for item in safe_list(sandbox.get("commands")) if str(item).strip()]
+    risk_level = str(risk_assessment.get("level") or normalize_risk(repair.get("risk")))
+    dry_run_passed = bool(validation.get("valid"))
+    guardrails_passed = str(guardrails.get("status") or "") == "passed"
+    sandbox_passed = str(sandbox.get("status") or "") == "passed" and bool(sandbox.get("patch_applied"))
+    ready = not blockers and dry_run_passed and guardrails_passed and sandbox_passed
+    gates = [
+        {
+            "name": "dry_run",
+            "status": "passed" if dry_run_passed else "blocked",
+            "required": True,
+            "summary": "patch schema and file paths are valid",
+        },
+        {
+            "name": "guardrails",
+            "status": "passed" if guardrails_passed else "blocked",
+            "required": True,
+            "summary": "sensitive paths, command whitelist, and patch limits are acceptable",
+        },
+        {
+            "name": "sandbox",
+            "status": "passed" if sandbox_passed else "blocked",
+            "required": True,
+            "summary": "patch applies to a copied worktree and tests pass",
+        },
+        {
+            "name": "risk_review",
+            "status": "attention" if risk_level in {"medium", "high", "critical"} and ready else "passed",
+            "required": risk_level in {"high", "critical"},
+            "summary": f"assessed risk level is {risk_level}",
+        },
+    ]
+    pre_deploy_checks = [
+        "Review the unified diff and changed file list before approval.",
+        "Confirm approval_report.ready_to_approve is true and blockers is empty.",
+        "Confirm the prepared branch contains only the intended changed files.",
+        "Provide deploy verification URLs before running deploy-merged.",
+    ]
+    validation_steps = [
+        {"type": "sandbox_command", "command": command, "required": True} for command in commands
+    ]
+    validation_steps.append(
+        {
+            "type": "deploy_verification",
+            "summary": "After merge, deploy-merged must run configured verification URLs.",
+            "required": True,
+        }
+    )
+    rollback_plan = {
+        "automatic": True,
+        "strategy": "restore_previous_git_commit_and_rerun_safe_commands",
+        "trigger_conditions": [
+            "deploy command failed",
+            "deploy verification URL failed",
+        ],
+        "target": "deploy_result.before_commit captured immediately before deployment",
+        "commands": "rollback_commands from deploy request, otherwise deployment commands",
+        "verification": "rollback_verify_urls from deploy request, otherwise deploy verification URLs",
+        "manual_fallback": "Use the recorded before_commit and deploy backup to restore the previous release manually.",
+    }
+    return {
+        "status": "ready_for_approval" if ready else "blocked",
+        "impact": {
+            "patch_type": str(patch.get("patch_type") or ""),
+            "changed_files": changed_files,
+            "changed_file_count": len(changed_files),
+            "risk_level": risk_level,
+        },
+        "gates": gates,
+        "pre_deploy_checks": pre_deploy_checks,
+        "validation_steps": validation_steps,
+        "rollback_plan": rollback_plan,
+        "warnings": warnings,
+        "blockers": blockers,
     }
 
 
