@@ -29,6 +29,8 @@ DEFAULT_SANDBOX_MAX_OUTPUT_CHARS = 12000
 DEFAULT_GIT_TIMEOUT_SECONDS = 60
 DEFAULT_GIT_PUSH_TIMEOUT_SECONDS = 120
 DEFAULT_GITHUB_TIMEOUT_SECONDS = 30
+DEFAULT_DEPLOY_TIMEOUT_SECONDS = 180
+DEFAULT_DEPLOY_VERIFY_TIMEOUT_SECONDS = 10
 CONTROLLED_BRANCH_PREFIX = "ai-repair"
 CONTROLLED_WORKTREE_SUFFIX = "ai-repair-worktrees"
 MAX_DIFF_CHARS = 80000
@@ -58,6 +60,12 @@ SAFE_TEST_COMMAND_PREFIXES = (
     "pytest",
     "python -m py_compile",
     "python3 -m py_compile",
+)
+DEFAULT_DEPLOY_COMMANDS = ["python -m unittest discover -s tests"]
+SAFE_DEPLOY_COMMAND_PREFIXES = (
+    *SAFE_TEST_COMMAND_PREFIXES,
+    "systemctl restart ops-agent",
+    "systemctl reload ops-agent",
 )
 SENSITIVE_FILENAMES = {
     ".env",
@@ -235,6 +243,77 @@ def publish_ai_repair_pull_request(
         actor=actor,
         note=note,
         test_result=result,
+    )
+
+
+def deploy_ai_repair_after_merge(
+    storage: Storage,
+    repair_id: int,
+    repo_root: Path | str,
+    actor: str = "operator",
+    note: str = "",
+    remote: str = "origin",
+    base: str = "main",
+    commands: list[str] | None = None,
+    verify_urls: list[str] | None = None,
+    assume_merged: bool = False,
+) -> dict:
+    repair = require_ai_repair(storage, repair_id)
+    if str(repair.get("status") or "") not in {"pr_created", "merge_pending", "deploy_failed", "deployed"}:
+        raise ValueError("AI repair pull request must be created before merged deployment")
+    result_payload = safe_dict(repair.get("test_result"))
+    pull_request = safe_dict(result_payload.get("pull_request"))
+    if not pull_request.get("ready_for_review"):
+        raise ValueError("pull request metadata is not ready for deployment")
+    pr_status = (
+        {"status": "merged", "merged": True, "source": "assumed", "error": ""}
+        if assume_merged
+        else github_pull_request_status(Path(repo_root), pull_request, remote=remote)
+    )
+    if not pr_status.get("merged"):
+        deploy_result = {
+            "status": "skipped",
+            "ready": False,
+            "reason": "pull request is not merged",
+            "error": pr_status.get("error", ""),
+        }
+        updated_result = {
+            **result_payload,
+            "status": "not_run",
+            "note": note or "PR merge check completed; deployment not started",
+            "pull_request_status": pr_status,
+            "deploy_result": deploy_result,
+        }
+        return storage.update_ai_repair_proposal_status(
+            repair_id,
+            "merge_pending",
+            actor=actor,
+            note=note,
+            test_result=updated_result,
+        )
+
+    deploy_result = deploy_merged_pull_request(
+        Path(repo_root),
+        remote=remote,
+        base=base,
+        commands=safe_list(commands) if commands is not None else DEFAULT_DEPLOY_COMMANDS,
+        verify_urls=safe_list(verify_urls) if verify_urls is not None else [],
+    )
+    next_status = "deployed" if deploy_result.get("ready") else "deploy_failed"
+    updated_result = {
+        **result_payload,
+        "status": "passed" if deploy_result.get("ready") else "failed",
+        "note": note or "merged PR deployment completed",
+        "error": deploy_result.get("error", ""),
+        "pull_request_status": pr_status,
+        "deploy_result": deploy_result,
+    }
+    return storage.update_ai_repair_proposal_status(
+        repair_id,
+        next_status,
+        actor=actor,
+        note=note,
+        test_result=updated_result,
     )
 
 
@@ -732,6 +811,8 @@ def normalize_test_result(result: dict[str, Any], repair: dict[str, Any]) -> dic
         "approval_report": safe_dict(result.get("approval_report")),
         "controlled_apply": safe_dict(result.get("controlled_apply")),
         "pull_request": safe_dict(result.get("pull_request")),
+        "pull_request_status": safe_dict(result.get("pull_request_status")),
+        "deploy_result": safe_dict(result.get("deploy_result")),
     }
 
 
@@ -1163,6 +1244,299 @@ def create_github_pull_request_with_api(
     }
 
 
+def github_pull_request_status(repo_root: Path, pull_request: dict[str, Any], remote: str = "origin") -> dict[str, Any]:
+    pr_url = str(pull_request.get("pr_url") or "")
+    pr_number = safe_int(pull_request.get("pr_number"))
+    repo_slug = str(pull_request.get("repo_slug") or "").strip()
+    if not repo_slug:
+        remote_url = run_git(["remote", "get-url", normalize_git_ref(remote, "origin")], repo_root)
+        if remote_url["returncode"] == 0:
+            repo_slug = github_repo_slug(remote_url["stdout"].strip())
+    gh_status = github_pull_request_status_with_gh(repo_root, pr_url, pr_number, repo_slug)
+    if gh_status.get("checked"):
+        return gh_status
+    api_status = github_pull_request_status_with_api(repo_slug, pr_number)
+    if api_status.get("checked"):
+        return api_status
+    errors = [str(item.get("error") or "") for item in (gh_status, api_status) if item.get("error")]
+    return {
+        "checked": False,
+        "merged": False,
+        "status": "unknown",
+        "source": "github",
+        "error": "; ".join(errors) or "unable to check pull request merge status",
+    }
+
+
+def github_pull_request_status_with_gh(
+    repo_root: Path,
+    pr_url: str,
+    pr_number: int,
+    repo_slug: str,
+) -> dict[str, Any]:
+    target = pr_url or str(pr_number or "")
+    if not target:
+        return {"checked": False, "merged": False, "status": "unknown", "source": "gh", "error": "missing PR URL/number"}
+    command = [
+        "gh",
+        "pr",
+        "view",
+        target,
+        "--json",
+        "state,mergedAt,mergeCommit,url,number,headRefName,baseRefName",
+    ]
+    if repo_slug:
+        command.extend(["--repo", repo_slug])
+    viewed = run_subprocess(command, repo_root, timeout_seconds=DEFAULT_GITHUB_TIMEOUT_SECONDS)
+    if viewed["returncode"] != 0:
+        return {
+            "checked": False,
+            "merged": False,
+            "status": "unknown",
+            "source": "gh",
+            "error": f"gh pr view failed: {viewed['stderr'] or viewed['stdout']}",
+        }
+    payload = parse_json_object(viewed["stdout"])
+    if not payload:
+        return {
+            "checked": False,
+            "merged": False,
+            "status": "unknown",
+            "source": "gh",
+            "error": "gh pr view did not return JSON",
+        }
+    return normalize_pull_request_status(payload, "gh")
+
+
+def github_pull_request_status_with_api(repo_slug: str, pr_number: int) -> dict[str, Any]:
+    if not repo_slug or pr_number <= 0:
+        return {
+            "checked": False,
+            "merged": False,
+            "status": "unknown",
+            "source": "github_api",
+            "error": "missing GitHub repository or PR number",
+        }
+    token = github_token()
+    if not token:
+        return {
+            "checked": False,
+            "merged": False,
+            "status": "unknown",
+            "source": "github_api",
+            "error": "missing GITHUB_TOKEN or GH_TOKEN for GitHub API fallback",
+        }
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repo_slug}/pulls/{pr_number}",
+        method="GET",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "ops-agent",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=DEFAULT_GITHUB_TIMEOUT_SECONDS) as response:
+            payload = parse_json_object(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        return {
+            "checked": False,
+            "merged": False,
+            "status": "unknown",
+            "source": "github_api",
+            "error": f"GitHub API failed HTTP {exc.code}: {truncate_text(error_body, 1000)}",
+        }
+    except urllib.error.URLError as exc:
+        return {
+            "checked": False,
+            "merged": False,
+            "status": "unknown",
+            "source": "github_api",
+            "error": f"GitHub API request failed: {exc}",
+        }
+    return normalize_pull_request_status(payload, "github_api")
+
+
+def normalize_pull_request_status(payload: dict[str, Any], source: str) -> dict[str, Any]:
+    state = str(payload.get("state") or "").lower()
+    merged_at = str(payload.get("mergedAt") or payload.get("merged_at") or "")
+    merge_commit = payload.get("mergeCommit") or payload.get("merge_commit_sha") or {}
+    merge_sha = str(safe_dict(merge_commit).get("oid") or merge_commit or "")
+    merged = state == "merged" or bool(merged_at)
+    return {
+        "checked": True,
+        "merged": merged,
+        "status": "merged" if merged else (state or "open"),
+        "source": source,
+        "pr_url": str(payload.get("url") or payload.get("html_url") or ""),
+        "pr_number": safe_int(payload.get("number")),
+        "merged_at": merged_at,
+        "merge_commit": merge_sha,
+        "head": str(payload.get("headRefName") or safe_dict(payload.get("head")).get("ref") or ""),
+        "base": str(payload.get("baseRefName") or safe_dict(payload.get("base")).get("ref") or ""),
+        "error": "",
+    }
+
+
+def deploy_merged_pull_request(
+    repo_root: Path,
+    remote: str,
+    base: str,
+    commands: list[Any],
+    verify_urls: list[Any],
+) -> dict[str, Any]:
+    started = time.monotonic()
+    root = repo_root.resolve()
+    remote_name = normalize_git_ref(remote, "origin")
+    base_branch = normalize_git_ref(base, "main")
+    requested_commands = [str(item).strip() for item in commands if str(item).strip()]
+    if not requested_commands:
+        requested_commands = DEFAULT_DEPLOY_COMMANDS
+    verification_targets = [str(item).strip() for item in verify_urls if str(item).strip()]
+    result: dict[str, Any] = {
+        "status": "failed",
+        "ready": False,
+        "repo_root": str(root),
+        "remote": remote_name,
+        "base": base_branch,
+        "before_commit": "",
+        "after_commit": "",
+        "commands": requested_commands,
+        "command_results": [],
+        "verification": {"status": "skipped", "targets": []},
+        "output": "",
+        "error": "",
+    }
+    blockers = deploy_blockers(root, requested_commands)
+    if blockers:
+        result["error"] = "; ".join(blockers)
+        result["blockers"] = blockers
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    before = run_git(["rev-parse", "HEAD"], root)
+    if before["returncode"] != 0:
+        result["error"] = f"git rev-parse failed: {before['stderr'] or before['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    result["before_commit"] = before["stdout"].strip()
+    fetch = run_git(["fetch", remote_name, base_branch], root, timeout_seconds=DEFAULT_GIT_PUSH_TIMEOUT_SECONDS)
+    if fetch["returncode"] != 0:
+        result["error"] = f"git fetch failed: {fetch['stderr'] or fetch['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    checkout = run_git(["checkout", base_branch], root)
+    if checkout["returncode"] != 0:
+        result["error"] = f"git checkout failed: {checkout['stderr'] or checkout['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    pull = run_git(["pull", "--ff-only", remote_name, base_branch], root, timeout_seconds=DEFAULT_GIT_PUSH_TIMEOUT_SECONDS)
+    if pull["returncode"] != 0:
+        result["error"] = f"git pull --ff-only failed: {pull['stderr'] or pull['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    after = run_git(["rev-parse", "HEAD"], root)
+    if after["returncode"] == 0:
+        result["after_commit"] = after["stdout"].strip()
+
+    command_execution = run_safe_deploy_commands(root, requested_commands)
+    result.update(command_execution)
+    if command_execution["status"] != "passed":
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+
+    verification = verify_deployment_urls(verification_targets)
+    result["verification"] = verification
+    if verification["status"] != "passed":
+        result["error"] = verification.get("error", "")
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    result.update({"status": "passed", "ready": True, "duration_seconds": round(time.monotonic() - started, 3)})
+    return result
+
+
+def deploy_blockers(repo_root: Path, requested_commands: list[str]) -> list[str]:
+    blockers: list[str] = []
+    if not repo_root.exists() or not repo_root.is_dir():
+        blockers.append(f"repo root not found: {repo_root}")
+        return blockers
+    unsafe_command = next((command for command in requested_commands if not is_safe_deploy_command(command)), "")
+    if unsafe_command:
+        blockers.append(f"unsafe deploy command: {unsafe_command}")
+    inside = run_git(["rev-parse", "--is-inside-work-tree"], repo_root)
+    if inside["returncode"] != 0 or inside["stdout"].strip().lower() != "true":
+        blockers.append(f"repo root is not a git work tree: {repo_root}")
+    status = run_git(["status", "--porcelain"], repo_root)
+    if status["returncode"] != 0:
+        blockers.append(f"git status failed: {status['stderr'] or status['stdout']}")
+    elif status["stdout"].strip():
+        blockers.append("repo has uncommitted changes; deployment requires a clean work tree")
+    return blockers
+
+
+def run_safe_deploy_commands(cwd: Path, requested_commands: list[str]) -> dict[str, Any]:
+    command_results: list[dict[str, Any]] = []
+    combined_output: list[str] = []
+    combined_error: list[str] = []
+    all_passed = True
+    for command in requested_commands:
+        executed_command = runtime_test_command(command)
+        result = run_subprocess(executed_command, cwd, timeout_seconds=DEFAULT_DEPLOY_TIMEOUT_SECONDS)
+        command_result = {
+            "command": command,
+            "executed_command": executed_command,
+            "returncode": result["returncode"],
+            "stdout": truncate_text(result["stdout"], DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
+            "stderr": truncate_text(result["stderr"], DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
+            "timed_out": bool(result.get("timed_out")),
+        }
+        command_results.append(command_result)
+        if command_result["stdout"]:
+            combined_output.append(f"$ {command}\n{command_result['stdout']}")
+        if command_result["stderr"]:
+            combined_error.append(f"$ {command}\n{command_result['stderr']}")
+        if result["returncode"] != 0:
+            all_passed = False
+            break
+    return {
+        "status": "passed" if all_passed else "failed",
+        "command_results": command_results,
+        "output": truncate_text("\n".join(combined_output), DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
+        "error": truncate_text("\n".join(combined_error), DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
+    }
+
+
+def verify_deployment_urls(urls: list[str]) -> dict[str, Any]:
+    if not urls:
+        return {"status": "skipped", "targets": [], "error": "no verification URLs configured"}
+    targets: list[dict[str, Any]] = []
+    all_passed = True
+    for url in urls:
+        started = time.monotonic()
+        target = {"url": url, "status": "failed", "status_code": 0, "latency_ms": 0, "error": ""}
+        try:
+            request = urllib.request.Request(url=url, method="GET", headers={"User-Agent": "ops-agent/0.1"})
+            with urllib.request.urlopen(request, timeout=DEFAULT_DEPLOY_VERIFY_TIMEOUT_SECONDS) as response:
+                target["status_code"] = int(response.status)
+                response.read(300)
+            target["status"] = "passed" if target["status_code"] == 200 else "failed"
+        except urllib.error.HTTPError as exc:
+            target["status_code"] = int(exc.code)
+            target["error"] = str(exc)
+        except urllib.error.URLError as exc:
+            target["error"] = str(exc)
+        finally:
+            target["latency_ms"] = int((time.monotonic() - started) * 1000)
+        if target["status"] != "passed":
+            all_passed = False
+        targets.append(target)
+    return {
+        "status": "passed" if all_passed else "failed",
+        "targets": targets,
+        "error": "" if all_passed else "one or more verification URLs failed",
+    }
+
+
 def controlled_apply_blockers(
     repo_root: Path,
     repair: dict[str, Any],
@@ -1408,6 +1782,11 @@ def build_approval_report(repair: dict[str, Any], validation: dict[str, Any], sa
 def is_safe_test_command(command: str) -> bool:
     normalized = " ".join(command.strip().split())
     return any(normalized == prefix or normalized.startswith(prefix + " ") for prefix in SAFE_TEST_COMMAND_PREFIXES)
+
+
+def is_safe_deploy_command(command: str) -> bool:
+    normalized = " ".join(command.strip().split())
+    return any(normalized == prefix or normalized.startswith(prefix + " ") for prefix in SAFE_DEPLOY_COMMAND_PREFIXES)
 
 
 def runtime_test_command(command: str) -> str:

@@ -2,13 +2,16 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 import urllib.request
 from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from ops_agent.ai.repair import (
     build_ai_repair_proposal,
+    deploy_ai_repair_after_merge,
     dry_run_ai_repair_proposal,
     prepare_ai_repair_branch,
     publish_ai_repair_pull_request,
@@ -353,6 +356,60 @@ class AiRepairTest(unittest.TestCase):
         self.assertTrue(published["test_result"]["pull_request"]["pushed"])
         self.assertIn(branch_name, remote_branches)
 
+    def test_deploy_after_merge_fast_forwards_runs_tests_and_verifies_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_git_sandbox_repo(Path(tmp) / "repo")
+            remote = create_bare_remote(Path(tmp) / "remote.git")
+            run_git_fixture(repo, ["remote", "add", "origin", str(remote)])
+            run_git_fixture(repo, ["push", "-u", "origin", "main"])
+            fake_bin = create_fake_gh(Path(tmp) / "fake-bin", "https://github.com/example/repo/pull/9")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    }
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+            sandbox_test_ai_repair_proposal(storage, proposal["id"], repo, actor="tester")
+            storage.update_ai_repair_proposal_status(proposal["id"], "approved", actor="tester")
+            prepare_ai_repair_branch(storage, proposal["id"], repo, actor="tester")
+            with patched_path(fake_bin):
+                published = publish_ai_repair_pull_request(storage, proposal["id"], repo, actor="tester")
+            branch_name = published["test_result"]["pull_request"]["branch_name"]
+            merge_branch_to_remote_main(remote, branch_name, Path(tmp) / "merge-clone")
+            self.assertEqual("old\n", (repo / "sample.txt").read_text(encoding="utf-8"))
+
+            with ok_http_server() as health_url:
+                deployed = deploy_ai_repair_after_merge(
+                    storage,
+                    proposal["id"],
+                    repo,
+                    actor="tester",
+                    commands=["python -m unittest discover -s tests"],
+                    verify_urls=[health_url],
+                    assume_merged=True,
+                )
+            deployed_content = (repo / "sample.txt").read_text(encoding="utf-8")
+            storage.close()
+
+        self.assertEqual("deployed", deployed["status"])
+        self.assertEqual("new\n", deployed_content)
+        self.assertTrue(deployed["test_result"]["deploy_result"]["ready"])
+        self.assertEqual("passed", deployed["test_result"]["deploy_result"]["verification"]["status"])
+
     def test_ai_repair_dashboard_api_runs_sandbox_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = create_sandbox_repo(Path(tmp) / "repo")
@@ -512,6 +569,84 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual("https://github.com/example/repo/pull/8", published["test_result"]["pull_request"]["pr_url"])
         self.assertIn("ai_repair.create_pr", {row["operation"] for row in audit})
 
+    def test_ai_repair_dashboard_api_deploys_merged_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_git_sandbox_repo(Path(tmp) / "repo")
+            remote = create_bare_remote(Path(tmp) / "remote.git")
+            run_git_fixture(repo, ["remote", "add", "origin", str(remote)])
+            run_git_fixture(repo, ["push", "-u", "origin", "main"])
+            fake_bin = create_fake_gh(Path(tmp) / "fake-bin", "https://github.com/example/repo/pull/10", merged=True)
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "app": {"name": "ops"},
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    },
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                proposal = post_json(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/ai-repair/propose",
+                    {"actor": "tester"},
+                )
+                post_json(
+                    f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/sandbox-test",
+                    {"actor": "tester"},
+                )
+                post_json(
+                    f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/approve",
+                    {"actor": "tester"},
+                )
+                post_json(
+                    f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/prepare-branch",
+                    {"actor": "tester"},
+                )
+                with patched_path(fake_bin):
+                    published = post_json(
+                        f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/create-pr",
+                        {"actor": "tester"},
+                    )
+                    merge_branch_to_remote_main(
+                        remote,
+                        published["test_result"]["pull_request"]["branch_name"],
+                        Path(tmp) / "merge-clone",
+                    )
+                    with ok_http_server() as health_url:
+                        deployed = post_json(
+                            f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/deploy-merged",
+                            {
+                                "actor": "tester",
+                                "commands": ["python -m unittest discover -s tests"],
+                                "verify_urls": [health_url],
+                            },
+                        )
+                audit = storage.latest_api_audit_logs(60)
+                deployed_content = (repo / "sample.txt").read_text(encoding="utf-8")
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("pr_created", published["status"])
+        self.assertEqual("deployed", deployed["status"])
+        self.assertEqual("new\n", deployed_content)
+        self.assertEqual("passed", deployed["test_result"]["deploy_result"]["verification"]["status"])
+        self.assertIn("ai_repair.deploy_merged", {row["operation"] for row in audit})
+
 
 def post_json(url: str, payload: dict) -> dict:
     request = urllib.request.Request(
@@ -557,6 +692,7 @@ def create_sandbox_repo(root: Path) -> Path:
 def create_git_sandbox_repo(root: Path) -> Path:
     repo = create_sandbox_repo(root)
     run_git_fixture(repo, ["init"])
+    run_git_fixture(repo, ["branch", "-M", "main"])
     run_git_fixture(repo, ["add", "."])
     run_git_fixture(
         repo,
@@ -578,16 +714,63 @@ def create_bare_remote(root: Path) -> Path:
     return root
 
 
-def create_fake_gh(root: Path, pr_url: str) -> Path:
+def create_fake_gh(root: Path, pr_url: str, merged: bool = False) -> Path:
     root.mkdir(parents=True)
+    view_json = (
+        '{"state":"MERGED","mergedAt":"2026-07-06T00:00:00Z","mergeCommit":{"oid":"abc123"},'
+        f'"url":"{pr_url}","number":{pr_url.rstrip("/").rsplit("/", 1)[-1]},'
+        '"headRefName":"ai-repair-test","baseRefName":"main"}'
+    )
     if os.name == "nt":
         script = root / "gh.cmd"
-        script.write_text(f"@echo off\necho {pr_url}\n", encoding="utf-8")
+        if merged:
+            script.write_text(
+                f'@echo off\nif "%1"=="pr" if "%2"=="view" (\n  echo {view_json}\n  exit /B 0\n)\necho {pr_url}\n',
+                encoding="utf-8",
+            )
+        else:
+            script.write_text(f"@echo off\necho {pr_url}\n", encoding="utf-8")
     else:
         script = root / "gh"
-        script.write_text(f"#!/bin/sh\necho {pr_url}\n", encoding="utf-8")
+        if merged:
+            script.write_text(
+                f'#!/bin/sh\nif [ "$1" = "pr" ] && [ "$2" = "view" ]; then\n  echo \'{view_json}\'\n  exit 0\nfi\necho {pr_url}\n',
+                encoding="utf-8",
+            )
+        else:
+            script.write_text(f"#!/bin/sh\necho {pr_url}\n", encoding="utf-8")
         script.chmod(0o755)
     return root
+
+
+def merge_branch_to_remote_main(remote: Path, branch_name: str, clone_dir: Path) -> None:
+    run_git_fixture(clone_dir.parent, ["clone", str(remote), str(clone_dir)])
+    run_git_fixture(clone_dir, ["checkout", "main"])
+    run_git_fixture(clone_dir, ["fetch", "origin", branch_name])
+    run_git_fixture(clone_dir, ["merge", "--ff-only", f"origin/{branch_name}"])
+    run_git_fixture(clone_dir, ["push", "origin", "main"])
+
+
+@contextmanager
+def ok_http_server():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, format, *args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/health"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 @contextmanager

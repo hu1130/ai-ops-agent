@@ -27,6 +27,7 @@ from ops_agent.ai.config_patches import (
 from ops_agent.ai.learning_review import build_learning_optimization_draft
 from ops_agent.ai.repair import (
     build_ai_repair_proposal,
+    deploy_ai_repair_after_merge,
     dry_run_ai_repair_proposal,
     prepare_ai_repair_branch,
     publish_ai_repair_pull_request,
@@ -558,6 +559,28 @@ def start_dashboard(
                     )
                     outcome = "success" if updated.get("status") == "pr_created" else "error"
                     self.record_audit(path, 200, outcome, "AI repair pull request published", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+                if action in {"deploy-merged", "deploy", "verify-deploy"}:
+                    if config is None:
+                        self.record_audit(path, 503, "error", "config is not configured", actor=actor, auth=auth)
+                        self.send_json({"error": "config is not configured"}, status=503)
+                        return
+                    commands = body.get("commands")
+                    verify_urls = body.get("verify_urls") or body.get("verification_urls")
+                    updated = deploy_ai_repair_after_merge(
+                        storage,
+                        repair_id,
+                        config.base_dir,
+                        actor=actor,
+                        note=note,
+                        remote=str(body.get("remote") or "origin"),
+                        base=str(body.get("base") or "main"),
+                        commands=commands if isinstance(commands, list) else None,
+                        verify_urls=verify_urls if isinstance(verify_urls, list) else None,
+                    )
+                    outcome = "success" if updated.get("status") == "deployed" else "error"
+                    self.record_audit(path, 200, outcome, "AI repair merged PR deployment checked", actor=actor, auth=auth)
                     self.send_json(updated)
                     return
                 if action == "approve":

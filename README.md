@@ -631,6 +631,7 @@ POST /api/ai-repairs/1/sandbox-test
 POST /api/ai-repairs/1/approve
 POST /api/ai-repairs/1/prepare-branch
 POST /api/ai-repairs/1/create-pr
+POST /api/ai-repairs/1/deploy-merged
 ```
 
 Config center behavior:

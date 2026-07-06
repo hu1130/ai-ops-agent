@@ -1624,8 +1624,11 @@ class Storage:
                         when 'branch_prepared' then 8
                         when 'pr_failed' then 9
                         when 'pr_created' then 10
-                        when 'rejected' then 11
-                        else 12
+                        when 'merge_pending' then 11
+                        when 'deploy_failed' then 12
+                        when 'deployed' then 13
+                        when 'rejected' then 14
+                        else 15
                     end,
                     updated_at desc,
                     id desc
@@ -1667,6 +1670,9 @@ class Storage:
             "branch_prepared",
             "pr_failed",
             "pr_created",
+            "merge_pending",
+            "deploy_failed",
+            "deployed",
             "rejected",
         }
         normalized_status = (status or "").strip().lower()
