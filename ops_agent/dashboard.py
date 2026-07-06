@@ -10,12 +10,18 @@ from ops_agent.alerts.notifier import Notifier
 from ops_agent.auth import AuthResult, authenticate_token, configured_api_tokens, has_role
 from ops_agent.config import AppConfig
 from ops_agent.config_center import (
+    ai_repair_policy_snapshot,
     apply_config_update,
     backup_config,
     candidate_from_body,
+    configure_deepseek_repair_model,
     config_snapshot,
+    delete_project_config,
     list_config_backups,
+    project_config_snapshot,
     restore_config_backup,
+    update_ai_repair_policy,
+    upsert_project_config,
     validate_config_candidate,
 )
 from ops_agent.diagnosis import persist_incident_diagnosis
@@ -117,6 +123,18 @@ def start_dashboard(
                     self.send_json({"error": "config is not configured"}, status=503)
                     return
                 self.send_json(config_snapshot(config))
+                return
+            if path == "/api/config/projects":
+                if config is None:
+                    self.send_json({"error": "config is not configured"}, status=503)
+                    return
+                self.send_json(project_config_snapshot(config))
+                return
+            if path == "/api/config/ai-repair-policy":
+                if config is None:
+                    self.send_json({"error": "config is not configured"}, status=503)
+                    return
+                self.send_json(ai_repair_policy_snapshot(config))
                 return
             if path == "/api/config/backups":
                 if config is None:
@@ -711,6 +729,53 @@ def start_dashboard(
                     result = backup_config(config, reason=str(body.get("reason") or "manual"))
                     self.record_audit(path, 200, "success", f"config backup {result.get('name')}", actor=actor, auth=auth)
                     self.send_json({"status": "backed_up", "backup": result})
+                    return
+
+                if path == "/api/config/deepseek":
+                    result = configure_deepseek_repair_model(
+                        config,
+                        body,
+                        reason=str(body.get("reason") or "deepseek-repair-model"),
+                    )
+                    self.record_audit(path, 200, "success", "DeepSeek repair model configured", actor=actor, auth=auth)
+                    self.send_json(result)
+                    return
+
+                if path == "/api/config/projects/upsert":
+                    result = upsert_project_config(
+                        config,
+                        safe_body_dict(body.get("project")) or body,
+                        reason=str(body.get("reason") or "project-upsert"),
+                    )
+                    self.record_audit(
+                        path,
+                        200,
+                        "success",
+                        f"project {result.get('action')} {safe_body_dict(result.get('project')).get('id')}",
+                        actor=actor,
+                        auth=auth,
+                    )
+                    self.send_json(result)
+                    return
+
+                if path == "/api/config/projects/delete":
+                    result = delete_project_config(
+                        config,
+                        str(body.get("id") or body.get("project_id") or ""),
+                        reason=str(body.get("reason") or "project-delete"),
+                    )
+                    self.record_audit(path, 200, "success", f"project deleted {result.get('project_id')}", actor=actor, auth=auth)
+                    self.send_json(result)
+                    return
+
+                if path == "/api/config/ai-repair-policy":
+                    result = update_ai_repair_policy(
+                        config,
+                        safe_body_dict(body.get("policy")) or body,
+                        reason=str(body.get("reason") or "ai-repair-policy"),
+                    )
+                    self.record_audit(path, 200, "success", "AI repair policy updated", actor=actor, auth=auth)
+                    self.send_json(result)
                     return
 
                 if path == "/api/config/apply":
@@ -1831,6 +1896,11 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/config/backup": ("config.backup", "config", None),
         "/api/config/apply": ("config.apply", "config", None),
         "/api/config/restore": ("config.restore", "config", None),
+        "/api/config/deepseek": ("config.deepseek", "config", None),
+        "/api/config/projects": ("config.projects.read", "config", None),
+        "/api/config/projects/upsert": ("config.projects.upsert", "config", None),
+        "/api/config/projects/delete": ("config.projects.delete", "config", None),
+        "/api/config/ai-repair-policy": ("config.ai_repair_policy", "config", None),
         "/api/monitor-targets": ("monitor_target.list", "monitor_target", None),
         "/api/playbooks": ("playbook.list", "playbook", None),
         "/api/playbooks/detail": ("playbook.detail", "playbook", None),

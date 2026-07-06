@@ -13,6 +13,7 @@ from ops_agent.ai.repair import (
     build_ai_repair_proposal,
     deploy_ai_repair_after_merge,
     dry_run_ai_repair_proposal,
+    normalize_model_endpoint_url,
     prepare_ai_repair_branch,
     publish_ai_repair_pull_request,
     record_ai_repair_test_result,
@@ -205,6 +206,39 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual("dry_run_passed", dry_run["status"])
         self.assertTrue(dry_run["dry_run"]["mutates_files"])
         self.assertIn("ops_agent/http_monitor.py", dry_run["dry_run"]["checked_files"])
+
+    def test_deepseek_repair_provider_uses_openai_compatible_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "ai": {
+                        "repair": {
+                            "provider": "deepseek",
+                            "enabled": True,
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    }
+                },
+                base_dir=Path(tmp),
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+            endpoint = normalize_model_endpoint_url(
+                {"provider": "deepseek", "endpoint_url": "https://api.deepseek.com"}
+            )
+            storage.close()
+
+        self.assertEqual("deepseek", proposal["model_provider"])
+        self.assertEqual("deepseek-v4-flash", proposal["model_name"])
+        self.assertEqual("https://api.deepseek.com/chat/completions", endpoint)
+        self.assertEqual("proposal_only", proposal["patch"]["apply_mode"])
 
     def test_dry_run_blocks_unsafe_model_patch_paths(self) -> None:
         result = validate_patch_dry_run(

@@ -71,6 +71,15 @@ def public_project(item: dict[str, Any], index: int, app: dict[str, Any]) -> dic
         "tags": [str(value) for value in item.get("tags", []) if str(value).strip()]
         if isinstance(item.get("tags"), list)
         else [],
+        "repo_root": str(item.get("repo_root") or item.get("path") or ""),
+        "git_remote": str(item.get("git_remote") or item.get("remote") or "origin"),
+        "base_branch": str(item.get("base_branch") or item.get("branch") or "main"),
+        "health_urls": string_list(item.get("health_urls") or item.get("verify_urls")),
+        "test_commands": string_list(item.get("test_commands") or item.get("commands")),
+        "deploy_commands": string_list(item.get("deploy_commands")),
+        "rollback_commands": string_list(item.get("rollback_commands")),
+        "owners": string_list(item.get("owners")),
+        "repair_policy": dict(item.get("repair_policy")) if isinstance(item.get("repair_policy"), dict) else {},
     }
 
 
@@ -86,7 +95,22 @@ def default_project(app: dict[str, Any]) -> dict[str, Any]:
         "run_types": [run_type],
         "description": "Default project inferred from app environment.",
         "tags": [],
+        "repo_root": "",
+        "git_remote": "origin",
+        "base_branch": "main",
+        "health_urls": [],
+        "test_commands": [],
+        "deploy_commands": [],
+        "rollback_commands": [],
+        "owners": [],
+        "repair_policy": {},
     }
+
+
+def string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]
 
 
 def normalized_run_types(item: dict[str, Any], app: dict[str, Any]) -> list[str]:

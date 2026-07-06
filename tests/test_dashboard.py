@@ -937,6 +937,85 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("config.backup", audit[2]["operation"])
         self.assertEqual("config.validate", audit[3]["operation"])
 
+    def test_config_center_api_manages_projects_policy_and_deepseek(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text(
+                json.dumps({"app": {"interval_seconds": 60}, "http_checks": []}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            storage = Storage(Path(tmp) / "ops.db")
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/config/deepseek",
+                    data=json.dumps({"actor": "tester", "api_key_env": "DEEPSEEK_API_KEY"}).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    deepseek = json.loads(response.read().decode("utf-8"))
+
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/config/projects/upsert",
+                    data=json.dumps(
+                        {
+                            "actor": "tester",
+                            "project": {
+                                "id": "web",
+                                "name": "Web",
+                                "repo_root": "/opt/web",
+                                "health_urls": ["https://web.example.com/health"],
+                                "test_commands": ["python -m unittest discover -s tests"],
+                            },
+                        }
+                    ).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    project = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(f"http://{host}:{port}/api/config/projects", timeout=5) as response:
+                    projects = json.loads(response.read().decode("utf-8"))
+
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/config/ai-repair-policy",
+                    data=json.dumps(
+                        {
+                            "actor": "tester",
+                            "policy": {"auto_approve": True, "auto_approve_risks": ["low"], "prepare_branch": True},
+                        }
+                    ).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    policy = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/config/projects/delete",
+                    data=json.dumps({"actor": "tester", "id": "web"}).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    deleted = json.loads(response.read().decode("utf-8"))
+                audit = storage.latest_api_audit_logs(4)
+                saved = json.loads(config_path.read_text(encoding="utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("deepseek", deepseek["repair"]["provider"])
+        self.assertEqual("created", project["action"])
+        self.assertEqual(["web"], [row["id"] for row in projects["projects"]])
+        self.assertTrue(policy["policy"]["auto_approve"])
+        self.assertEqual("deleted", deleted["action"])
+        self.assertEqual([], saved["projects"])
+        self.assertEqual("config.projects.delete", audit[0]["operation"])
+
     def test_action_approval_api_lists_and_rejects_pending_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

@@ -8,6 +8,8 @@ import shutil
 from typing import Any
 
 from ops_agent.config import AppConfig
+from ops_agent.ai.repair import DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_MODEL_ENDPOINT, normalize_ai_repair_policy
+from ops_agent.projects import list_projects
 
 
 SECRET_MARKERS = (
@@ -100,11 +102,116 @@ def list_config_backups(config: AppConfig) -> dict[str, Any]:
     return {"config_path": str(config_path), "backups": backups}
 
 
+def project_config_snapshot(config: AppConfig) -> dict[str, Any]:
+    return {
+        "projects": list_projects(config),
+        "raw_projects": redact_secrets(safe_list(config.raw.get("projects"))),
+    }
+
+
+def upsert_project_config(config: AppConfig, project: dict[str, Any], reason: str = "project-upsert") -> dict[str, Any]:
+    candidate = deepcopy(config.raw)
+    project_payload = normalize_project_payload(project)
+    project_id = str(project_payload.get("id") or "").strip()
+    projects = [item for item in safe_list(candidate.get("projects")) if isinstance(item, dict)]
+    replaced = False
+    for index, item in enumerate(projects):
+        if str(item.get("id") or item.get("key") or "").strip() == project_id:
+            projects[index] = {**item, **project_payload}
+            replaced = True
+            break
+    if not replaced:
+        projects.append(project_payload)
+    candidate["projects"] = projects
+    result = apply_config_update(config, candidate, reason=reason)
+    result["project"] = next(
+        (project for project in list_projects(config) if str(project.get("id")) == project_id),
+        project_payload,
+    )
+    result["action"] = "updated" if replaced else "created"
+    return result
+
+
+def delete_project_config(config: AppConfig, project_id: str, reason: str = "project-delete") -> dict[str, Any]:
+    target = str(project_id or "").strip()
+    if not target:
+        raise ValueError("project id is required")
+    candidate = deepcopy(config.raw)
+    projects = [item for item in safe_list(candidate.get("projects")) if isinstance(item, dict)]
+    remaining = [
+        item
+        for item in projects
+        if str(item.get("id") or item.get("key") or "").strip() != target
+    ]
+    if len(remaining) == len(projects):
+        raise ValueError(f"project not found: {target}")
+    candidate["projects"] = remaining
+    result = apply_config_update(config, candidate, reason=reason)
+    result["action"] = "deleted"
+    result["project_id"] = target
+    return result
+
+
+def ai_repair_policy_snapshot(config: AppConfig) -> dict[str, Any]:
+    repair = safe_dict(safe_dict(config.raw.get("ai")).get("repair"))
+    return {
+        "policy": normalize_ai_repair_policy(repair.get("policy")),
+        "configured_policy": redact_secrets(safe_dict(repair.get("policy"))),
+    }
+
+
+def update_ai_repair_policy(config: AppConfig, policy: dict[str, Any], reason: str = "ai-repair-policy") -> dict[str, Any]:
+    candidate = deepcopy(config.raw)
+    ai = safe_dict(candidate.get("ai"))
+    repair = safe_dict(ai.get("repair"))
+    repair["policy"] = normalize_ai_repair_policy(policy)
+    ai["repair"] = repair
+    candidate["ai"] = ai
+    result = apply_config_update(config, candidate, reason=reason)
+    result["policy"] = normalize_ai_repair_policy(safe_dict(safe_dict(config.raw.get("ai")).get("repair")).get("policy"))
+    return result
+
+
+def configure_deepseek_repair_model(
+    config: AppConfig,
+    body: dict[str, Any],
+    reason: str = "deepseek-repair-model",
+) -> dict[str, Any]:
+    candidate = deepcopy(config.raw)
+    ai = safe_dict(candidate.get("ai"))
+    repair = safe_dict(ai.get("repair"))
+    repair["provider"] = "deepseek"
+    repair["enabled"] = bool(body.get("enabled", True))
+    repair["model"] = str(body.get("model") or repair.get("model") or DEEPSEEK_DEFAULT_MODEL)
+    repair["endpoint_url"] = str(body.get("endpoint_url") or repair.get("endpoint_url") or DEEPSEEK_MODEL_ENDPOINT)
+    repair["api_key_env"] = str(body.get("api_key_env") or repair.get("api_key_env") or "DEEPSEEK_API_KEY")
+    ai["repair"] = repair
+    candidate["ai"] = ai
+    result = apply_config_update(config, candidate, reason=reason)
+    result["repair"] = redact_secrets(safe_dict(config.raw.get("ai")).get("repair", {}))
+    return result
+
+
 def candidate_from_body(body: dict[str, Any]) -> dict[str, Any]:
     candidate = body.get("config")
     if not isinstance(candidate, dict):
         raise ValueError("config object is required")
     return deepcopy(candidate)
+
+
+def normalize_project_payload(project: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(project, dict):
+        raise ValueError("project object is required")
+    project_id = str(project.get("id") or project.get("key") or project.get("name") or "").strip()
+    if not project_id:
+        raise ValueError("project id is required")
+    payload = deepcopy(project)
+    payload["id"] = project_id
+    if "run_type" not in payload and "run_types" not in payload:
+        payload["run_types"] = ["normal"]
+    if "environment" not in payload:
+        payload["environment"] = "prod"
+    return payload
 
 
 def require_config_path(config: AppConfig) -> Path:
@@ -142,6 +249,14 @@ def redact_secrets(value: Any, key_name: str = "") -> Any:
     if isinstance(value, list):
         return [redact_secrets(item, key_name) for item in value]
     return deepcopy(value)
+
+
+def safe_dict(value: Any) -> dict:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def safe_list(value: Any) -> list:
+    return list(value) if isinstance(value, list) else []
 
 
 def is_secret_key(key_name: str) -> bool:

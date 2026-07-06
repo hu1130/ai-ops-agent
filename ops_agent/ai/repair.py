@@ -19,8 +19,10 @@ from ops_agent.storage import Storage
 
 SAFE_STATUSES = {"passed", "failed", "skipped", "not_run"}
 DEFAULT_TEST_COMMANDS = ["python -m unittest discover -s tests"]
-MODEL_PROVIDERS = {"openai", "openai_compatible", "llm"}
+MODEL_PROVIDERS = {"openai", "openai_compatible", "llm", "deepseek"}
 DEFAULT_MODEL_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+DEEPSEEK_MODEL_ENDPOINT = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_MODEL_TIMEOUT_SECONDS = 45
 DEFAULT_MAX_PROMPT_CHARS = 12000
 DEFAULT_MAX_RESPONSE_CHARS = 60000
@@ -76,6 +78,16 @@ SENSITIVE_FILENAMES = {
     "id_rsa",
 }
 SENSITIVE_PATH_PARTS = {".git", ".ssh", "secrets", "__pycache__"}
+DEFAULT_AI_REPAIR_POLICY = {
+    "enabled": True,
+    "auto_approve": False,
+    "auto_approve_risks": ["low"],
+    "prepare_branch": False,
+    "create_pr": False,
+    "max_changed_files": 5,
+    "allowed_patch_types": ["unified_diff"],
+    "require_human_approval_risks": ["medium", "high", "critical"],
+}
 
 
 def build_ai_repair_proposal(
@@ -104,10 +116,10 @@ def run_ai_repair_pipeline_for_incident(
     actor: str = "operator",
     note: str = "",
     commands: list[str] | None = None,
-    auto_approve: bool = False,
+    auto_approve: bool | None = None,
     auto_approve_risks: list[str] | None = None,
-    prepare_branch: bool = False,
-    create_pr: bool = False,
+    prepare_branch: bool | None = None,
+    create_pr: bool | None = None,
     remote: str = "origin",
     base: str = "main",
     draft: bool = True,
@@ -119,6 +131,7 @@ def run_ai_repair_pipeline_for_incident(
         incident_id,
         request={**safe_dict(request), "actor": actor},
     )
+    policy = ai_repair_policy_from_config(config)
     return run_ai_repair_pipeline(
         storage,
         proposal["id"],
@@ -133,6 +146,7 @@ def run_ai_repair_pipeline_for_incident(
         remote=remote,
         base=base,
         draft=draft,
+        policy=policy,
         initial_pipeline_stage={"name": "proposal", "status": "passed", "repair_id": proposal["id"]},
     )
 
@@ -144,23 +158,34 @@ def run_ai_repair_pipeline(
     actor: str = "operator",
     note: str = "",
     commands: list[str] | None = None,
-    auto_approve: bool = False,
+    auto_approve: bool | None = None,
     auto_approve_risks: list[str] | None = None,
-    prepare_branch: bool = False,
-    create_pr: bool = False,
+    prepare_branch: bool | None = None,
+    create_pr: bool | None = None,
     remote: str = "origin",
     base: str = "main",
     draft: bool = True,
+    policy: dict[str, Any] | None = None,
     initial_pipeline_stage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    repair_policy = normalize_ai_repair_policy(policy)
+    auto_approve_enabled = bool(auto_approve) if auto_approve is not None else bool(repair_policy.get("auto_approve"))
+    prepare_branch_enabled = (
+        bool(prepare_branch) if prepare_branch is not None else bool(repair_policy.get("prepare_branch"))
+    )
+    create_pr_enabled = bool(create_pr) if create_pr is not None else bool(repair_policy.get("create_pr"))
+    if create_pr_enabled:
+        prepare_branch_enabled = True
+    approved_risks = normalize_auto_approve_risks(auto_approve_risks or repair_policy.get("auto_approve_risks"))
     pipeline = {
         "mode": "ai_repair_pipeline",
         "status": "running",
         "stopped_at": "",
-        "auto_approve_requested": bool(auto_approve),
-        "auto_approve_risks": normalize_auto_approve_risks(auto_approve_risks),
-        "prepare_branch_requested": bool(prepare_branch or create_pr),
-        "create_pr_requested": bool(create_pr),
+        "policy": repair_policy,
+        "auto_approve_requested": auto_approve_enabled,
+        "auto_approve_risks": approved_risks,
+        "prepare_branch_requested": prepare_branch_enabled,
+        "create_pr_requested": create_pr_enabled,
         "stages": [],
     }
     if initial_pipeline_stage:
@@ -187,15 +212,15 @@ def run_ai_repair_pipeline(
     if repair.get("status") != "test_passed":
         return finish_ai_repair_pipeline(storage, repair, pipeline, "failed", "sandbox_failed", actor, note)
 
-    if not auto_approve:
+    if not auto_approve_enabled:
         return finish_ai_repair_pipeline(storage, repair, pipeline, "blocked", "approval_required", actor, note)
 
-    if not can_auto_approve_repair(repair, pipeline["auto_approve_risks"]):
+    if not can_auto_approve_repair(repair, repair_policy, approved_risks):
         return finish_ai_repair_pipeline(storage, repair, pipeline, "blocked", "auto_approve_blocked", actor, note)
 
     repair = storage.update_ai_repair_proposal_status(repair_id, "approved", actor=actor, note=note)
     append_pipeline_stage(pipeline, "approval", repair)
-    if not (prepare_branch or create_pr):
+    if not prepare_branch_enabled:
         return finish_ai_repair_pipeline(storage, repair, pipeline, "completed", "approved", actor, note)
 
     repair = prepare_ai_repair_branch(
@@ -209,7 +234,7 @@ def run_ai_repair_pipeline(
     append_pipeline_stage(pipeline, "prepare_branch", repair)
     if repair.get("status") != "branch_prepared":
         return finish_ai_repair_pipeline(storage, repair, pipeline, "failed", "branch_failed", actor, note)
-    if not create_pr:
+    if not create_pr_enabled:
         return finish_ai_repair_pipeline(storage, repair, pipeline, "completed", "branch_prepared", actor, note)
 
     repair = publish_ai_repair_pull_request(
@@ -528,12 +553,15 @@ def repair_settings(context: dict[str, Any]) -> dict[str, Any]:
     config_context = safe_dict(context.get("config"))
     raw = safe_dict(config_context.get("repair"))
     provider = str(raw.get("provider") or config_context.get("provider") or "rules").strip().lower()
+    endpoint_default = DEEPSEEK_MODEL_ENDPOINT if provider == "deepseek" else DEFAULT_MODEL_ENDPOINT
+    model_default = DEEPSEEK_DEFAULT_MODEL if provider == "deepseek" else "gpt-4.1-mini"
+    api_key_env_default = "DEEPSEEK_API_KEY" if provider == "deepseek" else "OPS_AGENT_LLM_API_KEY"
     return {
         "provider": provider,
-        "model": str(raw.get("model") or config_context.get("model") or "gpt-4.1-mini"),
-        "endpoint_url": str(raw.get("endpoint_url") or DEFAULT_MODEL_ENDPOINT),
+        "model": str(raw.get("model") or config_context.get("model") or model_default),
+        "endpoint_url": str(raw.get("endpoint_url") or endpoint_default),
         "api_key": str(raw.get("api_key") or ""),
-        "api_key_env": str(raw.get("api_key_env") or "OPS_AGENT_LLM_API_KEY"),
+        "api_key_env": str(raw.get("api_key_env") or api_key_env_default),
         "timeout_seconds": safe_int(raw.get("timeout_seconds"), DEFAULT_MODEL_TIMEOUT_SECONDS),
         "max_prompt_chars": safe_int(raw.get("max_prompt_chars"), DEFAULT_MAX_PROMPT_CHARS),
         "max_response_chars": safe_int(raw.get("max_response_chars"), DEFAULT_MAX_RESPONSE_CHARS),
@@ -620,7 +648,7 @@ def call_openai_compatible_model(settings: dict[str, Any], prompt: dict[str, Any
     }
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
-        str(settings.get("endpoint_url") or DEFAULT_MODEL_ENDPOINT),
+        normalize_model_endpoint_url(settings),
         data=data,
         method="POST",
         headers={
@@ -644,6 +672,16 @@ def call_openai_compatible_model(settings: dict[str, Any], prompt: dict[str, Any
     if not content.strip():
         raise ValueError("model response did not include message content")
     return content
+
+
+def normalize_model_endpoint_url(settings: dict[str, Any]) -> str:
+    provider = str(settings.get("provider") or "").strip().lower()
+    endpoint = str(settings.get("endpoint_url") or "").strip().rstrip("/")
+    if not endpoint:
+        return DEEPSEEK_MODEL_ENDPOINT if provider == "deepseek" else DEFAULT_MODEL_ENDPOINT
+    if provider == "deepseek" and endpoint in {"https://api.deepseek.com", "https://api.deepseek.com/v1"}:
+        return f"{endpoint}/chat/completions"
+    return endpoint
 
 
 def model_api_key(settings: dict[str, Any]) -> str:
@@ -2078,12 +2116,19 @@ def finish_ai_repair_pipeline(
     )
 
 
-def can_auto_approve_repair(repair: dict[str, Any], allowed_risks: list[str]) -> bool:
+def can_auto_approve_repair(repair: dict[str, Any], policy: dict[str, Any], allowed_risks: list[str]) -> bool:
     risk = str(repair.get("risk") or "medium").strip().lower()
     report = safe_dict(safe_dict(repair.get("test_result")).get("approval_report"))
     patch = safe_dict(repair.get("patch"))
+    validation = safe_dict(safe_dict(repair.get("test_result")).get("validation")) or validate_patch_dry_run(patch)
+    checked_files = [str(path) for path in safe_list(validation.get("checked_files")) if str(path).strip()]
+    allowed_patch_types = {str(item) for item in safe_list(policy.get("allowed_patch_types")) if str(item)}
+    max_changed_files = safe_int(policy.get("max_changed_files"), safe_int(DEFAULT_AI_REPAIR_POLICY["max_changed_files"], 5))
     return (
-        risk in set(allowed_risks)
+        bool(policy.get("enabled", True))
+        and risk in set(allowed_risks)
+        and str(patch.get("patch_type") or "") in allowed_patch_types
+        and len(checked_files) <= max_changed_files
         and bool(report.get("ready_to_approve"))
         and bool(str(patch.get("diff") or "").strip())
     )
@@ -2093,6 +2138,33 @@ def normalize_auto_approve_risks(value: list[str] | None) -> list[str]:
     risks = [str(item).strip().lower() for item in safe_list(value) if str(item).strip()]
     valid = [risk for risk in risks if risk in {"low", "medium", "high", "critical"}]
     return valid or ["low"]
+
+
+def ai_repair_policy_from_config(config: AppConfig | None) -> dict[str, Any]:
+    if config is None:
+        return normalize_ai_repair_policy({})
+    repair_config = safe_dict(safe_dict(config.raw.get("ai")).get("repair"))
+    return normalize_ai_repair_policy(repair_config.get("policy"))
+
+
+def normalize_ai_repair_policy(value: Any) -> dict[str, Any]:
+    raw = safe_dict(value)
+    policy = dict(DEFAULT_AI_REPAIR_POLICY)
+    for key in ("enabled", "auto_approve", "prepare_branch", "create_pr"):
+        if key in raw:
+            policy[key] = bool(raw.get(key))
+    if "auto_approve_risks" in raw:
+        policy["auto_approve_risks"] = normalize_auto_approve_risks(safe_list(raw.get("auto_approve_risks")))
+    if "require_human_approval_risks" in raw:
+        policy["require_human_approval_risks"] = normalize_auto_approve_risks(
+            safe_list(raw.get("require_human_approval_risks"))
+        )
+    if "allowed_patch_types" in raw:
+        values = [str(item).strip() for item in safe_list(raw.get("allowed_patch_types")) if str(item).strip()]
+        policy["allowed_patch_types"] = values or list(DEFAULT_AI_REPAIR_POLICY["allowed_patch_types"])
+    if "max_changed_files" in raw:
+        policy["max_changed_files"] = safe_int(raw.get("max_changed_files"), 5)
+    return policy
 
 
 def is_safe_test_command(command: str) -> bool:

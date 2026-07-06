@@ -624,6 +624,12 @@ POST /api/config/validate
 POST /api/config/backup
 POST /api/config/apply
 POST /api/config/restore
+GET  /api/config/projects
+POST /api/config/projects/upsert
+POST /api/config/projects/delete
+GET  /api/config/ai-repair-policy
+POST /api/config/ai-repair-policy
+POST /api/config/deepseek
 GET  /api/ai-repairs
 GET  /api/ai-repairs/1
 POST /api/incidents/1/ai-repair/propose
@@ -639,6 +645,17 @@ POST /api/ai-repairs/1/deploy-merged
 `POST /api/ai-repairs/{id}/deploy-merged` runs the merged PR deployment, health verification, and automatic rollback on deployment or verification failure. Optional JSON fields: `commands`, `verify_urls`, `rollback_commands`, `rollback_verify_urls`.
 
 `POST /api/incidents/{id}/ai-repair/run-pipeline` and `POST /api/ai-repairs/{id}/run-pipeline` run the backend AI repair pipeline: proposal, dry-run, sandbox test, optional auto-approval, optional branch preparation, and optional PR creation. It stops at human approval by default. Optional JSON fields: `commands`, `auto_approve`, `auto_approve_risks`, `prepare_branch`, `create_pr`, `remote`, `base`, `draft`.
+
+DeepSeek repair model can be enabled through:
+
+```json
+{
+  "api_key_env": "DEEPSEEK_API_KEY",
+  "model": "deepseek-v4-flash"
+}
+```
+
+Send it to `POST /api/config/deepseek`. The API key should stay in the server environment variable, not in `config.json`.
 
 Config center behavior:
 
