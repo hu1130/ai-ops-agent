@@ -32,6 +32,8 @@ from ops_agent.ai.repair import (
     prepare_ai_repair_branch,
     publish_ai_repair_pull_request,
     record_ai_repair_test_result,
+    run_ai_repair_pipeline,
+    run_ai_repair_pipeline_for_incident,
     sandbox_test_ai_repair_proposal,
 )
 from ops_agent.monitor_targets import (
@@ -455,6 +457,35 @@ def start_dashboard(
             try:
                 body = self.read_json_body()
                 actor = self.actor_from_body(body, auth)
+                if action in {"run-pipeline", "pipeline", "autopilot"}:
+                    if config is None:
+                        self.record_audit(path, 503, "error", "config is not configured", actor=actor, auth=auth)
+                        self.send_json({"error": "config is not configured"}, status=503)
+                        return
+                    commands = body.get("commands")
+                    auto_approve_risks = body.get("auto_approve_risks")
+                    updated = run_ai_repair_pipeline_for_incident(
+                        storage,
+                        config,
+                        incident_id,
+                        config.base_dir,
+                        actor=actor,
+                        note=str(body.get("note") or body.get("reason") or ""),
+                        commands=commands if isinstance(commands, list) else None,
+                        auto_approve=bool(body.get("auto_approve", False)),
+                        auto_approve_risks=auto_approve_risks if isinstance(auto_approve_risks, list) else None,
+                        prepare_branch=bool(body.get("prepare_branch", False)),
+                        create_pr=bool(body.get("create_pr", False)),
+                        remote=str(body.get("remote") or "origin"),
+                        base=str(body.get("base") or "main"),
+                        draft=bool(body.get("draft", True)),
+                        request=body,
+                    )
+                    pipeline = safe_body_dict(safe_body_dict(updated.get("test_result")).get("pipeline"))
+                    outcome = "error" if pipeline.get("status") == "failed" else "success"
+                    self.record_audit(path, 200, outcome, "AI repair pipeline completed", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
                 if action not in {"propose", "proposal"}:
                     self.record_audit(
                         path,
@@ -493,6 +524,33 @@ def start_dashboard(
                 body = self.read_json_body()
                 actor = self.actor_from_body(body, auth)
                 note = str(body.get("note") or body.get("reason") or "")
+                if action in {"run-pipeline", "pipeline", "autopilot"}:
+                    if config is None:
+                        self.record_audit(path, 503, "error", "config is not configured", actor=actor, auth=auth)
+                        self.send_json({"error": "config is not configured"}, status=503)
+                        return
+                    commands = body.get("commands")
+                    auto_approve_risks = body.get("auto_approve_risks")
+                    updated = run_ai_repair_pipeline(
+                        storage,
+                        repair_id,
+                        config.base_dir,
+                        actor=actor,
+                        note=note,
+                        commands=commands if isinstance(commands, list) else None,
+                        auto_approve=bool(body.get("auto_approve", False)),
+                        auto_approve_risks=auto_approve_risks if isinstance(auto_approve_risks, list) else None,
+                        prepare_branch=bool(body.get("prepare_branch", False)),
+                        create_pr=bool(body.get("create_pr", False)),
+                        remote=str(body.get("remote") or "origin"),
+                        base=str(body.get("base") or "main"),
+                        draft=bool(body.get("draft", True)),
+                    )
+                    pipeline = safe_body_dict(safe_body_dict(updated.get("test_result")).get("pipeline"))
+                    outcome = "error" if pipeline.get("status") == "failed" else "success"
+                    self.record_audit(path, 200, outcome, "AI repair pipeline completed", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
                 if action in {"dry-run", "apply-dry-run", "validate"}:
                     updated = dry_run_ai_repair_proposal(storage, repair_id, actor=actor, note=note)
                     outcome = "success" if updated.get("status") == "dry_run_passed" else "error"

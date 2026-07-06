@@ -96,6 +96,138 @@ def build_ai_repair_proposal(
     return storage.save_ai_repair_proposal(incident_id, proposal)
 
 
+def run_ai_repair_pipeline_for_incident(
+    storage: Storage,
+    config: AppConfig | None,
+    incident_id: int,
+    repo_root: Path | str,
+    actor: str = "operator",
+    note: str = "",
+    commands: list[str] | None = None,
+    auto_approve: bool = False,
+    auto_approve_risks: list[str] | None = None,
+    prepare_branch: bool = False,
+    create_pr: bool = False,
+    remote: str = "origin",
+    base: str = "main",
+    draft: bool = True,
+    request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    proposal = build_ai_repair_proposal(
+        storage,
+        config,
+        incident_id,
+        request={**safe_dict(request), "actor": actor},
+    )
+    return run_ai_repair_pipeline(
+        storage,
+        proposal["id"],
+        repo_root,
+        actor=actor,
+        note=note,
+        commands=commands,
+        auto_approve=auto_approve,
+        auto_approve_risks=auto_approve_risks,
+        prepare_branch=prepare_branch,
+        create_pr=create_pr,
+        remote=remote,
+        base=base,
+        draft=draft,
+        initial_pipeline_stage={"name": "proposal", "status": "passed", "repair_id": proposal["id"]},
+    )
+
+
+def run_ai_repair_pipeline(
+    storage: Storage,
+    repair_id: int,
+    repo_root: Path | str,
+    actor: str = "operator",
+    note: str = "",
+    commands: list[str] | None = None,
+    auto_approve: bool = False,
+    auto_approve_risks: list[str] | None = None,
+    prepare_branch: bool = False,
+    create_pr: bool = False,
+    remote: str = "origin",
+    base: str = "main",
+    draft: bool = True,
+    initial_pipeline_stage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    pipeline = {
+        "mode": "ai_repair_pipeline",
+        "status": "running",
+        "stopped_at": "",
+        "auto_approve_requested": bool(auto_approve),
+        "auto_approve_risks": normalize_auto_approve_risks(auto_approve_risks),
+        "prepare_branch_requested": bool(prepare_branch or create_pr),
+        "create_pr_requested": bool(create_pr),
+        "stages": [],
+    }
+    if initial_pipeline_stage:
+        pipeline["stages"].append(safe_dict(initial_pipeline_stage))
+
+    repair = dry_run_ai_repair_proposal(storage, repair_id, actor=actor, note=note)
+    append_pipeline_stage(pipeline, "dry_run", repair)
+    if repair.get("status") != "dry_run_passed":
+        return finish_ai_repair_pipeline(storage, repair, pipeline, "failed", "dry_run_failed", actor, note)
+
+    patch = safe_dict(repair.get("patch"))
+    if not str(patch.get("diff") or "").strip():
+        return finish_ai_repair_pipeline(storage, repair, pipeline, "blocked", "no_patch_diff", actor, note)
+
+    repair = sandbox_test_ai_repair_proposal(
+        storage,
+        repair_id,
+        repo_root,
+        actor=actor,
+        note=note,
+        commands=commands,
+    )
+    append_pipeline_stage(pipeline, "sandbox_test", repair)
+    if repair.get("status") != "test_passed":
+        return finish_ai_repair_pipeline(storage, repair, pipeline, "failed", "sandbox_failed", actor, note)
+
+    if not auto_approve:
+        return finish_ai_repair_pipeline(storage, repair, pipeline, "blocked", "approval_required", actor, note)
+
+    if not can_auto_approve_repair(repair, pipeline["auto_approve_risks"]):
+        return finish_ai_repair_pipeline(storage, repair, pipeline, "blocked", "auto_approve_blocked", actor, note)
+
+    repair = storage.update_ai_repair_proposal_status(repair_id, "approved", actor=actor, note=note)
+    append_pipeline_stage(pipeline, "approval", repair)
+    if not (prepare_branch or create_pr):
+        return finish_ai_repair_pipeline(storage, repair, pipeline, "completed", "approved", actor, note)
+
+    repair = prepare_ai_repair_branch(
+        storage,
+        repair_id,
+        repo_root,
+        actor=actor,
+        note=note,
+        commands=commands,
+    )
+    append_pipeline_stage(pipeline, "prepare_branch", repair)
+    if repair.get("status") != "branch_prepared":
+        return finish_ai_repair_pipeline(storage, repair, pipeline, "failed", "branch_failed", actor, note)
+    if not create_pr:
+        return finish_ai_repair_pipeline(storage, repair, pipeline, "completed", "branch_prepared", actor, note)
+
+    repair = publish_ai_repair_pull_request(
+        storage,
+        repair_id,
+        repo_root,
+        actor=actor,
+        note=note,
+        remote=remote,
+        base=base,
+        draft=draft,
+    )
+    append_pipeline_stage(pipeline, "create_pr", repair)
+    if repair.get("status") != "pr_created":
+        return finish_ai_repair_pipeline(storage, repair, pipeline, "failed", "pr_failed", actor, note)
+    return finish_ai_repair_pipeline(storage, repair, pipeline, "completed", "pr_created", actor, note)
+
+
 def dry_run_ai_repair_proposal(storage: Storage, repair_id: int, actor: str = "operator", note: str = "") -> dict:
     repair = require_ai_repair(storage, repair_id)
     patch = safe_dict(repair.get("patch"))
@@ -1903,6 +2035,64 @@ def build_approval_report(repair: dict[str, Any], validation: dict[str, Any], sa
             else "Patch is not ready for approval; review blockers first."
         ),
     }
+
+
+def append_pipeline_stage(pipeline: dict[str, Any], name: str, repair: dict[str, Any]) -> None:
+    dry_run = safe_dict(repair.get("dry_run"))
+    test_result = safe_dict(repair.get("test_result"))
+    pipeline["stages"].append(
+        {
+            "name": name,
+            "repair_id": repair.get("id"),
+            "status": repair.get("status"),
+            "ready": bool(
+                dry_run.get("valid")
+                or safe_dict(test_result.get("approval_report")).get("ready_to_approve")
+                or safe_dict(test_result.get("controlled_apply")).get("ready_for_pr")
+                or safe_dict(test_result.get("pull_request")).get("ready_for_review")
+            ),
+            "error": str(test_result.get("error") or ""),
+        }
+    )
+
+
+def finish_ai_repair_pipeline(
+    storage: Storage,
+    repair: dict[str, Any],
+    pipeline: dict[str, Any],
+    status: str,
+    stopped_at: str,
+    actor: str,
+    note: str,
+) -> dict[str, Any]:
+    pipeline["status"] = status
+    pipeline["stopped_at"] = stopped_at
+    result_payload = safe_dict(repair.get("test_result"))
+    result_payload["pipeline"] = pipeline
+    return storage.update_ai_repair_proposal_status(
+        safe_int(repair.get("id")),
+        str(repair.get("status") or "proposed"),
+        actor=actor,
+        note=note,
+        test_result=result_payload,
+    )
+
+
+def can_auto_approve_repair(repair: dict[str, Any], allowed_risks: list[str]) -> bool:
+    risk = str(repair.get("risk") or "medium").strip().lower()
+    report = safe_dict(safe_dict(repair.get("test_result")).get("approval_report"))
+    patch = safe_dict(repair.get("patch"))
+    return (
+        risk in set(allowed_risks)
+        and bool(report.get("ready_to_approve"))
+        and bool(str(patch.get("diff") or "").strip())
+    )
+
+
+def normalize_auto_approve_risks(value: list[str] | None) -> list[str]:
+    risks = [str(item).strip().lower() for item in safe_list(value) if str(item).strip()]
+    valid = [risk for risk in risks if risk in {"low", "medium", "high", "critical"}]
+    return valid or ["low"]
 
 
 def is_safe_test_command(command: str) -> bool:

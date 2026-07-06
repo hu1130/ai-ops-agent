@@ -627,6 +627,8 @@ POST /api/config/restore
 GET  /api/ai-repairs
 GET  /api/ai-repairs/1
 POST /api/incidents/1/ai-repair/propose
+POST /api/incidents/1/ai-repair/run-pipeline
+POST /api/ai-repairs/1/run-pipeline
 POST /api/ai-repairs/1/sandbox-test
 POST /api/ai-repairs/1/approve
 POST /api/ai-repairs/1/prepare-branch
@@ -635,6 +637,8 @@ POST /api/ai-repairs/1/deploy-merged
 ```
 
 `POST /api/ai-repairs/{id}/deploy-merged` runs the merged PR deployment, health verification, and automatic rollback on deployment or verification failure. Optional JSON fields: `commands`, `verify_urls`, `rollback_commands`, `rollback_verify_urls`.
+
+`POST /api/incidents/{id}/ai-repair/run-pipeline` and `POST /api/ai-repairs/{id}/run-pipeline` run the backend AI repair pipeline: proposal, dry-run, sandbox test, optional auto-approval, optional branch preparation, and optional PR creation. It stops at human approval by default. Optional JSON fields: `commands`, `auto_approve`, `auto_approve_risks`, `prepare_branch`, `create_pr`, `remote`, `base`, `draft`.
 
 Config center behavior:
 
