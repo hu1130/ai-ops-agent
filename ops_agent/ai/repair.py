@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
+import tempfile
+import time
 from pathlib import Path
 from typing import Any
 import urllib.error
@@ -18,6 +22,8 @@ DEFAULT_MODEL_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 DEFAULT_MODEL_TIMEOUT_SECONDS = 45
 DEFAULT_MAX_PROMPT_CHARS = 12000
 DEFAULT_MAX_RESPONSE_CHARS = 60000
+DEFAULT_SANDBOX_TEST_TIMEOUT_SECONDS = 120
+DEFAULT_SANDBOX_MAX_OUTPUT_CHARS = 12000
 MAX_DIFF_CHARS = 80000
 ALLOWED_DIFF_SUFFIXES = {
     ".cfg",
@@ -36,6 +42,16 @@ ALLOWED_DIFF_SUFFIXES = {
     ".yml",
 }
 ALLOWED_DIFF_FILENAMES = {"Dockerfile", "Makefile", "Procfile"}
+SAFE_TEST_COMMAND_PREFIXES = (
+    "python -m unittest",
+    "python3 -m unittest",
+    "py -m unittest",
+    "python -m pytest",
+    "python3 -m pytest",
+    "pytest",
+    "python -m py_compile",
+    "python3 -m py_compile",
+)
 SENSITIVE_FILENAMES = {
     ".env",
     ".env.local",
@@ -98,6 +114,39 @@ def record_ai_repair_test_result(
         note=note,
         test_result=payload,
     )
+
+
+def sandbox_test_ai_repair_proposal(
+    storage: Storage,
+    repair_id: int,
+    repo_root: Path | str,
+    actor: str = "operator",
+    note: str = "",
+    commands: list[str] | None = None,
+) -> dict:
+    repair = require_ai_repair(storage, repair_id)
+    patch = safe_dict(repair.get("patch"))
+    validation = validate_patch_dry_run(patch)
+    sandbox = run_patch_in_sandbox(
+        Path(repo_root),
+        patch,
+        safe_list(commands) if commands is not None else safe_list(safe_dict(repair.get("test_plan")).get("commands")),
+    )
+    report = build_approval_report(repair, validation, sandbox)
+    status = "passed" if report["ready_to_approve"] else "failed"
+    if not str(patch.get("diff") or "").strip():
+        status = "skipped"
+    result = {
+        "status": status,
+        "commands": sandbox.get("commands", []),
+        "output": sandbox.get("output", ""),
+        "error": sandbox.get("error", ""),
+        "note": note or "sandbox patch validation completed",
+        "validation": validation,
+        "sandbox": sandbox,
+        "approval_report": report,
+    }
+    return record_ai_repair_test_result(storage, repair_id, result=result, actor=actor, note=note)
 
 
 def require_ai_repair(storage: Storage, repair_id: int) -> dict:
@@ -589,7 +638,182 @@ def normalize_test_result(result: dict[str, Any], repair: dict[str, Any]) -> dic
         "output": str(result.get("output") or ""),
         "error": str(result.get("error") or ""),
         "note": str(result.get("note") or "test execution is external until sandbox runner is configured"),
+        "validation": safe_dict(result.get("validation")),
+        "sandbox": safe_dict(result.get("sandbox")),
+        "approval_report": safe_dict(result.get("approval_report")),
     }
+
+
+def run_patch_in_sandbox(repo_root: Path, patch: dict[str, Any], commands: list[Any]) -> dict[str, Any]:
+    started = time.monotonic()
+    validation = validate_patch_dry_run(patch)
+    requested_commands = [str(item).strip() for item in commands if str(item).strip()]
+    if not requested_commands:
+        requested_commands = DEFAULT_TEST_COMMANDS
+    sandbox_result: dict[str, Any] = {
+        "status": "failed",
+        "repo_root": str(repo_root),
+        "commands": requested_commands,
+        "patch_applied": False,
+        "cleanup": True,
+        "output": "",
+        "error": "",
+        "validation": validation,
+    }
+    if not validation["valid"]:
+        sandbox_result["error"] = "; ".join(validation["errors"])
+        sandbox_result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return sandbox_result
+    diff = str(patch.get("diff") or "")
+    if not diff.strip():
+        sandbox_result["status"] = "skipped"
+        sandbox_result["error"] = "patch has no unified diff to apply in sandbox"
+        sandbox_result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return sandbox_result
+    root = repo_root.resolve()
+    if not root.exists() or not root.is_dir():
+        sandbox_result["error"] = f"repo root not found: {root}"
+        sandbox_result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return sandbox_result
+    unsafe_command = next((command for command in requested_commands if not is_safe_test_command(command)), "")
+    if unsafe_command:
+        sandbox_result["error"] = f"unsafe test command: {unsafe_command}"
+        sandbox_result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return sandbox_result
+    with tempfile.TemporaryDirectory(prefix=f"ops-agent-repair-{safe_int(patch.get('schema_version'), 1)}-") as tmp:
+        sandbox_dir = Path(tmp) / "repo"
+        copy_repo_to_sandbox(root, sandbox_dir)
+        patch_path = Path(tmp) / "repair.patch"
+        patch_path.write_text(diff, encoding="utf-8")
+        check = run_subprocess(["git", "init"], sandbox_dir, timeout_seconds=30)
+        if check["returncode"] != 0:
+            sandbox_result["error"] = f"git init failed: {check['stderr']}"
+            sandbox_result["duration_seconds"] = round(time.monotonic() - started, 3)
+            return sandbox_result
+        check = run_subprocess(["git", "apply", "--check", str(patch_path)], sandbox_dir, timeout_seconds=30)
+        if check["returncode"] != 0:
+            sandbox_result["error"] = f"git apply --check failed: {check['stderr'] or check['stdout']}"
+            sandbox_result["duration_seconds"] = round(time.monotonic() - started, 3)
+            return sandbox_result
+        applied = run_subprocess(["git", "apply", str(patch_path)], sandbox_dir, timeout_seconds=30)
+        if applied["returncode"] != 0:
+            sandbox_result["error"] = f"git apply failed: {applied['stderr'] or applied['stdout']}"
+            sandbox_result["duration_seconds"] = round(time.monotonic() - started, 3)
+            return sandbox_result
+        sandbox_result["patch_applied"] = True
+        command_results: list[dict[str, Any]] = []
+        combined_output: list[str] = []
+        combined_error: list[str] = []
+        all_passed = True
+        for command in requested_commands:
+            result = run_subprocess(command, sandbox_dir, timeout_seconds=DEFAULT_SANDBOX_TEST_TIMEOUT_SECONDS)
+            command_result = {
+                "command": command,
+                "returncode": result["returncode"],
+                "stdout": truncate_text(result["stdout"], DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
+                "stderr": truncate_text(result["stderr"], DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
+                "timed_out": bool(result.get("timed_out")),
+            }
+            command_results.append(command_result)
+            if command_result["stdout"]:
+                combined_output.append(f"$ {command}\n{command_result['stdout']}")
+            if command_result["stderr"]:
+                combined_error.append(f"$ {command}\n{command_result['stderr']}")
+            if result["returncode"] != 0:
+                all_passed = False
+                break
+        sandbox_result.update(
+            {
+                "status": "passed" if all_passed else "failed",
+                "command_results": command_results,
+                "output": truncate_text("\n".join(combined_output), DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
+                "error": truncate_text("\n".join(combined_error), DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
+                "duration_seconds": round(time.monotonic() - started, 3),
+            }
+        )
+    return sandbox_result
+
+
+def copy_repo_to_sandbox(repo_root: Path, sandbox_dir: Path) -> None:
+    ignore = shutil.ignore_patterns(
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "__pycache__",
+        "*.pyc",
+        "data",
+        "node_modules",
+        ".venv",
+        "venv",
+    )
+    shutil.copytree(repo_root, sandbox_dir, ignore=ignore)
+
+
+def run_subprocess(command: str | list[str], cwd: Path, timeout_seconds: int) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(cwd),
+            shell=isinstance(command, str),
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+        return {
+            "returncode": int(completed.returncode),
+            "stdout": completed.stdout or "",
+            "stderr": completed.stderr or "",
+            "timed_out": False,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "returncode": 124,
+            "stdout": exc.stdout or "",
+            "stderr": (exc.stderr or "") + f"\ncommand timed out after {timeout_seconds}s",
+            "timed_out": True,
+        }
+
+
+def build_approval_report(repair: dict[str, Any], validation: dict[str, Any], sandbox: dict[str, Any]) -> dict[str, Any]:
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if not validation.get("valid"):
+        blockers.extend(str(error) for error in safe_list(validation.get("errors")))
+    if str(sandbox.get("status") or "") == "skipped":
+        blockers.append("sandbox test skipped because no diff was available")
+    if not sandbox.get("patch_applied"):
+        blockers.append("patch was not applied in sandbox")
+    if str(sandbox.get("status") or "") == "failed":
+        blockers.append("sandbox tests failed")
+    warnings.extend(str(item) for item in safe_list(validation.get("warnings")))
+    ready = not blockers
+    return {
+        "ready_to_approve": ready,
+        "decision": "ready_for_human_approval" if ready else "blocked",
+        "blockers": blockers,
+        "warnings": warnings,
+        "repair_id": repair.get("id"),
+        "incident_id": repair.get("incident_id"),
+        "checked_files": safe_list(validation.get("checked_files")),
+        "test_status": str(sandbox.get("status") or ""),
+        "summary": (
+            "Patch applied in sandbox and tests passed."
+            if ready
+            else "Patch is not ready for approval; review blockers first."
+        ),
+    }
+
+
+def is_safe_test_command(command: str) -> bool:
+    normalized = " ".join(command.strip().split())
+    return any(normalized == prefix or normalized.startswith(prefix + " ") for prefix in SAFE_TEST_COMMAND_PREFIXES)
+
+
+def truncate_text(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + "\n...[truncated]"
 
 
 def normalize_test_plan(value: Any) -> dict[str, Any]:

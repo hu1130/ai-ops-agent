@@ -8,6 +8,7 @@ from ops_agent.ai.repair import (
     build_ai_repair_proposal,
     dry_run_ai_repair_proposal,
     record_ai_repair_test_result,
+    sandbox_test_ai_repair_proposal,
     validate_patch_dry_run,
 )
 from ops_agent.config import AppConfig
@@ -219,6 +220,84 @@ class AiRepairTest(unittest.TestCase):
         self.assertTrue(any("unsafe file path" in error for error in result["errors"]))
         self.assertTrue(any("unsafe diff path" in error for error in result["errors"]))
 
+    def test_sandbox_test_applies_patch_to_copy_and_builds_approval_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    }
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+
+            tested = sandbox_test_ai_repair_proposal(storage, proposal["id"], repo, actor="tester")
+            original_content = (repo / "sample.txt").read_text(encoding="utf-8")
+            storage.close()
+
+        self.assertEqual("test_passed", tested["status"])
+        self.assertTrue(tested["test_result"]["sandbox"]["patch_applied"])
+        self.assertEqual("passed", tested["test_result"]["sandbox"]["status"])
+        self.assertTrue(tested["test_result"]["approval_report"]["ready_to_approve"])
+        self.assertEqual("old\n", original_content)
+
+    def test_ai_repair_dashboard_api_runs_sandbox_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "app": {"name": "ops"},
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    },
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                proposal = post_json(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/ai-repair/propose",
+                    {"actor": "tester"},
+                )
+                tested = post_json(
+                    f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/sandbox-test",
+                    {"actor": "tester"},
+                )
+                audit = storage.latest_api_audit_logs(20)
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("test_passed", tested["status"])
+        self.assertTrue(tested["test_result"]["approval_report"]["ready_to_approve"])
+        self.assertIn("ai_repair.sandbox_test", {row["operation"] for row in audit})
+
 
 def post_json(url: str, payload: dict) -> dict:
     request = urllib.request.Request(
@@ -234,6 +313,56 @@ def post_json(url: str, payload: dict) -> dict:
 def get_json(url: str) -> dict | list:
     with urllib.request.urlopen(url, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def create_sandbox_repo(root: Path) -> Path:
+    root.mkdir(parents=True)
+    tests_dir = root / "tests"
+    tests_dir.mkdir()
+    (root / "sample.txt").write_text("old\n", encoding="utf-8")
+    (tests_dir / "test_sample.py").write_text(
+        "\n".join(
+            [
+                "import unittest",
+                "from pathlib import Path",
+                "",
+                "class SampleTest(unittest.TestCase):",
+                "    def test_patch_was_applied(self):",
+                "        self.assertEqual('new', Path('sample.txt').read_text(encoding='utf-8').strip())",
+                "",
+                "if __name__ == '__main__':",
+                "    unittest.main()",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return root
+
+
+def sandbox_patch_response() -> dict:
+    return {
+        "title": "Patch sample file",
+        "summary": "Model generated a sandbox-testable diff.",
+        "risk": "low",
+        "root_cause": "sample file needs update",
+        "repair_plan": ["Update sample.txt", "Run unit tests"],
+        "patch": {
+            "schema_version": 1,
+            "patch_type": "unified_diff",
+            "apply_mode": "proposal_only",
+            "diff": (
+                "diff --git a/sample.txt b/sample.txt\n"
+                "--- a/sample.txt\n"
+                "+++ b/sample.txt\n"
+                "@@ -1 +1 @@\n"
+                "-old\n"
+                "+new\n"
+            ),
+            "files": [{"path": "sample.txt", "change_type": "modify", "reason": "unit test fixture"}],
+        },
+        "test_plan": {"commands": ["python -m unittest discover -s tests"]},
+    }
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ from ops_agent.ai.repair import (
     build_ai_repair_proposal,
     dry_run_ai_repair_proposal,
     record_ai_repair_test_result,
+    sandbox_test_ai_repair_proposal,
 )
 from ops_agent.monitor_targets import (
     apply_monitor_target_change,
@@ -500,6 +501,24 @@ def start_dashboard(
                     updated = record_ai_repair_test_result(storage, repair_id, result=result, actor=actor, note=note)
                     outcome = "success" if updated.get("status") == "test_passed" else "error"
                     self.record_audit(path, 200, outcome, "AI repair test result recorded", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+                if action in {"sandbox-test", "sandbox", "test-sandbox"}:
+                    if config is None:
+                        self.record_audit(path, 503, "error", "config is not configured", actor=actor, auth=auth)
+                        self.send_json({"error": "config is not configured"}, status=503)
+                        return
+                    commands = body.get("commands")
+                    updated = sandbox_test_ai_repair_proposal(
+                        storage,
+                        repair_id,
+                        config.base_dir,
+                        actor=actor,
+                        note=note,
+                        commands=commands if isinstance(commands, list) else None,
+                    )
+                    outcome = "success" if updated.get("status") == "test_passed" else "error"
+                    self.record_audit(path, 200, outcome, "AI repair sandbox test completed", actor=actor, auth=auth)
                     self.send_json(updated)
                     return
                 if action == "approve":
