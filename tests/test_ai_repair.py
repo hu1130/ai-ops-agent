@@ -640,6 +640,11 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual("passed", tested["test_result"]["guardrails"]["status"])
         self.assertEqual("passed", tested["test_result"]["approval_report"]["guardrail_status"])
         self.assertTrue(tested["test_result"]["approval_report"]["ready_to_approve"])
+        self.assertEqual("low", tested["test_result"]["approval_report"]["risk_assessment"]["level"])
+        self.assertEqual(
+            "eligible_for_human_approval",
+            tested["test_result"]["approval_report"]["risk_assessment"]["recommended_next_action"],
+        )
         self.assertEqual("old\n", original_content)
 
     def test_sandbox_guardrails_block_unsafe_test_commands(self) -> None:
@@ -726,6 +731,11 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual("blocked", tested["test_result"]["guardrails"]["status"])
         self.assertFalse(tested["test_result"]["sandbox"]["patch_applied"])
         self.assertFalse(tested["test_result"]["approval_report"]["ready_to_approve"])
+        self.assertEqual("critical", tested["test_result"]["approval_report"]["risk_assessment"]["level"])
+        self.assertEqual(
+            "fix_blockers",
+            tested["test_result"]["approval_report"]["risk_assessment"]["recommended_next_action"],
+        )
         self.assertTrue(any("sensitive file" in item for item in tested["test_result"]["approval_report"]["blockers"]))
         self.assertEqual("TOKEN=old\n", env_content)
 
@@ -979,6 +989,68 @@ class AiRepairTest(unittest.TestCase):
         )
         self.assertTrue(controlled_apply["ready_for_pr"])
         self.assertEqual("new\n", worktree_content)
+        self.assertEqual("", main_status)
+
+    def test_ai_repair_pipeline_blocks_auto_approval_when_assessed_risk_increases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_git_sandbox_repo(Path(tmp) / "repo")
+            for index in range(1, 5):
+                (repo / f"extra{index}.txt").write_text("old\n", encoding="utf-8")
+            run_git_fixture(repo, ["add", "."])
+            run_git_fixture(
+                repo,
+                [
+                    "-c",
+                    "user.name=Tester",
+                    "-c",
+                    "user.email=tester@example.local",
+                    "commit",
+                    "-m",
+                    "Add extra fixture files",
+                ],
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": multi_file_patch_response(),
+                        }
+                    }
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+
+            repaired = run_ai_repair_pipeline_for_incident(
+                storage,
+                config,
+                incident_id,
+                repo,
+                actor="tester",
+                auto_approve=True,
+                prepare_branch=True,
+            )
+            main_status = run_git_fixture(repo, ["status", "--porcelain"])
+            storage.close()
+
+        pipeline = repaired["test_result"]["pipeline"]
+        approval_report = repaired["test_result"]["approval_report"]
+        self.assertEqual("test_passed", repaired["status"])
+        self.assertEqual("blocked", pipeline["status"])
+        self.assertEqual("auto_approve_blocked", pipeline["stopped_at"])
+        self.assertEqual("medium", approval_report["risk_assessment"]["level"])
+        self.assertFalse(pipeline["auto_approve_decision"]["eligible"])
+        self.assertTrue(
+            any("assessed risk medium" in item for item in pipeline["auto_approve_decision"]["blockers"])
+        )
         self.assertEqual("", main_status)
 
     def test_prepare_branch_creates_auditable_worktree_commit_after_approval(self) -> None:
@@ -1727,6 +1799,29 @@ def sandbox_patch_response() -> dict:
         },
         "test_plan": {"commands": ["python -m unittest discover -s tests"]},
     }
+
+
+def multi_file_patch_response() -> dict:
+    files = ["sample.txt", "extra1.txt", "extra2.txt", "extra3.txt", "extra4.txt"]
+    diff_parts = []
+    for path in files:
+        diff_parts.extend(
+            [
+                f"diff --git a/{path} b/{path}",
+                f"--- a/{path}",
+                f"+++ b/{path}",
+                "@@ -1 +1 @@",
+                "-old",
+                "+new",
+            ]
+        )
+    response = sandbox_patch_response()
+    response["summary"] = "Model generated a wider but still sandbox-testable diff."
+    response["patch"]["diff"] = "\n".join(diff_parts) + "\n"
+    response["patch"]["files"] = [
+        {"path": path, "change_type": "modify", "reason": "multi-file risk fixture"} for path in files
+    ]
+    return response
 
 
 if __name__ == "__main__":

@@ -110,6 +110,7 @@ DEFAULT_AI_REPAIR_POLICY = {
     "require_human_approval_risks": ["medium", "high", "critical"],
 }
 DEFAULT_SANDBOX_MAX_COMMANDS = 5
+AI_REPAIR_RISK_SCORES = {"low": 10, "medium": 40, "high": 70, "critical": 90}
 AI_REPAIR_QUEUE_ACTIVE_STATUSES = [
     "proposed",
     "dry_run_failed",
@@ -476,6 +477,7 @@ def ai_repair_approval_queue_item(storage: Storage, repair: dict[str, Any]) -> d
             "approval_ready": bool(approval_report.get("ready_to_approve")),
             "approval_decision": str(approval_report.get("decision") or ""),
             "guardrail_status": str(guardrails.get("status") or ""),
+            "risk_assessment": safe_dict(approval_report.get("risk_assessment")),
             "sandbox_status": str(safe_dict(test_result.get("sandbox")).get("status") or ""),
             "controlled_branch_ready": bool(controlled_apply.get("ready_for_pr")),
             "pull_request_ready": bool(pull_request.get("ready_for_review")),
@@ -921,7 +923,9 @@ def run_ai_repair_pipeline(
     if not auto_approve_enabled:
         return finish_ai_repair_pipeline(storage, repair, pipeline, "blocked", "approval_required", actor, note)
 
-    if not can_auto_approve_repair(repair, repair_policy, approved_risks):
+    auto_approve_decision = auto_approval_decision(repair, repair_policy, approved_risks)
+    pipeline["auto_approve_decision"] = auto_approve_decision
+    if not auto_approve_decision["eligible"]:
         return finish_ai_repair_pipeline(storage, repair, pipeline, "blocked", "auto_approve_blocked", actor, note)
 
     repair = storage.update_ai_repair_proposal_status(repair_id, "approved", actor=actor, note=note)
@@ -2862,6 +2866,14 @@ def build_approval_report(
     warnings.extend(str(item) for item in safe_list(guardrail_report.get("warnings")))
     blockers = unique_strings(blockers)
     warnings = unique_strings(warnings)
+    risk_assessment = build_repair_risk_assessment(
+        repair,
+        validation,
+        sandbox,
+        guardrail_report,
+        blockers,
+        warnings,
+    )
     ready = not blockers
     return {
         "ready_to_approve": ready,
@@ -2869,6 +2881,7 @@ def build_approval_report(
         "blockers": blockers,
         "warnings": warnings,
         "guardrail_status": str(guardrail_report.get("status") or ""),
+        "risk_assessment": risk_assessment,
         "repair_id": repair.get("id"),
         "incident_id": repair.get("incident_id"),
         "checked_files": safe_list(validation.get("checked_files")),
@@ -2879,6 +2892,103 @@ def build_approval_report(
             else "Patch is not ready for approval; review blockers first."
         ),
     }
+
+
+def build_repair_risk_assessment(
+    repair: dict[str, Any],
+    validation: dict[str, Any],
+    sandbox: dict[str, Any],
+    guardrails: dict[str, Any],
+    blockers: list[str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    patch = safe_dict(repair.get("patch"))
+    model_risk = normalize_risk(repair.get("risk"))
+    score = safe_int(AI_REPAIR_RISK_SCORES.get(model_risk), AI_REPAIR_RISK_SCORES["medium"])
+    factors: list[dict[str, Any]] = [
+        {
+            "type": "model_risk",
+            "impact": score,
+            "summary": f"model classified repair risk as {model_risk}",
+        }
+    ]
+
+    checked_files = [str(path) for path in safe_list(validation.get("checked_files")) if str(path).strip()]
+    if len(checked_files) > 1:
+        impact = min(20, (len(checked_files) - 1) * 5)
+        score += impact
+        factors.append(
+            {
+                "type": "blast_radius",
+                "impact": impact,
+                "summary": f"patch touches {len(checked_files)} files",
+            }
+        )
+
+    patch_type = str(patch.get("patch_type") or "")
+    if patch_type and patch_type != "unified_diff":
+        score += 10
+        factors.append({"type": "patch_type", "impact": 10, "summary": f"patch type is {patch_type}"})
+    if not str(patch.get("diff") or "").strip():
+        score += 20
+        factors.append({"type": "review_only", "impact": 20, "summary": "patch has no unified diff"})
+    if not validation.get("valid"):
+        score += 30
+        factors.append({"type": "dry_run", "impact": 30, "summary": "dry-run validation failed"})
+
+    guardrail_blockers = safe_list(guardrails.get("blockers"))
+    if guardrails.get("status") == "blocked":
+        impact = 40 if guardrail_blockers else 25
+        score += impact
+        factors.append({"type": "guardrail", "impact": impact, "summary": "sandbox guardrails blocked approval"})
+
+    sandbox_status = str(sandbox.get("status") or "")
+    if sandbox_status == "failed":
+        score += 30
+        factors.append({"type": "sandbox", "impact": 30, "summary": "sandbox tests failed"})
+    elif sandbox_status == "skipped":
+        score += 20
+        factors.append({"type": "sandbox", "impact": 20, "summary": "sandbox test was skipped"})
+
+    if blockers:
+        impact = min(30, len(blockers) * 10)
+        score += impact
+        factors.append({"type": "approval_blockers", "impact": impact, "summary": f"{len(blockers)} approval blockers"})
+    elif warnings:
+        impact = min(10, len(warnings) * 2)
+        score += impact
+        factors.append({"type": "warnings", "impact": impact, "summary": f"{len(warnings)} approval warnings"})
+
+    score = max(0, min(100, score))
+    level = risk_level_from_score(score)
+    if blockers:
+        next_action = "fix_blockers"
+    elif level in {"high", "critical"}:
+        next_action = "manual_security_review"
+    elif level == "medium":
+        next_action = "manual_review"
+    else:
+        next_action = "eligible_for_human_approval"
+    return {
+        "score": score,
+        "level": level,
+        "model_risk": model_risk,
+        "factors": factors,
+        "blocker_count": len(blockers),
+        "warning_count": len(warnings),
+        "changed_file_count": len(checked_files),
+        "recommended_next_action": next_action,
+    }
+
+
+def risk_level_from_score(score: int) -> str:
+    if score >= 80:
+        return "critical"
+    if score >= 60:
+        return "high"
+    if score >= 30:
+        return "medium"
+    return "low"
 
 
 def append_pipeline_stage(pipeline: dict[str, Any], name: str, repair: dict[str, Any]) -> None:
@@ -2923,21 +3033,46 @@ def finish_ai_repair_pipeline(
 
 
 def can_auto_approve_repair(repair: dict[str, Any], policy: dict[str, Any], allowed_risks: list[str]) -> bool:
+    return bool(auto_approval_decision(repair, policy, allowed_risks).get("eligible"))
+
+
+def auto_approval_decision(repair: dict[str, Any], policy: dict[str, Any], allowed_risks: list[str]) -> dict[str, Any]:
     risk = str(repair.get("risk") or "medium").strip().lower()
     report = safe_dict(safe_dict(repair.get("test_result")).get("approval_report"))
+    risk_assessment = safe_dict(report.get("risk_assessment"))
+    assessed_level = normalize_risk(risk_assessment.get("level") or risk)
     patch = safe_dict(repair.get("patch"))
     validation = safe_dict(safe_dict(repair.get("test_result")).get("validation")) or validate_patch_dry_run(patch)
     checked_files = [str(path) for path in safe_list(validation.get("checked_files")) if str(path).strip()]
     allowed_patch_types = {str(item) for item in safe_list(policy.get("allowed_patch_types")) if str(item)}
     max_changed_files = safe_int(policy.get("max_changed_files"), safe_int(DEFAULT_AI_REPAIR_POLICY["max_changed_files"], 5))
-    return (
-        bool(policy.get("enabled", True))
-        and risk in set(allowed_risks)
-        and str(patch.get("patch_type") or "") in allowed_patch_types
-        and len(checked_files) <= max_changed_files
-        and bool(report.get("ready_to_approve"))
-        and bool(str(patch.get("diff") or "").strip())
-    )
+    blockers: list[str] = []
+    if not bool(policy.get("enabled", True)):
+        blockers.append("AI repair policy is disabled")
+    if risk not in set(allowed_risks):
+        blockers.append(f"model risk {risk} is not auto-approvable")
+    if assessed_level not in set(allowed_risks):
+        blockers.append(f"assessed risk {assessed_level} is not auto-approvable")
+    if str(patch.get("patch_type") or "") not in allowed_patch_types:
+        blockers.append(f"patch type {patch.get('patch_type') or ''} is not allowed")
+    if len(checked_files) > max_changed_files:
+        blockers.append(f"patch changes too many files: {len(checked_files)} > {max_changed_files}")
+    if not bool(report.get("ready_to_approve")):
+        blockers.append("approval report is not ready")
+    if not bool(str(patch.get("diff") or "").strip()):
+        blockers.append("patch has no unified diff")
+    blockers = unique_strings(blockers)
+    return {
+        "eligible": not blockers,
+        "blockers": blockers,
+        "model_risk": risk,
+        "assessed_risk": assessed_level,
+        "allowed_risks": allowed_risks,
+        "patch_type": str(patch.get("patch_type") or ""),
+        "changed_file_count": len(checked_files),
+        "max_changed_files": max_changed_files,
+        "approval_ready": bool(report.get("ready_to_approve")),
+    }
 
 
 def normalize_auto_approve_risks(value: list[str] | None) -> list[str]:

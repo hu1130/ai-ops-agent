@@ -653,6 +653,8 @@ POST /api/ai-repairs/1/deploy-merged
 
 `POST /api/ai-repairs/{id}/sandbox-test` records `test_result.guardrails` and folds guardrail blockers into `approval_report.blockers`. Approval is blocked when a model patch targets sensitive paths such as `.env`, `.ssh`, private key files, uses path traversal, changes more files than policy allows, or requests non-whitelisted test commands.
 
+Sandbox approval reports also include `approval_report.risk_assessment` with `score`, `level`, `factors`, `changed_file_count`, and `recommended_next_action`. Auto-approval now uses both the model-reported risk and this assessed risk, so a low-risk model proposal can still be blocked when the actual patch blast radius or validation result raises the assessed risk.
+
 `GET /api/ai-repairs/approval-queue` returns the human approval queue for AI repair proposals. Each item includes `queue_state`, blockers, warnings, safe next action, and booleans such as `can_approve`, `can_prepare_branch`, `can_create_pr`, and `can_deploy`. Optional query fields: `status`, `include_done`, `risk`, `model_provider`, `limit`.
 
 `POST /api/ai-repairs/approval-queue/notify` sends the current approval queue through the configured notifier and records a notification log. Optional JSON fields: `states` (default `["ready_for_approval"]`), `include_done`, `limit`, `actor`.
