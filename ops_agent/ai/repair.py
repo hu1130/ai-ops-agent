@@ -94,6 +94,7 @@ DEFAULT_REPOSITORY_CONTEXT_SETTINGS = {
     "max_file_chars": 4000,
     "max_total_chars": 16000,
     "max_tree_files": 80,
+    "max_file_bytes": 262144,
 }
 DEFAULT_AI_REPAIR_POLICY = {
     "enabled": True,
@@ -2277,6 +2278,7 @@ def build_repository_context(
             "max_files": settings["max_files"],
             "max_file_chars": settings["max_file_chars"],
             "max_total_chars": settings["max_total_chars"],
+            "max_file_bytes": settings["max_file_bytes"],
         },
     }
     if not repo_root.exists() or not repo_root.is_dir():
@@ -2301,12 +2303,10 @@ def build_repository_context(
         if not absolute_path.exists() or not absolute_path.is_file():
             context["missing_files"].append(safe_path)
             continue
-        file_size = absolute_path.stat().st_size
-        if file_size > settings["max_file_chars"] * 4:
-            context["skipped_files"].append({"path": safe_path, "reason": "file_too_large", "bytes": file_size})
-            continue
         try:
-            content = absolute_path.read_text(encoding="utf-8", errors="replace")
+            file_size = absolute_path.stat().st_size
+            raw = absolute_path.read_bytes()[: settings["max_file_bytes"]]
+            content = raw.decode("utf-8", errors="replace")
         except OSError as exc:
             context["skipped_files"].append({"path": safe_path, "reason": str(exc)})
             continue
@@ -2320,7 +2320,8 @@ def build_repository_context(
             {
                 "path": safe_path,
                 "chars": len(snippet),
-                "truncated": len(redacted) > len(snippet),
+                "bytes": file_size,
+                "truncated": file_size > len(raw) or len(redacted) > len(snippet),
                 "content": snippet,
             }
         )
@@ -2338,7 +2339,7 @@ def repository_context_settings(repair_config: dict[str, Any], request: dict[str
         return {**DEFAULT_REPOSITORY_CONTEXT_SETTINGS, "enabled": False, "reason": "model_provider_disabled"}
     raw = safe_dict(repair_config.get("repository_context"))
     settings = dict(DEFAULT_REPOSITORY_CONTEXT_SETTINGS)
-    for key in ("max_files", "max_file_chars", "max_total_chars", "max_tree_files"):
+    for key in ("max_files", "max_file_chars", "max_total_chars", "max_tree_files", "max_file_bytes"):
         if key in raw:
             settings[key] = safe_int(raw.get(key), settings[key])
     if "enabled" in raw:

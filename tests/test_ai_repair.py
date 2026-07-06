@@ -248,6 +248,10 @@ class AiRepairTest(unittest.TestCase):
                 "API_KEY = 'super-secret'\nTIMEOUT_SECONDS = 10\n",
                 encoding="utf-8",
             )
+            (repo / "large_module.py").write_text(
+                "def marker():\n    return 'large-context-file'\n" + "# filler\n" * 3000,
+                encoding="utf-8",
+            )
             storage = Storage(Path(tmp) / "ops.db")
             config = AppConfig(
                 raw={
@@ -257,7 +261,7 @@ class AiRepairTest(unittest.TestCase):
                             "environment": "prod",
                             "run_types": ["normal"],
                             "repo_root": str(repo),
-                            "repair_context_files": ["sample.txt", ".env", "settings.py"],
+                            "repair_context_files": ["sample.txt", ".env", "settings.py", "large_module.py"],
                         }
                     ],
                     "ai": {
@@ -288,7 +292,11 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual("prod", prompt_payload["project"]["id"])
         self.assertIn("sample.txt", file_paths)
         self.assertIn("settings.py", file_paths)
+        self.assertIn("large_module.py", file_paths)
         self.assertNotIn(".env", file_paths)
+        large_file = next(item for item in repository_context["files"] if item["path"] == "large_module.py")
+        self.assertTrue(large_file["truncated"])
+        self.assertIn("large-context-file", large_file["content"])
         self.assertIn("[redacted sensitive line]", combined_content)
         self.assertNotIn("super-secret", combined_content)
 
