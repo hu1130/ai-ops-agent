@@ -509,6 +509,7 @@ class DashboardTest(unittest.TestCase):
                     applied = json.loads(response.read().decode("utf-8"))
                 current_recommendation = storage.get_learning_recommendation(saved["id"])
                 audit = storage.latest_api_audit_logs(1)[0]
+                changes = storage.latest_change_events(source="learning")
                 config_text = config_path.read_text(encoding="utf-8")
             finally:
                 server.shutdown()
@@ -525,6 +526,9 @@ class DashboardTest(unittest.TestCase):
         self.assertIn("learned-classifier", config_text)
         self.assertIn("classification_rules", config.raw)
         self.assertEqual("learning.config_patch.apply", audit["operation"])
+        self.assertEqual(1, len(changes))
+        self.assertEqual("learning_config_patch", changes[0]["change_type"])
+        self.assertEqual(patch_id, changes[0]["metadata"]["config_patch_id"])
 
     def test_render_page_contains_event_center_and_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -869,6 +873,7 @@ class DashboardTest(unittest.TestCase):
                 with urllib.request.urlopen(request, timeout=5) as response:
                     created = json.loads(response.read().decode("utf-8"))
                 audit = storage.latest_api_audit_logs(2)
+                changes = storage.latest_change_events(source="monitor_target")
                 saved = json.loads(config_path.read_text(encoding="utf-8"))
             finally:
                 server.shutdown()
@@ -882,6 +887,9 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("API", saved["http_checks"][1]["name"])
         self.assertEqual("monitor_target.create", audit[0]["operation"])
         self.assertEqual("monitor_target.disable", audit[1]["operation"])
+        self.assertEqual(2, len(changes))
+        self.assertEqual("Monitor target create: API", changes[0]["title"])
+        self.assertEqual("Monitor target disable: Site", changes[1]["title"])
 
     def test_config_center_api_validates_applies_and_restores_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -942,6 +950,7 @@ class DashboardTest(unittest.TestCase):
                     backups = json.loads(response.read().decode("utf-8"))
 
                 audit = storage.latest_api_audit_logs(4)
+                changes = storage.latest_change_events(source="config_center")
                 saved = json.loads(config_path.read_text(encoding="utf-8"))
             finally:
                 server.shutdown()
@@ -959,6 +968,10 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("config.apply", audit[1]["operation"])
         self.assertEqual("config.backup", audit[2]["operation"])
         self.assertEqual("config.validate", audit[3]["operation"])
+        self.assertEqual(2, len(changes))
+        self.assertEqual("Config restored from " + backup["backup"]["name"], changes[0]["title"])
+        self.assertEqual("Config applied", changes[1]["title"])
+        self.assertEqual(["app"], changes[1]["metadata"]["changed_sections"])
 
     def test_config_center_api_manages_projects_policy_and_deepseek(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1045,6 +1058,7 @@ class DashboardTest(unittest.TestCase):
                 with urllib.request.urlopen(request, timeout=5) as response:
                     deleted = json.loads(response.read().decode("utf-8"))
                 audit = storage.latest_api_audit_logs(5)
+                changes = storage.latest_change_events(source="config_center")
                 saved = json.loads(config_path.read_text(encoding="utf-8"))
             finally:
                 server.shutdown()
@@ -1063,6 +1077,12 @@ class DashboardTest(unittest.TestCase):
         self.assertTrue(saved["ai"]["repair"]["auto_trigger"]["enabled"])
         self.assertEqual("config.projects.delete", audit[0]["operation"])
         self.assertEqual("config.ai_repair_auto_trigger", audit[1]["operation"])
+        self.assertEqual(5, len(changes))
+        self.assertEqual("Project config deleted: web", changes[0]["title"])
+        self.assertEqual("AI repair auto-trigger policy updated", changes[1]["title"])
+        self.assertEqual("AI repair policy updated", changes[2]["title"])
+        self.assertEqual("Project config created: web", changes[3]["title"])
+        self.assertEqual("DeepSeek repair model configured", changes[4]["title"])
 
     def test_action_approval_api_lists_and_rejects_pending_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

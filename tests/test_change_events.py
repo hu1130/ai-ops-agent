@@ -124,6 +124,45 @@ class ChangeEventsTest(unittest.TestCase):
         self.assertEqual(created["id"], listed[0]["id"])
         self.assertEqual("tester", listed[0]["actor"])
 
+    def test_learning_recommendation_apply_records_change_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            recommendation = storage.save_learning_recommendations(
+                [
+                    {
+                        "dedupe_key": "low-confidence-api",
+                        "priority": "medium",
+                        "category": "performance_degraded",
+                        "trigger_type": "low_confidence",
+                        "title": "Improve API classifier",
+                        "reason": "low confidence category",
+                        "recommended_action": "add classifier rule",
+                        "evidence": ["incident #7"],
+                        "incident_ids": [7],
+                        "metrics": {"avg_confidence": 0.51},
+                    }
+                ]
+            )[0]
+            config = AppConfig(raw={"app": {"environment": "prod", "run_type": "normal"}}, base_dir=Path(tmp))
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                applied = post_json(
+                    f"http://{host}:{port}/api/learning/recommendations/{recommendation['id']}/apply",
+                    {"actor": "tester", "note": "rule applied manually"},
+                )
+                changes = storage.latest_change_events(source="learning")
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("applied", applied["recommendation"]["status"])
+        self.assertEqual(1, len(changes))
+        self.assertEqual("learning_recommendation", changes[0]["change_type"])
+        self.assertEqual(7, changes[0]["related_incident_id"])
+        self.assertEqual("rule applied manually", changes[0]["metadata"]["note"])
+
 
 def post_json(url: str, payload: dict) -> dict:
     request = urllib.request.Request(

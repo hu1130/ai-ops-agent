@@ -914,6 +914,13 @@ def start_dashboard(
                         body,
                         reason=str(body.get("reason") or "deepseek-repair-model"),
                     )
+                    self.record_change_event(config_change_event_payload(
+                        "ai_model_config",
+                        "DeepSeek repair model configured",
+                        result,
+                        actor,
+                        config,
+                    ))
                     self.record_audit(path, 200, "success", "DeepSeek repair model configured", actor=actor, auth=auth)
                     self.send_json(result)
                     return
@@ -924,6 +931,16 @@ def start_dashboard(
                         safe_body_dict(body.get("project")) or body,
                         reason=str(body.get("reason") or "project-upsert"),
                     )
+                    project = safe_body_dict(result.get("project"))
+                    project_id = str(project.get("id") or "")
+                    self.record_change_event(config_change_event_payload(
+                        "project_config",
+                        f"Project config {result.get('action')}: {project_id}",
+                        result,
+                        actor,
+                        config,
+                        project_id=project_id,
+                    ))
                     self.record_audit(
                         path,
                         200,
@@ -941,6 +958,14 @@ def start_dashboard(
                         str(body.get("id") or body.get("project_id") or ""),
                         reason=str(body.get("reason") or "project-delete"),
                     )
+                    self.record_change_event(config_change_event_payload(
+                        "project_config",
+                        f"Project config deleted: {result.get('project_id')}",
+                        result,
+                        actor,
+                        config,
+                        project_id=str(result.get("project_id") or ""),
+                    ))
                     self.record_audit(path, 200, "success", f"project deleted {result.get('project_id')}", actor=actor, auth=auth)
                     self.send_json(result)
                     return
@@ -951,6 +976,13 @@ def start_dashboard(
                         safe_body_dict(body.get("policy")) or body,
                         reason=str(body.get("reason") or "ai-repair-policy"),
                     )
+                    self.record_change_event(config_change_event_payload(
+                        "ai_repair_policy",
+                        "AI repair policy updated",
+                        result,
+                        actor,
+                        config,
+                    ))
                     self.record_audit(path, 200, "success", "AI repair policy updated", actor=actor, auth=auth)
                     self.send_json(result)
                     return
@@ -961,6 +993,13 @@ def start_dashboard(
                         safe_body_dict(body.get("auto_trigger")) or body,
                         reason=str(body.get("reason") or "ai-repair-auto-trigger"),
                     )
+                    self.record_change_event(config_change_event_payload(
+                        "ai_repair_auto_trigger",
+                        "AI repair auto-trigger policy updated",
+                        result,
+                        actor,
+                        config,
+                    ))
                     self.record_audit(path, 200, "success", "AI repair auto-trigger policy updated", actor=actor, auth=auth)
                     self.send_json(result)
                     return
@@ -968,6 +1007,13 @@ def start_dashboard(
                 if path == "/api/config/apply":
                     candidate = candidate_from_body(body)
                     result = apply_config_update(config, candidate, reason=str(body.get("reason") or "api-apply"))
+                    self.record_change_event(config_change_event_payload(
+                        "config_apply",
+                        "Config applied",
+                        result,
+                        actor,
+                        config,
+                    ))
                     self.record_audit(
                         path,
                         200,
@@ -981,6 +1027,13 @@ def start_dashboard(
 
                 if path == "/api/config/restore":
                     result = restore_config_backup(config, str(body.get("backup") or body.get("name") or ""))
+                    self.record_change_event(config_change_event_payload(
+                        "config_restore",
+                        f"Config restored from {result.get('restored_from', {}).get('name')}",
+                        result,
+                        actor,
+                        config,
+                    ))
                     self.record_audit(
                         path,
                         200,
@@ -1020,6 +1073,7 @@ def start_dashboard(
                 body = self.read_json_body()
                 actor = self.actor_from_body(body, auth)
                 result = apply_monitor_target_change(config, target_type, index, action, body)
+                self.record_change_event(monitor_target_change_event_payload(result, actor, config))
                 self.record_audit(
                     path,
                     200,
@@ -1212,6 +1266,7 @@ def start_dashboard(
                         note=note,
                         draft=draft,
                     )
+                    self.record_change_event(learning_recommendation_change_event_payload(updated, actor, note, config))
                     self.record_audit(path, 200, "success", "learning recommendation marked applied", actor=actor, auth=auth)
                     self.send_json({"recommendation": updated, "draft": updated.get("draft")})
                     return
@@ -1328,6 +1383,7 @@ def start_dashboard(
                         )
                     except ValueError:
                         pass
+                    self.record_change_event(learning_config_patch_change_event_payload(current, updated, apply_result, actor, note, config))
                     self.record_audit(path, 200, "success", "learning config patch applied", actor=actor, auth=auth)
                     self.send_json(updated)
                     return
@@ -1438,6 +1494,12 @@ def start_dashboard(
                 )
             except Exception:
                 return
+
+        def record_change_event(self, payload: dict) -> dict | None:
+            try:
+                return storage.save_change_event(payload)
+            except Exception:
+                return None
 
         def client_ip(self) -> str:
             forwarded_for = self.headers.get("X-Forwarded-For", "")
@@ -2188,3 +2250,155 @@ def public_config_patch_preview(preview: dict) -> dict:
         "operation_count": int(preview.get("operation_count") or 0),
         "operations": list(preview.get("operations") or []),
     }
+
+
+def config_change_event_payload(
+    change_key: str,
+    title: str,
+    result: dict,
+    actor: str,
+    config: AppConfig | None,
+    project_id: str = "ops-agent",
+) -> dict:
+    backup = safe_body_dict(result.get("backup"))
+    restored_from = safe_body_dict(result.get("restored_from"))
+    metadata = {
+        "change_key": change_key,
+        "status": str(result.get("status") or ""),
+        "changed_sections": list(result.get("changed_sections") or []),
+        "backup": backup,
+        "restored_from": restored_from,
+        "validation": safe_body_dict(result.get("validation")),
+    }
+    if result.get("action"):
+        metadata["action"] = result.get("action")
+    if result.get("project_id"):
+        metadata["project_id"] = result.get("project_id")
+    project = safe_body_dict(result.get("project"))
+    if project:
+        metadata["project"] = {
+            "id": project.get("id"),
+            "name": project.get("name"),
+            "environment": project.get("environment"),
+            "run_types": project.get("run_types"),
+        }
+    return {
+        **change_event_context(config),
+        "project_id": project_id or "ops-agent",
+        "source": "config_center",
+        "change_type": change_key,
+        "title": title,
+        "summary": config_change_summary(result),
+        "actor": actor,
+        "status": "completed",
+        "risk": "medium",
+        "metadata": metadata,
+    }
+
+
+def monitor_target_change_event_payload(result: dict, actor: str, config: AppConfig | None) -> dict:
+    target = safe_body_dict(result.get("target"))
+    action = str(result.get("action") or "update")
+    target_id = str(target.get("id") or "")
+    target_name = str(target.get("name") or target_id or "monitor target")
+    return {
+        **change_event_context(config),
+        "project_id": target_id or "ops-agent",
+        "source": "monitor_target",
+        "change_type": "monitor_target",
+        "title": f"Monitor target {action}: {target_name}",
+        "summary": f"{action} {target_id or target_name}",
+        "actor": actor,
+        "status": "completed",
+        "risk": "low",
+        "metadata": {
+            "action": action,
+            "target": target,
+            "backup_path": str(result.get("backup_path") or ""),
+            "validation": safe_body_dict(result.get("validation")),
+        },
+    }
+
+
+def learning_recommendation_change_event_payload(
+    recommendation: dict,
+    actor: str,
+    note: str,
+    config: AppConfig | None,
+) -> dict:
+    incident_ids = list(recommendation.get("incident_ids") or [])
+    return {
+        **change_event_context(config),
+        "project_id": "ops-agent",
+        "source": "learning",
+        "change_type": "learning_recommendation",
+        "title": f"Learning recommendation applied: #{recommendation.get('id')}",
+        "summary": str(recommendation.get("title") or recommendation.get("reason") or ""),
+        "actor": actor,
+        "status": "completed",
+        "risk": "low",
+        "related_incident_id": incident_ids[0] if len(incident_ids) == 1 else None,
+        "metadata": {
+            "recommendation_id": recommendation.get("id"),
+            "category": recommendation.get("category"),
+            "trigger_type": recommendation.get("trigger_type"),
+            "incident_ids": incident_ids,
+            "note": note,
+        },
+    }
+
+
+def learning_config_patch_change_event_payload(
+    current: dict,
+    updated: dict,
+    apply_result: dict,
+    actor: str,
+    note: str,
+    config: AppConfig | None,
+) -> dict:
+    patch = safe_body_dict(current.get("patch"))
+    operations = list(apply_result.get("operations") or [])
+    return {
+        **change_event_context(config),
+        "project_id": "ops-agent",
+        "source": "learning",
+        "change_type": "learning_config_patch",
+        "title": str(patch.get("title") or current.get("title") or f"Learning config patch #{current.get('id')} applied"),
+        "summary": str(patch.get("reason") or current.get("reason") or ""),
+        "actor": actor,
+        "status": "completed",
+        "risk": "medium",
+        "metadata": {
+            "config_patch_id": current.get("id"),
+            "recommendation_id": current.get("recommendation_id"),
+            "patch_type": patch.get("patch_type") or current.get("patch_type"),
+            "operation_count": apply_result.get("operation_count"),
+            "operations": operations,
+            "backup_path": apply_result.get("backup_path"),
+            "patch_status": updated.get("status"),
+            "note": note,
+        },
+    }
+
+
+def change_event_context(config: AppConfig | None) -> dict:
+    app = safe_body_dict(config.app if config else {})
+    return {
+        "environment": str(app.get("environment") or "prod"),
+        "run_type": str(app.get("run_type") or "normal"),
+    }
+
+
+def config_change_summary(result: dict) -> str:
+    sections = [str(item) for item in list(result.get("changed_sections") or []) if str(item)]
+    if sections:
+        return "changed_sections=" + ",".join(sections)
+    if result.get("project_id"):
+        return f"project_id={result.get('project_id')}"
+    backup = safe_body_dict(result.get("backup"))
+    if backup.get("name"):
+        return f"backup={backup.get('name')}"
+    restored_from = safe_body_dict(result.get("restored_from"))
+    if restored_from.get("name"):
+        return f"restored_from={restored_from.get('name')}"
+    return str(result.get("status") or "completed")

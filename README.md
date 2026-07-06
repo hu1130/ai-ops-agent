@@ -258,6 +258,16 @@ GET /api/incidents/1/changes
 
 AI 修复部署和回滚会自动写入变更事件，并关联 `related_incident_id` 和 `related_ai_repair_id`。这一步不会直接修改业务代码，只负责沉淀变更上下文，供误报压降、根因诊断和后续大模型修复策略使用。
 
+以下后端操作会自动写入变更事件：
+- 配置中心应用配置、恢复配置、DeepSeek/AI 修复策略/自动触发策略更新
+- 项目配置新增、更新、删除
+- 监控目标新增、更新、启用、停用、删除
+- 学习建议标记为已应用
+- 学习配置补丁应用到 `config.json`
+- AI 修复部署和自动回滚
+
+变更事件只保存脱敏摘要、目标 ID、备份路径、操作结果和关联事件 ID，不保存完整敏感配置。
+
 Learning recommendation review flow:
 - `accept` keeps the suggestion in an accepted state and stores a generated optimization draft.
 - `dismiss` closes a noisy or expected suggestion without applying changes.
