@@ -79,6 +79,7 @@ def public_project(item: dict[str, Any], index: int, app: dict[str, Any]) -> dic
         "deploy_commands": string_list(item.get("deploy_commands")),
         "rollback_commands": string_list(item.get("rollback_commands")),
         "owners": string_list(item.get("owners")),
+        "repair_context_files": string_list(item.get("repair_context_files") or item.get("context_files")),
         "repair_policy": dict(item.get("repair_policy")) if isinstance(item.get("repair_policy"), dict) else {},
     }
 
@@ -103,6 +104,7 @@ def default_project(app: dict[str, Any]) -> dict[str, Any]:
         "deploy_commands": [],
         "rollback_commands": [],
         "owners": [],
+        "repair_context_files": [],
         "repair_policy": {},
     }
 

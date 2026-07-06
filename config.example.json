@@ -29,6 +29,7 @@
       "deploy_commands": ["python -m unittest discover -s tests", "systemctl restart your-service"],
       "rollback_commands": ["systemctl restart your-service"],
       "owners": ["ops@example.com"],
+      "repair_context_files": ["ops_agent/monitors/http_monitor.py", "tests/test_http_monitor.py"],
       "repair_policy": {
         "auto_approve": false,
         "auto_approve_risks": ["low"],
@@ -87,6 +88,13 @@
       "timeout_seconds": 45,
       "max_prompt_chars": 12000,
       "max_response_chars": 60000,
+      "repository_context": {
+        "enabled": true,
+        "max_files": 8,
+        "max_file_chars": 4000,
+        "max_total_chars": 16000,
+        "max_tree_files": 80
+      },
       "policy": {
         "enabled": true,
         "auto_approve": false,

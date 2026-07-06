@@ -646,6 +646,34 @@ POST /api/ai-repairs/1/deploy-merged
 
 `POST /api/incidents/{id}/ai-repair/run-pipeline` and `POST /api/ai-repairs/{id}/run-pipeline` run the backend AI repair pipeline: proposal, dry-run, sandbox test, optional auto-approval, optional branch preparation, and optional PR creation. It stops at human approval by default. Optional JSON fields: `commands`, `auto_approve`, `auto_approve_risks`, `prepare_branch`, `create_pr`, `remote`, `base`, `draft`.
 
+Incident-based pipeline runs are project-aware. The agent selects the project by `project_id` from the request, or by the incident `environment` and `run_type`. Project `repo_root`, `test_commands`, `git_remote`, `base_branch`, and `repair_policy` override global defaults for that run.
+
+Model repair proposals can include bounded repository context so DeepSeek/OpenAI-compatible models can generate concrete reviewable diffs instead of guessing. Configure it globally under `ai.repair.repository_context`, and optionally add project-level `repair_context_files`:
+
+```json
+{
+  "projects": [
+    {
+      "id": "prod",
+      "repo_root": "/opt/your-project",
+      "repair_context_files": ["src/app.py", "tests/test_app.py"]
+    }
+  ],
+  "ai": {
+    "repair": {
+      "repository_context": {
+        "enabled": true,
+        "max_files": 8,
+        "max_file_chars": 4000,
+        "max_total_chars": 16000
+      }
+    }
+  }
+}
+```
+
+The repository context reader skips sensitive paths such as `.env`, `.ssh`, `.git`, private key files, and common build/cache directories. Lines containing key, token, password, authorization, or secret markers are redacted before sending to the model.
+
 DeepSeek repair model can be enabled through:
 
 ```json

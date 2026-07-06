@@ -240,6 +240,108 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual("https://api.deepseek.com/chat/completions", endpoint)
         self.assertEqual("proposal_only", proposal["patch"]["apply_mode"])
 
+    def test_model_repair_prompt_includes_bounded_repository_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            (repo / ".env").write_text("TOKEN=super-secret\n", encoding="utf-8")
+            (repo / "settings.py").write_text(
+                "API_KEY = 'super-secret'\nTIMEOUT_SECONDS = 10\n",
+                encoding="utf-8",
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "projects": [
+                        {
+                            "id": "prod",
+                            "environment": "prod",
+                            "run_types": ["normal"],
+                            "repo_root": str(repo),
+                            "repair_context_files": ["sample.txt", ".env", "settings.py"],
+                        }
+                    ],
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                            "repository_context": {"enabled": True, "max_files": 4, "max_file_chars": 2000},
+                        }
+                    },
+                },
+                base_dir=Path(tmp),
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+            prompt_payload = json.loads(proposal["prompt"]["user"])
+            repository_context = prompt_payload["repository_context"]
+            storage.close()
+
+        file_paths = [item["path"] for item in repository_context["files"]]
+        combined_content = "\n".join(item["content"] for item in repository_context["files"])
+        self.assertEqual("prod", prompt_payload["project"]["id"])
+        self.assertIn("sample.txt", file_paths)
+        self.assertIn("settings.py", file_paths)
+        self.assertNotIn(".env", file_paths)
+        self.assertIn("[redacted sensitive line]", combined_content)
+        self.assertNotIn("super-secret", combined_content)
+
+    def test_incident_pipeline_uses_project_repo_commands_and_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_git_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "projects": [
+                        {
+                            "id": "prod",
+                            "environment": "prod",
+                            "run_types": ["normal"],
+                            "repo_root": str(repo),
+                            "test_commands": ["python -m py_compile tests/test_sample.py"],
+                            "repair_policy": {
+                                "auto_approve": True,
+                                "auto_approve_risks": ["low"],
+                                "prepare_branch": True,
+                            },
+                        }
+                    ],
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    },
+                },
+                base_dir=Path(tmp) / "not-the-project",
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+
+            repaired = run_ai_repair_pipeline_for_incident(storage, config, incident_id, Path(tmp), actor="tester")
+            controlled_apply = repaired["test_result"]["controlled_apply"]
+            main_status = run_git_fixture(repo, ["status", "--porcelain"])
+            storage.close()
+
+        pipeline = repaired["test_result"]["pipeline"]
+        self.assertEqual("branch_prepared", repaired["status"])
+        self.assertEqual("completed", pipeline["status"])
+        self.assertTrue(pipeline["policy"]["auto_approve"])
+        self.assertTrue(pipeline["policy"]["prepare_branch"])
+        self.assertEqual(["python -m py_compile tests/test_sample.py"], controlled_apply["commands"])
+        self.assertEqual("", main_status)
+
     def test_dry_run_blocks_unsafe_model_patch_paths(self) -> None:
         result = validate_patch_dry_run(
             {

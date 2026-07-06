@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 
 from ops_agent.config import AppConfig
+from ops_agent.projects import list_projects
 from ops_agent.storage import Storage
 
 
@@ -78,6 +79,22 @@ SENSITIVE_FILENAMES = {
     "id_rsa",
 }
 SENSITIVE_PATH_PARTS = {".git", ".ssh", "secrets", "__pycache__"}
+REPOSITORY_CONTEXT_EXCLUDED_PARTS = SENSITIVE_PATH_PARTS | {
+    ".mypy_cache",
+    ".pytest_cache",
+    ".venv",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+}
+DEFAULT_REPOSITORY_CONTEXT_SETTINGS = {
+    "enabled": True,
+    "max_files": 8,
+    "max_file_chars": 4000,
+    "max_total_chars": 16000,
+    "max_tree_files": 80,
+}
 DEFAULT_AI_REPAIR_POLICY = {
     "enabled": True,
     "auto_approve": False,
@@ -125,26 +142,37 @@ def run_ai_repair_pipeline_for_incident(
     draft: bool = True,
     request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    incident = storage.get_incident(incident_id)
+    if not incident:
+        raise ValueError(f"incident not found: {incident_id}")
+    request_payload = safe_dict(request)
+    diagnosis_rows = storage.latest_incident_diagnoses(incident_id, limit=1)
+    diagnosis = diagnosis_rows[0] if diagnosis_rows else {}
+    project = select_repair_project(config, incident, diagnosis, request_payload)
+    effective_repo_root = resolve_repair_repo_root(config, project, request_payload, repo_root)
+    effective_commands = commands if commands is not None else string_list(project.get("test_commands"))
+    effective_remote = str(request_payload.get("remote") or project.get("git_remote") or remote)
+    effective_base = str(request_payload.get("base") or project.get("base_branch") or base)
     proposal = build_ai_repair_proposal(
         storage,
         config,
         incident_id,
-        request={**safe_dict(request), "actor": actor},
+        request={**request_payload, "actor": actor},
     )
-    policy = ai_repair_policy_from_config(config)
+    policy = ai_repair_policy_from_config(config, project=project)
     return run_ai_repair_pipeline(
         storage,
         proposal["id"],
-        repo_root,
+        effective_repo_root,
         actor=actor,
         note=note,
-        commands=commands,
+        commands=effective_commands or None,
         auto_approve=auto_approve,
         auto_approve_risks=auto_approve_risks,
         prepare_branch=prepare_branch,
         create_pr=create_pr,
-        remote=remote,
-        base=base,
+        remote=effective_remote,
+        base=effective_base,
         draft=draft,
         policy=policy,
         initial_pipeline_stage={"name": "proposal", "status": "passed", "repair_id": proposal["id"]},
@@ -510,18 +538,32 @@ def proposal_context(
 ) -> dict[str, Any]:
     ai_config = safe_dict(config.raw.get("ai") if config else {})
     repair_config = safe_dict(ai_config.get("repair"))
+    request_payload = safe_dict(request)
+    project = select_repair_project(config, incident, diagnosis, request_payload)
+    repository_context = build_repository_context(
+        config,
+        repair_config,
+        incident,
+        diagnosis,
+        recommendations,
+        project,
+        request_payload,
+    )
     return {
         "incident": incident,
         "diagnosis": diagnosis,
         "recommendations": recommendations,
         "actions": actions,
+        "project": project,
+        "repository_context": repository_context,
         "config": {
             "base_dir": str(config.base_dir) if config else "",
             "repair": repair_config,
             "provider": repair_config.get("provider") or "",
             "model": repair_config.get("model") or "",
+            "project": project,
         },
-        "request": request or {},
+        "request": request_payload,
     }
 
 
@@ -572,6 +614,8 @@ def repair_settings(context: dict[str, Any]) -> dict[str, Any]:
 def build_model_prompt(context: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
     incident = public_incident_context(safe_dict(context.get("incident")))
     diagnosis = safe_dict(context.get("diagnosis"))
+    project = public_project_context(safe_dict(context.get("project")))
+    repository_context = safe_dict(context.get("repository_context"))
     recommendations = [
         public_recommendation_context(item)
         for item in safe_list(context.get("recommendations"))[:10]
@@ -586,6 +630,8 @@ def build_model_prompt(context: dict[str, Any], settings: dict[str, Any]) -> dic
         "diagnosis": diagnosis,
         "recommendations": recommendations,
         "actions": actions,
+        "project": project,
+        "repository_context": repository_context,
         "output_schema": {
             "title": "short title",
             "summary": "short summary",
@@ -607,6 +653,8 @@ def build_model_prompt(context: dict[str, Any], settings: dict[str, Any]) -> dic
             "Use proposal_only apply mode. Do not ask to directly mutate production.",
             "Generate the smallest safe patch. Prefer diagnostics if evidence is insufficient.",
             "Use relative paths only. Do not modify .env, .ssh, .git, secrets, or private key files.",
+            "Use repository_context.files as the primary source for unified diffs.",
+            "If repository_context is missing or insufficient, return manual_code_review instead of inventing code.",
         ],
     }
     user_text = json.dumps(user_payload, ensure_ascii=False, sort_keys=True)
@@ -2140,11 +2188,272 @@ def normalize_auto_approve_risks(value: list[str] | None) -> list[str]:
     return valid or ["low"]
 
 
-def ai_repair_policy_from_config(config: AppConfig | None) -> dict[str, Any]:
+def select_repair_project(
+    config: AppConfig | None,
+    incident: dict[str, Any],
+    diagnosis: dict[str, Any] | None = None,
+    request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if config is None:
+        return {}
+    projects = list_projects(config)
+    if not projects:
+        return {}
+    request_payload = safe_dict(request)
+    requested = str(request_payload.get("project_id") or request_payload.get("project") or "").strip()
+    if requested:
+        for project in projects:
+            if requested in {str(project.get("id") or ""), str(project.get("name") or "")}:
+                return project
+    diagnosis_context = safe_dict(safe_dict(diagnosis).get("context"))
+    environment = str(
+        request_payload.get("environment")
+        or incident.get("environment")
+        or diagnosis_context.get("environment")
+        or config.app.get("environment")
+        or "prod"
+    )
+    run_type = str(
+        request_payload.get("run_type")
+        or incident.get("run_type")
+        or diagnosis_context.get("run_type")
+        or config.app.get("run_type")
+        or "normal"
+    )
+    for project in projects:
+        if not bool(project.get("enabled", True)):
+            continue
+        run_types = [str(item) for item in safe_list(project.get("run_types")) if str(item)]
+        if str(project.get("environment") or "") == environment and (not run_types or run_type in run_types):
+            return project
+    return next((project for project in projects if bool(project.get("enabled", True))), projects[0])
+
+
+def resolve_repair_repo_root(
+    config: AppConfig | None,
+    project: dict[str, Any],
+    request: dict[str, Any],
+    fallback: Path | str,
+) -> Path:
+    raw = str(
+        request.get("repo_root")
+        or request.get("repository_root")
+        or project.get("repo_root")
+        or fallback
+        or ""
+    ).strip()
+    if not raw:
+        raw = str(fallback)
+    path = Path(raw)
+    if not path.is_absolute() and config is not None:
+        path = config.base_dir / path
+    return path
+
+
+def build_repository_context(
+    config: AppConfig | None,
+    repair_config: dict[str, Any],
+    incident: dict[str, Any],
+    diagnosis: dict[str, Any],
+    recommendations: list[dict],
+    project: dict[str, Any],
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    settings = repository_context_settings(repair_config, request)
+    if not settings["enabled"]:
+        return {"enabled": False, "reason": settings.get("reason") or "disabled"}
+    if config is None:
+        return {"enabled": False, "reason": "config_not_available"}
+    repo_root = resolve_repair_repo_root(config, project, request, config.base_dir).resolve()
+    context = {
+        "enabled": True,
+        "repo_root": str(repo_root),
+        "project_id": str(project.get("id") or ""),
+        "files": [],
+        "tree": [],
+        "missing_files": [],
+        "skipped_files": [],
+        "limits": {
+            "max_files": settings["max_files"],
+            "max_file_chars": settings["max_file_chars"],
+            "max_total_chars": settings["max_total_chars"],
+        },
+    }
+    if not repo_root.exists() or not repo_root.is_dir():
+        context["enabled"] = False
+        context["reason"] = "repo_root_not_found"
+        return context
+
+    candidates = repository_context_candidate_paths(repair_config, incident, diagnosis, recommendations, project, request)
+    files: list[dict[str, Any]] = []
+    total_chars = 0
+    for relative_path in candidates:
+        if len(files) >= settings["max_files"] or total_chars >= settings["max_total_chars"]:
+            break
+        safe_path = normalize_context_relative_path(relative_path)
+        if not safe_path:
+            context["skipped_files"].append({"path": str(relative_path), "reason": "unsafe_path"})
+            continue
+        absolute_path = (repo_root / safe_path).resolve()
+        if not path_is_within(absolute_path, repo_root):
+            context["skipped_files"].append({"path": safe_path, "reason": "outside_repo"})
+            continue
+        if not absolute_path.exists() or not absolute_path.is_file():
+            context["missing_files"].append(safe_path)
+            continue
+        file_size = absolute_path.stat().st_size
+        if file_size > settings["max_file_chars"] * 4:
+            context["skipped_files"].append({"path": safe_path, "reason": "file_too_large", "bytes": file_size})
+            continue
+        try:
+            content = absolute_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            context["skipped_files"].append({"path": safe_path, "reason": str(exc)})
+            continue
+        remaining = max(0, settings["max_total_chars"] - total_chars)
+        if remaining <= 0:
+            break
+        redacted = redact_repository_content(content)
+        snippet = truncate_text(redacted, min(settings["max_file_chars"], remaining))
+        total_chars += len(snippet)
+        files.append(
+            {
+                "path": safe_path,
+                "chars": len(snippet),
+                "truncated": len(redacted) > len(snippet),
+                "content": snippet,
+            }
+        )
+
+    context["files"] = files
+    context["total_chars"] = total_chars
+    if not files:
+        context["tree"] = repository_file_tree(repo_root, settings["max_tree_files"])
+    return context
+
+
+def repository_context_settings(repair_config: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    provider = str(repair_config.get("provider") or "rules").strip().lower()
+    if provider not in MODEL_PROVIDERS:
+        return {**DEFAULT_REPOSITORY_CONTEXT_SETTINGS, "enabled": False, "reason": "model_provider_disabled"}
+    raw = safe_dict(repair_config.get("repository_context"))
+    settings = dict(DEFAULT_REPOSITORY_CONTEXT_SETTINGS)
+    for key in ("max_files", "max_file_chars", "max_total_chars", "max_tree_files"):
+        if key in raw:
+            settings[key] = safe_int(raw.get(key), settings[key])
+    if "enabled" in raw:
+        settings["enabled"] = bool(raw.get("enabled"))
+    if "include_repository_context" in request:
+        settings["enabled"] = bool(request.get("include_repository_context"))
+    if "repository_context_enabled" in request:
+        settings["enabled"] = bool(request.get("repository_context_enabled"))
+    return settings
+
+
+def repository_context_candidate_paths(
+    repair_config: dict[str, Any],
+    incident: dict[str, Any],
+    diagnosis: dict[str, Any],
+    recommendations: list[dict],
+    project: dict[str, Any],
+    request: dict[str, Any],
+) -> list[str]:
+    paths: list[str] = []
+    for key in ("files", "candidate_files", "repair_context_files", "context_files"):
+        paths.extend(string_list(request.get(key)))
+    paths.extend(string_list(project.get("repair_context_files")))
+    paths.extend(string_list(safe_dict(repair_config.get("repository_context")).get("files")))
+    paths.extend(string_list(safe_dict(repair_config.get("repository_context")).get("seed_files")))
+    text_parts = [
+        str(incident.get("title") or ""),
+        str(incident.get("last_summary") or ""),
+        str(incident.get("classification_category") or ""),
+        str(diagnosis.get("top_category") or ""),
+        json.dumps(safe_list(recommendations), ensure_ascii=False),
+        str(incident.get("results_json") or ""),
+    ]
+    text = " ".join(text_parts).lower()
+    if any(marker in text for marker in ("json_api", "json api", "synthetic", "customer service", "客服")):
+        paths.extend(["ops_agent/monitors/json_api_monitor.py", "tests/test_json_api_monitor.py"])
+    if any(marker in text for marker in ("http", "health", "healthz", "404", "网站", "官网")):
+        paths.extend(["ops_agent/monitors/http_monitor.py", "ops_agent/monitor_targets.py", "tests/test_http_monitor.py"])
+    if "log" in text or "日志" in text:
+        paths.extend(["ops_agent/monitors/log_monitor.py", "tests/test_log_monitor.py"])
+    if any(marker in text for marker in ("disk", "memory", "cpu", "server", "服务器")):
+        paths.extend(["ops_agent/monitors/server_monitor.py", "tests/test_diagnostics.py"])
+    if "classif" in text or "unknown" in text or "低置信" in text:
+        paths.extend(["ops_agent/ai/classifier.py", "tests/test_classifier.py"])
+    return unique_strings(paths)
+
+
+def repository_file_tree(repo_root: Path, limit: int) -> list[str]:
+    files: list[str] = []
+    for path in repo_root.rglob("*"):
+        if len(files) >= limit:
+            break
+        if not path.is_file():
+            continue
+        try:
+            relative = path.relative_to(repo_root).as_posix()
+        except ValueError:
+            continue
+        if normalize_context_relative_path(relative):
+            files.append(relative)
+    return files
+
+
+def normalize_context_relative_path(value: Any) -> str:
+    path_text = str(value or "").strip().replace("\\", "/")
+    if not is_safe_patch_path(path_text):
+        return ""
+    parts = {part.lower() for part in Path(path_text).parts}
+    if parts & REPOSITORY_CONTEXT_EXCLUDED_PARTS:
+        return ""
+    return path_text
+
+
+def path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def redact_repository_content(content: str) -> str:
+    redacted_lines = []
+    for line in content.splitlines():
+        lowered = line.lower()
+        if any(marker in lowered for marker in ("api_key", "apikey", "authorization", "password", "secret", "token")):
+            redacted_lines.append("[redacted sensitive line]")
+        else:
+            redacted_lines.append(line)
+    return "\n".join(redacted_lines)
+
+
+def unique_strings(values: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def string_list(value: Any) -> list[str]:
+    return [str(item) for item in safe_list(value) if str(item).strip()]
+
+
+def ai_repair_policy_from_config(config: AppConfig | None, project: dict[str, Any] | None = None) -> dict[str, Any]:
     if config is None:
         return normalize_ai_repair_policy({})
     repair_config = safe_dict(safe_dict(config.raw.get("ai")).get("repair"))
-    return normalize_ai_repair_policy(repair_config.get("policy"))
+    policy = safe_dict(repair_config.get("policy"))
+    policy.update(safe_dict(safe_dict(project).get("repair_policy")))
+    return normalize_ai_repair_policy(policy)
 
 
 def normalize_ai_repair_policy(value: Any) -> dict[str, Any]:
@@ -2237,6 +2546,23 @@ def public_incident_context(incident: dict[str, Any]) -> dict[str, Any]:
     return {key: redact_sensitive_text(incident.get(key)) for key in keys if key in incident}
 
 
+def public_project_context(project: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "id",
+        "name",
+        "environment",
+        "run_types",
+        "tags",
+        "repo_root",
+        "git_remote",
+        "base_branch",
+        "health_urls",
+        "test_commands",
+        "repair_context_files",
+    ]
+    return {key: redact_sensitive_text(project.get(key)) for key in keys if key in project}
+
+
 def public_recommendation_context(item: dict[str, Any]) -> dict[str, Any]:
     keys = ["id", "category", "action_type", "title", "reason", "risk", "status", "source"]
     return {key: redact_sensitive_text(item.get(key)) for key in keys if key in item}
@@ -2253,6 +2579,10 @@ def public_action_context(item: dict[str, Any]) -> dict[str, Any]:
 def redact_sensitive_text(value: Any) -> Any:
     if value is None or isinstance(value, (int, float, bool)):
         return value
+    if isinstance(value, list):
+        return [redact_sensitive_text(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): redact_sensitive_text(item) for key, item in value.items()}
     text = str(value)
     lowered = text.lower()
     if any(marker in lowered for marker in ("api_key", "apikey", "token", "password", "secret")):
