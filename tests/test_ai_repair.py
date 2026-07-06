@@ -1,14 +1,17 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 from ops_agent.ai.repair import (
     build_ai_repair_proposal,
     dry_run_ai_repair_proposal,
     prepare_ai_repair_branch,
+    publish_ai_repair_pull_request,
     record_ai_repair_test_result,
     sandbox_test_ai_repair_proposal,
     validate_patch_dry_run,
@@ -306,6 +309,50 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual("", main_status)
         self.assertIn(controlled_apply["branch_name"], branch_list)
 
+    def test_publish_pull_request_pushes_branch_and_records_pr_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_git_sandbox_repo(Path(tmp) / "repo")
+            remote = create_bare_remote(Path(tmp) / "remote.git")
+            run_git_fixture(repo, ["remote", "add", "origin", str(remote)])
+            fake_bin = create_fake_gh(Path(tmp) / "fake-bin", "https://github.com/example/repo/pull/7")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    }
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+            sandbox_test_ai_repair_proposal(storage, proposal["id"], repo, actor="tester")
+            storage.update_ai_repair_proposal_status(proposal["id"], "approved", actor="tester")
+            prepared = prepare_ai_repair_branch(storage, proposal["id"], repo, actor="tester")
+
+            with patched_path(fake_bin):
+                published = publish_ai_repair_pull_request(storage, proposal["id"], repo, actor="tester")
+            branch_name = published["test_result"]["pull_request"]["branch_name"]
+            remote_branches = run_git_fixture(remote, ["branch", "--list", branch_name])
+            storage.close()
+
+        self.assertEqual("branch_prepared", prepared["status"])
+        self.assertEqual("pr_created", published["status"])
+        self.assertEqual("https://github.com/example/repo/pull/7", published["test_result"]["pull_request"]["pr_url"])
+        self.assertEqual(7, published["test_result"]["pull_request"]["pr_number"])
+        self.assertEqual("gh", published["test_result"]["pull_request"]["method"])
+        self.assertTrue(published["test_result"]["pull_request"]["pushed"])
+        self.assertIn(branch_name, remote_branches)
+
     def test_ai_repair_dashboard_api_runs_sandbox_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = create_sandbox_repo(Path(tmp) / "repo")
@@ -404,6 +451,67 @@ class AiRepairTest(unittest.TestCase):
         self.assertTrue(prepared["test_result"]["controlled_apply"]["ready_for_pr"])
         self.assertIn("ai_repair.prepare_branch", {row["operation"] for row in audit})
 
+    def test_ai_repair_dashboard_api_creates_pr_after_branch_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_git_sandbox_repo(Path(tmp) / "repo")
+            remote = create_bare_remote(Path(tmp) / "remote.git")
+            run_git_fixture(repo, ["remote", "add", "origin", str(remote)])
+            fake_bin = create_fake_gh(Path(tmp) / "fake-bin", "https://github.com/example/repo/pull/8")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "app": {"name": "ops"},
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    },
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                proposal = post_json(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/ai-repair/propose",
+                    {"actor": "tester"},
+                )
+                post_json(
+                    f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/sandbox-test",
+                    {"actor": "tester"},
+                )
+                post_json(
+                    f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/approve",
+                    {"actor": "tester"},
+                )
+                prepared = post_json(
+                    f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/prepare-branch",
+                    {"actor": "tester"},
+                )
+                with patched_path(fake_bin):
+                    published = post_json(
+                        f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/create-pr",
+                        {"actor": "tester"},
+                    )
+                audit = storage.latest_api_audit_logs(40)
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("branch_prepared", prepared["status"])
+        self.assertEqual("pr_created", published["status"])
+        self.assertEqual("https://github.com/example/repo/pull/8", published["test_result"]["pull_request"]["pr_url"])
+        self.assertIn("ai_repair.create_pr", {row["operation"] for row in audit})
+
 
 def post_json(url: str, payload: dict) -> dict:
     request = urllib.request.Request(
@@ -465,7 +573,35 @@ def create_git_sandbox_repo(root: Path) -> Path:
     return repo
 
 
+def create_bare_remote(root: Path) -> Path:
+    run_git_fixture(root.parent, ["init", "--bare", str(root)])
+    return root
+
+
+def create_fake_gh(root: Path, pr_url: str) -> Path:
+    root.mkdir(parents=True)
+    if os.name == "nt":
+        script = root / "gh.cmd"
+        script.write_text(f"@echo off\necho {pr_url}\n", encoding="utf-8")
+    else:
+        script = root / "gh"
+        script.write_text(f"#!/bin/sh\necho {pr_url}\n", encoding="utf-8")
+        script.chmod(0o755)
+    return root
+
+
+@contextmanager
+def patched_path(prefix: Path):
+    original = os.environ.get("PATH", "")
+    os.environ["PATH"] = str(prefix) + os.pathsep + original
+    try:
+        yield
+    finally:
+        os.environ["PATH"] = original
+
+
 def run_git_fixture(cwd: Path, args: list[str]) -> str:
+    cwd.mkdir(parents=True, exist_ok=True)
     completed = subprocess.run(
         ["git", *args],
         cwd=str(cwd),

@@ -1622,8 +1622,10 @@ class Storage:
                         when 'approved' then 6
                         when 'branch_failed' then 7
                         when 'branch_prepared' then 8
-                        when 'rejected' then 9
-                        else 10
+                        when 'pr_failed' then 9
+                        when 'pr_created' then 10
+                        when 'rejected' then 11
+                        else 12
                     end,
                     updated_at desc,
                     id desc
@@ -1663,6 +1665,8 @@ class Storage:
             "approved",
             "branch_failed",
             "branch_prepared",
+            "pr_failed",
+            "pr_created",
             "rejected",
         }
         normalized_status = (status or "").strip().lower()

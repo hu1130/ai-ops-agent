@@ -27,6 +27,8 @@ DEFAULT_MAX_RESPONSE_CHARS = 60000
 DEFAULT_SANDBOX_TEST_TIMEOUT_SECONDS = 120
 DEFAULT_SANDBOX_MAX_OUTPUT_CHARS = 12000
 DEFAULT_GIT_TIMEOUT_SECONDS = 60
+DEFAULT_GIT_PUSH_TIMEOUT_SECONDS = 120
+DEFAULT_GITHUB_TIMEOUT_SECONDS = 30
 CONTROLLED_BRANCH_PREFIX = "ai-repair"
 CONTROLLED_WORKTREE_SUFFIX = "ai-repair-worktrees"
 MAX_DIFF_CHARS = 80000
@@ -184,6 +186,48 @@ def prepare_ai_repair_branch(
         "sandbox": safe_dict(safe_dict(repair.get("test_result")).get("sandbox")),
         "approval_report": approval_report,
         "controlled_apply": controlled_apply,
+    }
+    return storage.update_ai_repair_proposal_status(
+        repair_id,
+        next_status,
+        actor=actor,
+        note=note,
+        test_result=result,
+    )
+
+
+def publish_ai_repair_pull_request(
+    storage: Storage,
+    repair_id: int,
+    repo_root: Path | str,
+    actor: str = "operator",
+    note: str = "",
+    remote: str = "origin",
+    base: str = "main",
+    draft: bool = True,
+) -> dict:
+    repair = require_ai_repair(storage, repair_id)
+    if str(repair.get("status") or "") not in {"branch_prepared", "pr_failed", "pr_created"}:
+        raise ValueError("AI repair branch must be prepared before creating a pull request")
+    result_payload = safe_dict(repair.get("test_result"))
+    controlled_apply = safe_dict(result_payload.get("controlled_apply"))
+    if not controlled_apply.get("ready_for_pr"):
+        raise ValueError("controlled branch is not ready for PR creation")
+    pull_request = publish_prepared_branch_pull_request(
+        Path(repo_root),
+        repair,
+        controlled_apply,
+        remote=remote,
+        base=base,
+        draft=draft,
+    )
+    next_status = "pr_created" if pull_request.get("ready_for_review") else "pr_failed"
+    result = {
+        **result_payload,
+        "status": "passed" if pull_request.get("ready_for_review") else "failed",
+        "note": note or "AI repair pull request publication completed",
+        "error": pull_request.get("error", ""),
+        "pull_request": pull_request,
     }
     return storage.update_ai_repair_proposal_status(
         repair_id,
@@ -687,6 +731,7 @@ def normalize_test_result(result: dict[str, Any], repair: dict[str, Any]) -> dic
         "sandbox": safe_dict(result.get("sandbox")),
         "approval_report": safe_dict(result.get("approval_report")),
         "controlled_apply": safe_dict(result.get("controlled_apply")),
+        "pull_request": safe_dict(result.get("pull_request")),
     }
 
 
@@ -884,6 +929,240 @@ def prepare_patch_branch(
     return result
 
 
+def publish_prepared_branch_pull_request(
+    repo_root: Path,
+    repair: dict[str, Any],
+    controlled_apply: dict[str, Any],
+    remote: str = "origin",
+    base: str = "main",
+    draft: bool = True,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    branch_name = str(controlled_apply.get("branch_name") or "").strip()
+    worktree_path = str(controlled_apply.get("worktree_path") or "").strip()
+    remote_name = normalize_git_ref(remote, "origin")
+    base_branch = normalize_git_ref(base, "main")
+    result: dict[str, Any] = {
+        "status": "failed",
+        "ready_for_review": False,
+        "branch_name": branch_name,
+        "base": base_branch,
+        "remote": remote_name,
+        "repo_slug": "",
+        "pushed": False,
+        "pr_url": "",
+        "pr_number": None,
+        "method": "",
+        "draft": bool(draft),
+        "title": "",
+        "body": "",
+        "error": "",
+    }
+    if not branch_name:
+        result["error"] = "controlled apply result has no branch name"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    if not worktree_path:
+        result["error"] = "controlled apply result has no worktree path"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    worktree = Path(worktree_path).resolve()
+    if not worktree.exists() or not worktree.is_dir():
+        result["error"] = f"worktree not found: {worktree}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+
+    current_branch = run_git(["rev-parse", "--abbrev-ref", "HEAD"], worktree)
+    if current_branch["returncode"] != 0 or current_branch["stdout"].strip() != branch_name:
+        result["error"] = f"worktree is not on expected branch: {current_branch['stdout'] or current_branch['stderr']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    push = run_git(
+        ["push", "-u", remote_name, f"{branch_name}:{branch_name}"],
+        worktree,
+        timeout_seconds=DEFAULT_GIT_PUSH_TIMEOUT_SECONDS,
+    )
+    if push["returncode"] != 0:
+        result["error"] = f"git push failed: {push['stderr'] or push['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    result["pushed"] = True
+
+    remote_url = run_git(["remote", "get-url", remote_name], worktree)
+    repo_slug = github_repo_slug(remote_url["stdout"].strip()) if remote_url["returncode"] == 0 else ""
+    title = pull_request_title(repair, branch_name)
+    body = pull_request_body(repair, controlled_apply, base_branch)
+    result.update({"repo_slug": repo_slug, "title": title, "body": body})
+
+    pr_result = create_github_pull_request(
+        worktree,
+        repo_slug=repo_slug,
+        head=branch_name,
+        base=base_branch,
+        title=title,
+        body=body,
+        draft=draft,
+    )
+    result.update(pr_result)
+    result["duration_seconds"] = round(time.monotonic() - started, 3)
+    return result
+
+
+def create_github_pull_request(
+    worktree: Path,
+    repo_slug: str,
+    head: str,
+    base: str,
+    title: str,
+    body: str,
+    draft: bool,
+) -> dict[str, Any]:
+    gh_result = create_github_pull_request_with_gh(
+        worktree,
+        repo_slug=repo_slug,
+        head=head,
+        base=base,
+        title=title,
+        body=body,
+        draft=draft,
+    )
+    if gh_result.get("ready_for_review"):
+        return gh_result
+    api_result = create_github_pull_request_with_api(
+        repo_slug=repo_slug,
+        head=head,
+        base=base,
+        title=title,
+        body=body,
+        draft=draft,
+    )
+    if api_result.get("ready_for_review"):
+        return api_result
+    errors = [str(item.get("error") or "") for item in (gh_result, api_result) if item.get("error")]
+    return {
+        "status": "failed",
+        "ready_for_review": False,
+        "method": "github",
+        "pr_url": "",
+        "pr_number": None,
+        "error": "; ".join(errors) or "unable to create GitHub pull request",
+    }
+
+
+def create_github_pull_request_with_gh(
+    worktree: Path,
+    repo_slug: str,
+    head: str,
+    base: str,
+    title: str,
+    body: str,
+    draft: bool,
+) -> dict[str, Any]:
+    command = ["gh", "pr", "create", "--head", head, "--base", base, "--title", title, "--body", body]
+    if repo_slug:
+        command.extend(["--repo", repo_slug])
+    if draft:
+        command.append("--draft")
+    created = run_subprocess(command, worktree, timeout_seconds=DEFAULT_GITHUB_TIMEOUT_SECONDS)
+    if created["returncode"] != 0:
+        return {
+            "status": "failed",
+            "ready_for_review": False,
+            "method": "gh",
+            "pr_url": "",
+            "pr_number": None,
+            "error": f"gh pr create failed: {created['stderr'] or created['stdout']}",
+        }
+    pr_url = first_url(created["stdout"] or created["stderr"])
+    return {
+        "status": "passed",
+        "ready_for_review": bool(pr_url),
+        "method": "gh",
+        "pr_url": pr_url,
+        "pr_number": pr_number_from_url(pr_url),
+        "error": "" if pr_url else "gh pr create did not return a PR URL",
+    }
+
+
+def create_github_pull_request_with_api(
+    repo_slug: str,
+    head: str,
+    base: str,
+    title: str,
+    body: str,
+    draft: bool,
+) -> dict[str, Any]:
+    if not repo_slug:
+        return {
+            "status": "failed",
+            "ready_for_review": False,
+            "method": "github_api",
+            "pr_url": "",
+            "pr_number": None,
+            "error": "cannot infer GitHub repository from git remote",
+        }
+    token = github_token()
+    if not token:
+        return {
+            "status": "failed",
+            "ready_for_review": False,
+            "method": "github_api",
+            "pr_url": "",
+            "pr_number": None,
+            "error": "missing GITHUB_TOKEN or GH_TOKEN for GitHub API fallback",
+        }
+    request_body = json.dumps(
+        {
+            "title": title,
+            "head": head,
+            "base": base,
+            "body": body,
+            "draft": bool(draft),
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repo_slug}/pulls",
+        data=request_body,
+        method="POST",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "ops-agent",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=DEFAULT_GITHUB_TIMEOUT_SECONDS) as response:
+            payload = parse_json_object(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        return {
+            "status": "failed",
+            "ready_for_review": False,
+            "method": "github_api",
+            "pr_url": "",
+            "pr_number": None,
+            "error": f"GitHub API failed HTTP {exc.code}: {truncate_text(error_body, 1000)}",
+        }
+    except urllib.error.URLError as exc:
+        return {
+            "status": "failed",
+            "ready_for_review": False,
+            "method": "github_api",
+            "pr_url": "",
+            "pr_number": None,
+            "error": f"GitHub API request failed: {exc}",
+        }
+    return {
+        "status": "passed",
+        "ready_for_review": bool(payload.get("html_url")),
+        "method": "github_api",
+        "pr_url": str(payload.get("html_url") or ""),
+        "pr_number": safe_int(payload.get("number")),
+        "error": "" if payload.get("html_url") else "GitHub API response did not include html_url",
+    }
+
+
 def controlled_apply_blockers(
     repo_root: Path,
     repair: dict[str, Any],
@@ -962,6 +1241,87 @@ def git_status_paths(output: str) -> list[str]:
     return paths
 
 
+def normalize_git_ref(value: str, default: str) -> str:
+    candidate = str(value or default).strip()
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-")
+    return candidate if candidate and set(candidate) <= allowed and ".." not in candidate else default
+
+
+def github_repo_slug(remote_url: str) -> str:
+    url = remote_url.strip()
+    if url.endswith(".git"):
+        url = url[:-4]
+    if url.startswith("git@github.com:"):
+        return url.split(":", 1)[1].strip("/")
+    marker = "github.com/"
+    if marker in url:
+        return url.split(marker, 1)[1].strip("/")
+    return ""
+
+
+def pull_request_title(repair: dict[str, Any], branch_name: str) -> str:
+    title = str(repair.get("title") or "").strip()
+    return title if title else f"AI repair {branch_name}"
+
+
+def pull_request_body(repair: dict[str, Any], controlled_apply: dict[str, Any], base: str) -> str:
+    test_result = safe_dict(repair.get("test_result"))
+    approval_report = safe_dict(test_result.get("approval_report"))
+    sandbox = safe_dict(test_result.get("sandbox"))
+    changed_files = [str(item) for item in safe_list(controlled_apply.get("changed_files"))]
+    command_results = safe_list(controlled_apply.get("command_results"))
+    commands = [str(item.get("command") or "") for item in command_results if isinstance(item, dict)]
+    body = [
+        "## AI Ops Repair",
+        "",
+        f"- Repair ID: #{repair.get('id')}",
+        f"- Incident ID: #{repair.get('incident_id')}",
+        f"- Base branch: `{base}`",
+        f"- Risk: `{repair.get('risk') or 'medium'}`",
+        f"- Commit: `{controlled_apply.get('commit') or ''}`",
+        "",
+        "## Summary",
+        str(repair.get("summary") or "AI-generated repair proposal."),
+        "",
+        "## Root Cause",
+        str(repair.get("root_cause") or "Not specified."),
+        "",
+        "## Changed Files",
+        "\n".join(f"- `{path}`" for path in changed_files) if changed_files else "- No files reported",
+        "",
+        "## Validation",
+        f"- Sandbox status: `{sandbox.get('status') or 'unknown'}`",
+        f"- Approval readiness: `{approval_report.get('decision') or 'unknown'}`",
+        f"- Controlled branch status: `{controlled_apply.get('status') or 'unknown'}`",
+        "",
+        "## Test Commands",
+        "\n".join(f"- `{command}`" for command in commands) if commands else "- No commands reported",
+        "",
+        "## Operator Note",
+        "Review before merge. This PR was prepared by Ops Agent after sandbox validation and human approval.",
+    ]
+    return "\n".join(body)
+
+
+def first_url(value: str) -> str:
+    for token in value.replace("\r", " ").replace("\n", " ").split():
+        if token.startswith("http://") or token.startswith("https://"):
+            return token.strip()
+    return ""
+
+
+def pr_number_from_url(url: str) -> int | None:
+    tail = url.rstrip("/").rsplit("/", 1)[-1]
+    try:
+        return int(tail)
+    except ValueError:
+        return None
+
+
+def github_token() -> str:
+    return os.environ.get("GITHUB_TOKEN", "").strip() or os.environ.get("GH_TOKEN", "").strip()
+
+
 def copy_repo_to_sandbox(repo_root: Path, sandbox_dir: Path) -> None:
     ignore = shutil.ignore_patterns(
         ".git",
@@ -979,11 +1339,16 @@ def copy_repo_to_sandbox(repo_root: Path, sandbox_dir: Path) -> None:
 
 
 def run_subprocess(command: str | list[str], cwd: Path, timeout_seconds: int) -> dict[str, Any]:
+    resolved_command = command
+    if isinstance(command, list) and command:
+        executable = shutil.which(command[0])
+        if executable:
+            resolved_command = [executable, *command[1:]]
     try:
         completed = subprocess.run(
-            command,
+            resolved_command,
             cwd=str(cwd),
-            shell=isinstance(command, str),
+            shell=isinstance(resolved_command, str),
             text=True,
             capture_output=True,
             timeout=timeout_seconds,
@@ -1000,6 +1365,13 @@ def run_subprocess(command: str | list[str], cwd: Path, timeout_seconds: int) ->
             "stdout": exc.stdout or "",
             "stderr": (exc.stderr or "") + f"\ncommand timed out after {timeout_seconds}s",
             "timed_out": True,
+        }
+    except OSError as exc:
+        return {
+            "returncode": 127,
+            "stdout": "",
+            "stderr": str(exc),
+            "timed_out": False,
         }
 
 

@@ -624,6 +624,13 @@ POST /api/config/validate
 POST /api/config/backup
 POST /api/config/apply
 POST /api/config/restore
+GET  /api/ai-repairs
+GET  /api/ai-repairs/1
+POST /api/incidents/1/ai-repair/propose
+POST /api/ai-repairs/1/sandbox-test
+POST /api/ai-repairs/1/approve
+POST /api/ai-repairs/1/prepare-branch
+POST /api/ai-repairs/1/create-pr
 ```
 
 Config center behavior:
