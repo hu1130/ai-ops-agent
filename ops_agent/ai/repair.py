@@ -1115,12 +1115,16 @@ def validate_patch_dry_run(patch: dict[str, Any]) -> dict[str, Any]:
     files = safe_list(patch.get("files"))
     diff = str(patch.get("diff") or "")
     apply_mode = str(patch.get("apply_mode") or "proposal_only")
+    patch_type = str(patch.get("patch_type") or "")
     if apply_mode != "proposal_only":
         errors.append("patch apply_mode must be proposal_only")
     if len(diff) > MAX_DIFF_CHARS:
         errors.append(f"diff is too large: {len(diff)} chars")
     if not operations and not files and not diff.strip():
-        errors.append("patch has no operations, files, or diff")
+        if patch_type in {"manual_code_review", "config_review", "config_or_route_review"}:
+            warnings.append("review-only proposal has no patch operations, files, or diff")
+        else:
+            errors.append("patch has no operations, files, or diff")
     for file_item in files:
         file_payload = safe_dict(file_item)
         path = str(file_payload.get("path") or "")

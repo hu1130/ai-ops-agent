@@ -476,6 +476,22 @@ class AiRepairTest(unittest.TestCase):
         self.assertTrue(any("unsafe file path" in error for error in result["errors"]))
         self.assertTrue(any("unsafe diff path" in error for error in result["errors"]))
 
+    def test_dry_run_allows_review_only_proposal_without_diff(self) -> None:
+        result = validate_patch_dry_run(
+            {
+                "schema_version": 1,
+                "patch_type": "manual_code_review",
+                "apply_mode": "proposal_only",
+                "diff": "",
+                "files": [],
+            }
+        )
+
+        self.assertTrue(result["valid"])
+        self.assertFalse(result["mutates_files"])
+        self.assertEqual([], result["errors"])
+        self.assertTrue(any("review-only proposal" in warning for warning in result["warnings"]))
+
     def test_sandbox_test_applies_patch_to_copy_and_builds_approval_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = create_sandbox_repo(Path(tmp) / "repo")
