@@ -25,6 +25,11 @@ from ops_agent.ai.config_patches import (
     preview_config_patch,
 )
 from ops_agent.ai.learning_review import build_learning_optimization_draft
+from ops_agent.ai.repair import (
+    build_ai_repair_proposal,
+    dry_run_ai_repair_proposal,
+    record_ai_repair_test_result,
+)
 from ops_agent.monitor_targets import (
     apply_monitor_target_change,
     get_monitor_target,
@@ -98,6 +103,9 @@ def start_dashboard(
             if path == "/api/learning/config-patches":
                 self.send_json(storage.latest_learning_config_patches(**learning_config_patch_filters_from_query(query)))
                 return
+            if path == "/api/ai-repairs":
+                self.send_json(storage.latest_ai_repair_proposals(**ai_repair_filters_from_query(query)))
+                return
             if path == "/api/config":
                 if config is None:
                     self.send_json({"error": "config is not configured"}, status=503)
@@ -120,6 +128,16 @@ def start_dashboard(
                     row = storage.get_learning_config_patch(patch_id)
                     if not row:
                         self.send_json({"error": "learning config patch not found"}, status=404)
+                        return
+                    self.send_json(row)
+                    return
+            ai_repair_request = parse_ai_repair_api_path(path)
+            if ai_repair_request:
+                repair_id, action = ai_repair_request
+                if action == "":
+                    row = storage.get_ai_repair_proposal(repair_id)
+                    if not row:
+                        self.send_json({"error": "AI repair proposal not found"}, status=404)
                         return
                     self.send_json(row)
                     return
@@ -299,6 +317,16 @@ def start_dashboard(
                 self.handle_learning_recommendation_post(learning_request, auth)
                 return
 
+            ai_repair_request = parse_ai_repair_api_path(path)
+            if ai_repair_request:
+                self.handle_ai_repair_post(ai_repair_request, auth)
+                return
+
+            incident_ai_repair_request = parse_incident_ai_repair_api_path(path)
+            if incident_ai_repair_request:
+                self.handle_incident_ai_repair_post(incident_ai_repair_request, auth)
+                return
+
             monitor_target_request = parse_monitor_target_api_path(path)
             if monitor_target_request:
                 self.handle_monitor_target_post(monitor_target_request, auth)
@@ -411,6 +439,106 @@ def start_dashboard(
                 return
             self.record_audit(path, 200, "success", f"incident status={updated.get('status')}", actor=actor, auth=auth)
             self.send_json(updated)
+
+        def handle_incident_ai_repair_post(
+            self,
+            repair_request: tuple[int, str],
+            auth: AuthResult,
+        ) -> None:
+            incident_id, action = repair_request
+            path = self.path.split("?", 1)[0]
+            actor = "api"
+            try:
+                body = self.read_json_body()
+                actor = self.actor_from_body(body, auth)
+                if action not in {"propose", "proposal"}:
+                    self.record_audit(
+                        path,
+                        404,
+                        "not_found",
+                        f"unsupported incident AI repair operation: {action}",
+                        actor=actor,
+                        auth=auth,
+                    )
+                    self.send_json({"error": f"unsupported incident AI repair operation: {action}"}, status=404)
+                    return
+                proposal = build_ai_repair_proposal(
+                    storage,
+                    config,
+                    incident_id,
+                    request={**body, "actor": actor},
+                )
+                self.record_audit(path, 200, "success", "AI repair proposal created", actor=actor, auth=auth)
+                self.send_json(proposal)
+            except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
+
+        def handle_ai_repair_post(
+            self,
+            repair_request: tuple[int, str],
+            auth: AuthResult,
+        ) -> None:
+            repair_id, action = repair_request
+            path = self.path.split("?", 1)[0]
+            actor = "api"
+            try:
+                body = self.read_json_body()
+                actor = self.actor_from_body(body, auth)
+                note = str(body.get("note") or body.get("reason") or "")
+                if action in {"dry-run", "apply-dry-run", "validate"}:
+                    updated = dry_run_ai_repair_proposal(storage, repair_id, actor=actor, note=note)
+                    outcome = "success" if updated.get("status") == "dry_run_passed" else "error"
+                    self.record_audit(path, 200, outcome, "AI repair dry run completed", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+                if action in {"test", "record-test"}:
+                    result = safe_body_dict(body.get("result")) or body
+                    updated = record_ai_repair_test_result(storage, repair_id, result=result, actor=actor, note=note)
+                    outcome = "success" if updated.get("status") == "test_passed" else "error"
+                    self.record_audit(path, 200, outcome, "AI repair test result recorded", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+                if action == "approve":
+                    updated = storage.update_ai_repair_proposal_status(
+                        repair_id,
+                        "approved",
+                        actor=actor,
+                        note=note,
+                    )
+                    self.record_audit(path, 200, "success", "AI repair proposal approved", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+                if action == "reject":
+                    updated = storage.update_ai_repair_proposal_status(
+                        repair_id,
+                        "rejected",
+                        actor=actor,
+                        note=note,
+                    )
+                    self.record_audit(path, 200, "success", "AI repair proposal rejected", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+            except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
+                return
+            self.record_audit(
+                path,
+                404,
+                "not_found",
+                f"unsupported AI repair operation: {action}",
+                actor=actor,
+                auth=auth,
+            )
+            self.send_json({"error": f"unsupported AI repair operation: {action}"}, status=404)
 
         def handle_config_center_post(self, path: str, auth: AuthResult) -> None:
             actor = "api"
@@ -1014,6 +1142,16 @@ def learning_config_patch_filters_from_query(query: dict[str, list[str]]) -> dic
     }
 
 
+def ai_repair_filters_from_query(query: dict[str, list[str]]) -> dict:
+    return {
+        "limit": query_limit(query, default=50, maximum=200),
+        "statuses": query_statuses(query),
+        "incident_id": query_optional_int(query, "incident_id"),
+        "risk": query_text(query, "risk"),
+        "model_provider": query_text(query, "model_provider"),
+    }
+
+
 def query_text(query: dict[str, list[str]], key: str) -> str:
     values = query.get(key, [])
     return str(values[0]).strip() if values else ""
@@ -1402,6 +1540,18 @@ def parse_incident_api_path(path: str) -> tuple[int, str] | None:
     return incident_id, action
 
 
+def parse_incident_ai_repair_api_path(path: str) -> tuple[int, str] | None:
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 5 or parts[0] != "api" or parts[1] != "incidents" or parts[3] != "ai-repair":
+        return None
+    try:
+        incident_id = int(parts[2])
+    except ValueError:
+        return None
+    action = parts[4] if len(parts) >= 5 else ""
+    return incident_id, action
+
+
 def parse_action_api_path(path: str) -> tuple[int, str] | None:
     parts = [part for part in path.strip("/").split("/") if part]
     if len(parts) < 3 or parts[0] != "api" or parts[1] != "actions":
@@ -1450,6 +1600,18 @@ def parse_learning_config_patch_api_path(path: str) -> tuple[int, str] | None:
     return patch_id, action
 
 
+def parse_ai_repair_api_path(path: str) -> tuple[int, str] | None:
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 3 or parts[0] != "api" or parts[1] != "ai-repairs":
+        return None
+    try:
+        repair_id = int(parts[2])
+    except ValueError:
+        return None
+    action = parts[3] if len(parts) >= 4 else ""
+    return repair_id, action
+
+
 def parse_monitor_target_api_path(path: str) -> tuple[str, int | None, str] | None:
     parts = [part for part in path.strip("/").split("/") if part]
     if len(parts) < 3 or parts[0] != "api" or parts[1] != "monitor-targets":
@@ -1482,6 +1644,20 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         recommendation_id, action = learning_request
         operation = f"learning.recommendation.{action or 'read'}"
         return operation, "learning_recommendation", recommendation_id
+
+    ai_repair_request = parse_ai_repair_api_path(path)
+    if ai_repair_request:
+        repair_id, action = ai_repair_request
+        operation_name = (action or "read").replace("-", "_")
+        operation = f"ai_repair.{operation_name}"
+        return operation, "ai_repair", repair_id
+
+    incident_ai_repair_request = parse_incident_ai_repair_api_path(path)
+    if incident_ai_repair_request:
+        incident_id, action = incident_ai_repair_request
+        operation_name = (action or "read").replace("-", "_")
+        operation = f"ai_repair.{operation_name}"
+        return operation, "incident", incident_id
 
     recommendation_request = parse_recommendation_api_path(path)
     if recommendation_request:
@@ -1525,6 +1701,7 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/learning/config-patches": ("learning.config_patch.list", "learning_config_patch", None),
         "/api/learning/recommendations": ("learning.recommendation.list", "learning", None),
         "/api/learning/summary": ("learning.summary", "learning", None),
+        "/api/ai-repairs": ("ai_repair.list", "ai_repair", None),
         "/api/ops/metrics": ("ops.metrics", "ops", None),
         "/api/ops/report": ("ops.report", "ops", None),
         "/api/remediation/audit": ("remediation.audit", "remediation", None),

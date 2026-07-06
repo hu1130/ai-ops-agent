@@ -246,6 +246,29 @@ class Storage:
                     apply_result_json text not null default '{}'
                 );
 
+                create table if not exists ai_repair_proposals (
+                    id integer primary key autoincrement,
+                    incident_id integer not null,
+                    created_at text not null,
+                    updated_at text,
+                    status text not null default 'proposed',
+                    title text not null default '',
+                    summary text not null default '',
+                    risk text not null default 'medium',
+                    root_cause text not null default '',
+                    model_provider text not null default 'rules',
+                    model_name text not null default '',
+                    prompt_json text not null default '{}',
+                    proposal_json text not null default '{}',
+                    patch_json text not null default '{}',
+                    test_plan_json text not null default '{}',
+                    dry_run_json text not null default '{}',
+                    test_result_json text not null default '{}',
+                    decision_by text,
+                    decision_at text,
+                    decision_note text
+                );
+
                 create index if not exists idx_incident_recommendations_incident
                     on incident_recommendations (incident_id, position, id);
                 create index if not exists idx_incident_comments_incident
@@ -258,6 +281,10 @@ class Storage:
                     on learning_config_patches (status, updated_at, id);
                 create index if not exists idx_learning_config_patches_recommendation
                     on learning_config_patches (recommendation_id, id);
+                create index if not exists idx_ai_repair_proposals_incident
+                    on ai_repair_proposals (incident_id, id);
+                create index if not exists idx_ai_repair_proposals_status
+                    on ai_repair_proposals (status, updated_at, id);
                 create index if not exists idx_notification_logs_created
                     on notification_logs (created_at, id);
                 create index if not exists idx_notification_logs_status
@@ -271,6 +298,7 @@ class Storage:
             self.ensure_recommendation_columns()
             self.ensure_learning_recommendation_columns()
             self.ensure_learning_config_patch_columns()
+            self.ensure_ai_repair_proposal_columns()
             self.ensure_notification_log_columns()
             self.connection.commit()
 
@@ -485,6 +513,34 @@ class Storage:
             "decision_note": "alter table learning_config_patches add column decision_note text",
             "applied_at": "alter table learning_config_patches add column applied_at text",
             "apply_result_json": "alter table learning_config_patches add column apply_result_json text not null default '{}'",
+        }
+        for column, statement in additions.items():
+            if column not in columns:
+                self.connection.execute(statement)
+
+    def ensure_ai_repair_proposal_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("pragma table_info(ai_repair_proposals)").fetchall()
+        }
+        additions = {
+            "updated_at": "alter table ai_repair_proposals add column updated_at text",
+            "status": "alter table ai_repair_proposals add column status text not null default 'proposed'",
+            "title": "alter table ai_repair_proposals add column title text not null default ''",
+            "summary": "alter table ai_repair_proposals add column summary text not null default ''",
+            "risk": "alter table ai_repair_proposals add column risk text not null default 'medium'",
+            "root_cause": "alter table ai_repair_proposals add column root_cause text not null default ''",
+            "model_provider": "alter table ai_repair_proposals add column model_provider text not null default 'rules'",
+            "model_name": "alter table ai_repair_proposals add column model_name text not null default ''",
+            "prompt_json": "alter table ai_repair_proposals add column prompt_json text not null default '{}'",
+            "proposal_json": "alter table ai_repair_proposals add column proposal_json text not null default '{}'",
+            "patch_json": "alter table ai_repair_proposals add column patch_json text not null default '{}'",
+            "test_plan_json": "alter table ai_repair_proposals add column test_plan_json text not null default '{}'",
+            "dry_run_json": "alter table ai_repair_proposals add column dry_run_json text not null default '{}'",
+            "test_result_json": "alter table ai_repair_proposals add column test_result_json text not null default '{}'",
+            "decision_by": "alter table ai_repair_proposals add column decision_by text",
+            "decision_at": "alter table ai_repair_proposals add column decision_at text",
+            "decision_note": "alter table ai_repair_proposals add column decision_note text",
         }
         for column, statement in additions.items():
             if column not in columns:
@@ -1484,6 +1540,174 @@ class Storage:
                 (patch_id,),
             ).fetchone()
         return learning_config_patch_payload(updated)
+
+    def save_ai_repair_proposal(self, incident_id: int, proposal: dict) -> dict:
+        if not self.get_incident(incident_id):
+            raise ValueError(f"incident not found: #{incident_id}")
+        payload = normalize_ai_repair_proposal(proposal)
+        now = utc_now_iso()
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                insert into ai_repair_proposals (
+                    incident_id, created_at, updated_at, status, title, summary, risk,
+                    root_cause, model_provider, model_name, prompt_json, proposal_json,
+                    patch_json, test_plan_json, dry_run_json, test_result_json
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    incident_id,
+                    now,
+                    now,
+                    "proposed",
+                    payload["title"],
+                    payload["summary"],
+                    payload["risk"],
+                    payload["root_cause"],
+                    payload["model_provider"],
+                    payload["model_name"],
+                    json.dumps(payload["prompt"], ensure_ascii=False),
+                    json.dumps(payload["proposal"], ensure_ascii=False),
+                    json.dumps(payload["patch"], ensure_ascii=False),
+                    json.dumps(payload["test_plan"], ensure_ascii=False),
+                    "{}",
+                    "{}",
+                ),
+            )
+            self.connection.commit()
+            row = self.connection.execute(
+                "select * from ai_repair_proposals where id = ?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        return ai_repair_proposal_payload(row)
+
+    def latest_ai_repair_proposals(
+        self,
+        limit: int = 50,
+        statuses: Sequence[str] | None = None,
+        incident_id: int | None = None,
+        risk: str = "",
+        model_provider: str = "",
+    ) -> list[dict]:
+        with self.lock:
+            where: list[str] = []
+            params: list[object] = []
+            cleaned_statuses = [status for status in (statuses or []) if status]
+            if cleaned_statuses:
+                where.append(f"status in ({','.join('?' for _ in cleaned_statuses)})")
+                params.extend(cleaned_statuses)
+            if incident_id:
+                where.append("incident_id = ?")
+                params.append(incident_id)
+            if risk:
+                where.append("risk = ?")
+                params.append(risk)
+            if model_provider:
+                where.append("model_provider = ?")
+                params.append(model_provider)
+            where_sql = f"where {' and '.join(where)}" if where else ""
+            rows = self.connection.execute(
+                f"""
+                select * from ai_repair_proposals
+                {where_sql}
+                order by
+                    case status
+                        when 'proposed' then 0
+                        when 'dry_run_failed' then 1
+                        when 'dry_run_passed' then 2
+                        when 'test_failed' then 3
+                        when 'test_not_run' then 4
+                        when 'test_passed' then 5
+                        when 'approved' then 6
+                        when 'rejected' then 7
+                        else 8
+                    end,
+                    updated_at desc,
+                    id desc
+                limit ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [ai_repair_proposal_payload(row) for row in rows]
+
+    def get_ai_repair_proposal(self, repair_id: int) -> dict | None:
+        with self.lock:
+            row = self.connection.execute(
+                """
+                select * from ai_repair_proposals
+                where id = ?
+                """,
+                (repair_id,),
+            ).fetchone()
+        return ai_repair_proposal_payload(row) if row else None
+
+    def update_ai_repair_proposal_status(
+        self,
+        repair_id: int,
+        status: str,
+        actor: str = "",
+        note: str = "",
+        dry_run: dict | None = None,
+        test_result: dict | None = None,
+    ) -> dict:
+        allowed_statuses = {
+            "proposed",
+            "dry_run_passed",
+            "dry_run_failed",
+            "test_passed",
+            "test_failed",
+            "test_not_run",
+            "approved",
+            "rejected",
+        }
+        normalized_status = (status or "").strip().lower()
+        if normalized_status not in allowed_statuses:
+            raise ValueError(f"unsupported AI repair proposal status: {status}")
+        now = utc_now_iso()
+        actor_value = actor.strip()
+        note_value = note.strip()
+        with self.lock:
+            row = self.connection.execute(
+                "select * from ai_repair_proposals where id = ?",
+                (repair_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"AI repair proposal not found: #{repair_id}")
+            current_status = str(row["status"] or "proposed")
+            if current_status == "rejected" and normalized_status != "rejected":
+                raise ValueError(f"AI repair proposal already rejected: #{repair_id}")
+            dry_run_payload = safe_dict(dry_run) or parse_json_object(str(row["dry_run_json"] or "{}"))
+            test_payload = safe_dict(test_result) or parse_json_object(str(row["test_result_json"] or "{}"))
+            self.connection.execute(
+                """
+                update ai_repair_proposals
+                set updated_at = ?,
+                    status = ?,
+                    dry_run_json = ?,
+                    test_result_json = ?,
+                    decision_by = coalesce(nullif(?, ''), decision_by),
+                    decision_at = coalesce(?, decision_at),
+                    decision_note = coalesce(nullif(?, ''), decision_note)
+                where id = ?
+                """,
+                (
+                    now,
+                    normalized_status,
+                    json.dumps(dry_run_payload, ensure_ascii=False),
+                    json.dumps(test_payload, ensure_ascii=False),
+                    actor_value,
+                    now if actor_value or note_value or normalized_status in {"approved", "rejected"} else None,
+                    note_value,
+                    repair_id,
+                ),
+            )
+            self.connection.commit()
+            updated = self.connection.execute(
+                "select * from ai_repair_proposals where id = ?",
+                (repair_id,),
+            ).fetchone()
+        return ai_repair_proposal_payload(updated)
 
     def learning_summary(self, limit: int = 500) -> dict:
         rows = self.latest_learning_recommendations(limit=limit)
@@ -3019,6 +3243,17 @@ def learning_config_patch_payload(row: sqlite3.Row) -> dict:
     return payload
 
 
+def ai_repair_proposal_payload(row: sqlite3.Row) -> dict:
+    payload = dict(row)
+    payload["prompt"] = parse_json_object(str(payload.get("prompt_json") or "{}"))
+    payload["proposal"] = parse_json_object(str(payload.get("proposal_json") or "{}"))
+    payload["patch"] = parse_json_object(str(payload.get("patch_json") or "{}"))
+    payload["test_plan"] = parse_json_object(str(payload.get("test_plan_json") or "{}"))
+    payload["dry_run"] = parse_json_object(str(payload.get("dry_run_json") or "{}"))
+    payload["test_result"] = parse_json_object(str(payload.get("test_result_json") or "{}"))
+    return payload
+
+
 def parse_json_object(value: str) -> dict:
     try:
         parsed = json.loads(value)
@@ -3077,6 +3312,25 @@ def normalize_learning_config_patch(value: dict | None) -> dict:
         "title": str(payload.get("title") or ""),
         "reason": str(payload.get("reason") or ""),
         "patch": payload,
+    }
+
+
+def normalize_ai_repair_proposal(value: dict | None) -> dict:
+    payload = safe_dict(value)
+    risk = str(payload.get("risk") or "medium").strip().lower()
+    if risk not in {"low", "medium", "high", "critical"}:
+        risk = "medium"
+    return {
+        "title": str(payload.get("title") or "AI repair proposal"),
+        "summary": str(payload.get("summary") or ""),
+        "risk": risk,
+        "root_cause": str(payload.get("root_cause") or ""),
+        "model_provider": str(payload.get("model_provider") or "rules"),
+        "model_name": str(payload.get("model_name") or ""),
+        "prompt": safe_dict(payload.get("prompt")),
+        "proposal": safe_dict(payload.get("proposal")),
+        "patch": safe_dict(payload.get("patch")),
+        "test_plan": safe_dict(payload.get("test_plan")),
     }
 
 
