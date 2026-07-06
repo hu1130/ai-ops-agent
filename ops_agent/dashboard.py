@@ -129,6 +129,9 @@ def start_dashboard(
             if path == "/api/ai-repairs/approval-queue":
                 self.send_json(ai_repair_approval_queue(storage, **ai_repair_queue_filters_from_query(query)))
                 return
+            if path == "/api/change-events":
+                self.send_json(storage.latest_change_events(**change_event_filters_from_query(query)))
+                return
             if path == "/api/config":
                 if config is None:
                     self.send_json({"error": "config is not configured"}, status=503)
@@ -280,6 +283,13 @@ def start_dashboard(
                     except ValueError as exc:
                         self.send_json({"error": str(exc)}, status=404)
                     return
+                if action == "changes":
+                    incident = storage.get_incident(incident_id)
+                    if not incident:
+                        self.send_json({"error": "incident not found"}, status=404)
+                        return
+                    self.send_json(storage.correlate_incident_changes(incident))
+                    return
                 if action == "playbook-matches":
                     if config is None:
                         self.send_json({"error": "config is not configured"}, status=503)
@@ -366,6 +376,10 @@ def start_dashboard(
 
             if path == "/api/ai-repairs/approval-queue/notify":
                 self.handle_ai_repair_queue_notify_post(auth)
+                return
+
+            if path == "/api/change-events":
+                self.handle_change_event_post(auth)
                 return
 
             ai_repair_request = parse_ai_repair_api_path(path)
@@ -495,6 +509,26 @@ def start_dashboard(
                 return
             self.record_audit(path, 200, "success", f"incident status={updated.get('status')}", actor=actor, auth=auth)
             self.send_json(updated)
+
+        def handle_change_event_post(self, auth: AuthResult) -> None:
+            path = self.path.split("?", 1)[0]
+            actor = "api"
+            try:
+                body = self.read_json_body()
+                actor = self.actor_from_body(body, auth)
+                payload = dict(body)
+                payload["actor"] = str(payload.get("actor") or actor)
+                created = storage.save_change_event(payload)
+            except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
+                return
+            self.record_audit(path, 200, "success", f"change event created #{created.get('id')}", actor=actor, auth=auth)
+            self.send_json(created)
 
         def handle_incident_ai_repair_post(
             self,
@@ -1523,6 +1557,21 @@ def ai_repair_queue_filters_from_query(query: dict[str, list[str]]) -> dict:
     }
 
 
+def change_event_filters_from_query(query: dict[str, list[str]]) -> dict:
+    return {
+        "limit": query_limit(query, default=50, maximum=500),
+        "environment": query_text(query, "environment"),
+        "run_type": query_text(query, "run_type"),
+        "project_id": query_text(query, "project_id"),
+        "change_type": query_text(query, "change_type"),
+        "source": query_text(query, "source"),
+        "status": query_text(query, "status"),
+        "risk": query_text(query, "risk"),
+        "related_incident_id": query_optional_int(query, "related_incident_id"),
+        "related_ai_repair_id": query_optional_int(query, "related_ai_repair_id"),
+    }
+
+
 def query_text(query: dict[str, list[str]], key: str) -> str:
     values = query.get(key, [])
     return str(values[0]).strip() if values else ""
@@ -2095,6 +2144,7 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/ai-repairs": ("ai_repair.list", "ai_repair", None),
         "/api/ai-repairs/approval-queue": ("ai_repair.approval_queue", "ai_repair", None),
         "/api/ai-repairs/approval-queue/notify": ("ai_repair.approval_queue.notify", "ai_repair", None),
+        "/api/change-events": ("change_event.list", "change_event", None),
         "/api/ops/metrics": ("ops.metrics", "ops", None),
         "/api/ops/report": ("ops.report", "ops", None),
         "/api/remediation/audit": ("remediation.audit", "remediation", None),

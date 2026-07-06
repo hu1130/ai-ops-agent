@@ -1202,12 +1202,72 @@ def deploy_ai_repair_after_merge(
         "pull_request_status": pr_status,
         "deploy_result": deploy_result,
     }
-    return storage.update_ai_repair_proposal_status(
+    updated = storage.update_ai_repair_proposal_status(
         repair_id,
         next_status,
         actor=actor,
         note=note,
         test_result=updated_result,
+    )
+    record_ai_repair_deployment_change(
+        storage,
+        updated,
+        deploy_result,
+        pr_status,
+        actor=actor,
+        note=note,
+        remote=remote,
+        base=base,
+    )
+    return updated
+
+
+def record_ai_repair_deployment_change(
+    storage: Storage,
+    repair: dict[str, Any],
+    deploy_result: dict[str, Any],
+    pr_status: dict[str, Any],
+    actor: str,
+    note: str,
+    remote: str,
+    base: str,
+) -> dict:
+    repair_id = safe_int(repair.get("id"))
+    incident_id = safe_int(repair.get("incident_id"))
+    incident = storage.get_incident(incident_id) if incident_id > 0 else {}
+    rollback = safe_dict(deploy_result.get("rollback"))
+    status = str(repair.get("status") or "")
+    change_type = "rollback" if status.startswith("rollback") else "deployment"
+    event_status = "completed" if status in {"deployed", "rollback_succeeded"} else "failed"
+    commit_sha = str(deploy_result.get("after_commit") or rollback.get("after_commit") or "")
+    pull_request = safe_dict(safe_dict(repair.get("test_result")).get("pull_request"))
+    pr_url = str(pr_status.get("pr_url") or pull_request.get("pr_url") or "")
+    links = [{"type": "pull_request", "url": pr_url}] if pr_url else []
+    return storage.save_change_event(
+        {
+            "environment": str(safe_dict(incident).get("environment") or "prod"),
+            "run_type": str(safe_dict(incident).get("run_type") or "normal"),
+            "source": "ai_repair",
+            "change_type": change_type,
+            "title": f"AI repair #{repair_id} {status}",
+            "summary": str(deploy_result.get("error") or note or repair.get("summary") or ""),
+            "actor": actor,
+            "status": event_status,
+            "risk": str(repair.get("risk") or "medium"),
+            "commit_sha": commit_sha,
+            "branch": base,
+            "related_incident_id": incident_id,
+            "related_ai_repair_id": repair_id,
+            "links": links,
+            "metadata": {
+                "repair_status": status,
+                "repair_title": str(repair.get("title") or ""),
+                "remote": remote,
+                "base": base,
+                "pull_request_status": pr_status,
+                "deploy_result": deploy_result,
+            },
+        }
     )
 
 

@@ -204,6 +204,29 @@ class Storage:
                     metadata_json text not null default '{}'
                 );
 
+                create table if not exists change_events (
+                    id integer primary key autoincrement,
+                    created_at text not null,
+                    updated_at text,
+                    environment text not null default 'prod',
+                    run_type text not null default 'normal',
+                    project_id text not null default '',
+                    source text not null default '',
+                    change_type text not null default '',
+                    title text not null,
+                    summary text not null default '',
+                    actor text not null default '',
+                    status text not null default 'completed',
+                    risk text not null default 'medium',
+                    commit_sha text not null default '',
+                    branch text not null default '',
+                    version text not null default '',
+                    related_incident_id integer,
+                    related_ai_repair_id integer,
+                    links_json text not null default '[]',
+                    metadata_json text not null default '{}'
+                );
+
                 create table if not exists learning_recommendations (
                     id integer primary key autoincrement,
                     created_at text not null,
@@ -289,6 +312,14 @@ class Storage:
                     on notification_logs (created_at, id);
                 create index if not exists idx_notification_logs_status
                     on notification_logs (status, id);
+                create index if not exists idx_change_events_created
+                    on change_events (created_at, id);
+                create index if not exists idx_change_events_context
+                    on change_events (environment, run_type, created_at, id);
+                create index if not exists idx_change_events_project
+                    on change_events (project_id, created_at, id);
+                create index if not exists idx_change_events_related
+                    on change_events (related_incident_id, related_ai_repair_id, id);
                 """
             )
             self.ensure_context_columns()
@@ -300,6 +331,7 @@ class Storage:
             self.ensure_learning_config_patch_columns()
             self.ensure_ai_repair_proposal_columns()
             self.ensure_notification_log_columns()
+            self.ensure_change_event_columns()
             self.connection.commit()
 
     def ensure_context_columns(self) -> None:
@@ -443,6 +475,34 @@ class Storage:
             "suppressed_reason": "alter table notification_logs add column suppressed_reason text not null default ''",
             "error": "alter table notification_logs add column error text not null default ''",
             "metadata_json": "alter table notification_logs add column metadata_json text not null default '{}'",
+        }
+        for column, statement in additions.items():
+            if column not in columns:
+                self.connection.execute(statement)
+
+    def ensure_change_event_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.connection.execute("pragma table_info(change_events)").fetchall()
+        }
+        additions = {
+            "updated_at": "alter table change_events add column updated_at text",
+            "environment": "alter table change_events add column environment text not null default 'prod'",
+            "run_type": "alter table change_events add column run_type text not null default 'normal'",
+            "project_id": "alter table change_events add column project_id text not null default ''",
+            "source": "alter table change_events add column source text not null default ''",
+            "change_type": "alter table change_events add column change_type text not null default ''",
+            "summary": "alter table change_events add column summary text not null default ''",
+            "actor": "alter table change_events add column actor text not null default ''",
+            "status": "alter table change_events add column status text not null default 'completed'",
+            "risk": "alter table change_events add column risk text not null default 'medium'",
+            "commit_sha": "alter table change_events add column commit_sha text not null default ''",
+            "branch": "alter table change_events add column branch text not null default ''",
+            "version": "alter table change_events add column version text not null default ''",
+            "related_incident_id": "alter table change_events add column related_incident_id integer",
+            "related_ai_repair_id": "alter table change_events add column related_ai_repair_id integer",
+            "links_json": "alter table change_events add column links_json text not null default '[]'",
+            "metadata_json": "alter table change_events add column metadata_json text not null default '{}'",
         }
         for column, statement in additions.items():
             if column not in columns:
@@ -1083,6 +1143,167 @@ class Storage:
                 "status": incident.get("status", ""),
                 "severity": incident.get("severity", ""),
             },
+        }
+
+    def save_change_event(self, event: dict) -> dict:
+        payload = normalize_change_event(event)
+        now = utc_now_iso()
+        created_at = payload["created_at"] or now
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                insert into change_events (
+                    created_at, updated_at, environment, run_type, project_id, source,
+                    change_type, title, summary, actor, status, risk, commit_sha, branch,
+                    version, related_incident_id, related_ai_repair_id, links_json, metadata_json
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    created_at,
+                    now,
+                    payload["environment"],
+                    payload["run_type"],
+                    payload["project_id"],
+                    payload["source"],
+                    payload["change_type"],
+                    payload["title"],
+                    payload["summary"],
+                    payload["actor"],
+                    payload["status"],
+                    payload["risk"],
+                    payload["commit_sha"],
+                    payload["branch"],
+                    payload["version"],
+                    payload["related_incident_id"],
+                    payload["related_ai_repair_id"],
+                    json.dumps(payload["links"], ensure_ascii=False),
+                    json.dumps(payload["metadata"], ensure_ascii=False),
+                ),
+            )
+            self.connection.commit()
+            row = self.connection.execute(
+                "select * from change_events where id = ?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        return change_event_payload(row)
+
+    def latest_change_events(
+        self,
+        limit: int = 50,
+        environment: str = "",
+        run_type: str = "",
+        project_id: str = "",
+        change_type: str = "",
+        source: str = "",
+        status: str = "",
+        risk: str = "",
+        related_incident_id: int | None = None,
+        related_ai_repair_id: int | None = None,
+    ) -> list[dict]:
+        with self.lock:
+            where, params = context_where(environment, run_type)
+            if project_id:
+                where.append("project_id = ?")
+                params.append(project_id)
+            if change_type:
+                where.append("change_type = ?")
+                params.append(change_type)
+            if source:
+                where.append("source = ?")
+                params.append(source)
+            if status:
+                where.append("status = ?")
+                params.append(status)
+            if risk:
+                where.append("risk = ?")
+                params.append(risk)
+            if related_incident_id is not None:
+                where.append("related_incident_id = ?")
+                params.append(related_incident_id)
+            if related_ai_repair_id is not None:
+                where.append("related_ai_repair_id = ?")
+                params.append(related_ai_repair_id)
+            where_sql = f"where {' and '.join(where)}" if where else ""
+            rows = self.connection.execute(
+                f"""
+                select * from change_events
+                {where_sql}
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [change_event_payload(row) for row in rows]
+
+    def recent_change_events_for_context(
+        self,
+        since_iso: str,
+        environment: str = "",
+        run_type: str = "",
+        project_id: str = "",
+        limit: int = 20,
+    ) -> list[dict]:
+        with self.lock:
+            where, params = context_where(environment, run_type)
+            if since_iso:
+                where.append("created_at >= ?")
+                params.append(since_iso)
+            if project_id:
+                where.append("(project_id = ? or project_id = '')")
+                params.append(project_id)
+            where_sql = f"where {' and '.join(where)}" if where else ""
+            rows = self.connection.execute(
+                f"""
+                select * from change_events
+                {where_sql}
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [change_event_payload(row) for row in rows]
+
+    def correlate_incident_changes(self, incident: dict, hours: int = 24, limit: int = 10) -> dict:
+        incident_id = safe_int(incident.get("id"))
+        environment = str(incident.get("environment") or "prod")
+        run_type = str(incident.get("run_type") or "normal")
+        occurred_at = (
+            parse_iso_datetime(incident.get("last_seen_at"))
+            or parse_iso_datetime(incident.get("updated_at"))
+            or parse_iso_datetime(incident.get("created_at"))
+            or datetime.now(timezone.utc)
+        )
+        since = occurred_at - timedelta(hours=max(1, int(hours or 24)))
+        incident_text = incident_correlation_text(incident)
+        rows = self.recent_change_events_for_context(
+            since.isoformat(),
+            environment=environment,
+            run_type=run_type,
+            limit=max(limit * 4, 20),
+        )
+        scored = []
+        for row in rows:
+            score, reasons = score_change_event_for_incident(row, incident, incident_text, occurred_at)
+            correlated = score >= 0.45 or safe_int(row.get("related_incident_id")) == incident_id
+            enriched = dict(row)
+            enriched["correlation_score"] = round(score, 3)
+            enriched["correlation_reasons"] = reasons
+            enriched["correlated"] = correlated
+            if correlated:
+                scored.append(enriched)
+        scored.sort(
+            key=lambda item: (safe_float(item.get("correlation_score")), str(item.get("created_at") or "")),
+            reverse=True,
+        )
+        return {
+            "incident_id": incident_id,
+            "window_hours": max(1, int(hours or 24)),
+            "since": since.isoformat(),
+            "environment": environment,
+            "run_type": run_type,
+            "related_count": len(scored),
+            "related_changes": scored[:limit],
         }
 
     def latest_escalated_incidents(self, limit: int = 20) -> list[dict]:
@@ -3272,6 +3493,13 @@ def ai_repair_proposal_payload(row: sqlite3.Row) -> dict:
     return payload
 
 
+def change_event_payload(row: sqlite3.Row) -> dict:
+    payload = dict(row)
+    payload["links"] = parse_json_list(str(payload.get("links_json") or "[]"))
+    payload["metadata"] = parse_json_object(str(payload.get("metadata_json") or "{}"))
+    return payload
+
+
 def parse_json_object(value: str) -> dict:
     try:
         parsed = json.loads(value)
@@ -3352,6 +3580,39 @@ def normalize_ai_repair_proposal(value: dict | None) -> dict:
     }
 
 
+def normalize_change_event(value: dict | None) -> dict:
+    payload = safe_dict(value)
+    title = str(payload.get("title") or "").strip()
+    if not title:
+        raise ValueError("change event title is required")
+    risk = str(payload.get("risk") or "medium").strip().lower()
+    if risk not in {"low", "medium", "high", "critical"}:
+        risk = "medium"
+    status = str(payload.get("status") or "completed").strip().lower()
+    if not status:
+        status = "completed"
+    return {
+        "created_at": str(payload.get("created_at") or "").strip(),
+        "environment": str(payload.get("environment") or "prod").strip() or "prod",
+        "run_type": str(payload.get("run_type") or "normal").strip() or "normal",
+        "project_id": str(payload.get("project_id") or "").strip(),
+        "source": str(payload.get("source") or "").strip(),
+        "change_type": str(payload.get("change_type") or "").strip(),
+        "title": title,
+        "summary": str(payload.get("summary") or "").strip(),
+        "actor": str(payload.get("actor") or "").strip(),
+        "status": status,
+        "risk": risk,
+        "commit_sha": str(payload.get("commit_sha") or payload.get("commit") or "").strip(),
+        "branch": str(payload.get("branch") or "").strip(),
+        "version": str(payload.get("version") or "").strip(),
+        "related_incident_id": positive_optional_int(payload.get("related_incident_id")),
+        "related_ai_repair_id": positive_optional_int(payload.get("related_ai_repair_id")),
+        "links": safe_list(payload.get("links")),
+        "metadata": safe_dict(payload.get("metadata")),
+    }
+
+
 def safe_dict(value: object) -> dict:
     return dict(value) if isinstance(value, dict) else {}
 
@@ -3372,6 +3633,75 @@ def safe_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def positive_optional_int(value: object) -> int | None:
+    parsed = safe_int(value)
+    return parsed if parsed > 0 else None
+
+
+def incident_correlation_text(incident: dict) -> str:
+    parts = [
+        str(incident.get("title") or ""),
+        str(incident.get("analysis") or ""),
+        str(incident.get("last_summary") or ""),
+        str(incident.get("classification_category") or ""),
+        str(incident.get("classification_summary") or ""),
+    ]
+    for result in parse_json_list(str(incident.get("results_json") or "[]")):
+        if isinstance(result, dict):
+            parts.extend(
+                [
+                    str(result.get("source") or ""),
+                    str(result.get("name") or ""),
+                    str(result.get("summary") or ""),
+                ]
+            )
+    return " ".join(parts).lower()
+
+
+def score_change_event_for_incident(
+    event: dict,
+    incident: dict,
+    incident_text: str,
+    occurred_at: datetime,
+) -> tuple[float, list[str]]:
+    score = 0.0
+    reasons: list[str] = []
+    if safe_int(event.get("related_incident_id")) == safe_int(incident.get("id")) and safe_int(incident.get("id")) > 0:
+        score += 1.0
+        reasons.append("direct_incident_link")
+    if str(event.get("environment") or "") == str(incident.get("environment") or "prod"):
+        score += 0.2
+        reasons.append("same_environment")
+    if str(event.get("run_type") or "") == str(incident.get("run_type") or "normal"):
+        score += 0.15
+        reasons.append("same_run_type")
+    project_id = str(event.get("project_id") or "").strip().lower()
+    if project_id and project_id in incident_text:
+        score += 0.25
+        reasons.append("project_matches_incident_signal")
+    change_type = str(event.get("change_type") or "").lower()
+    source = str(event.get("source") or "").lower()
+    if change_type in {"deployment", "release", "rollback", "config", "configuration", "ai_repair"}:
+        score += 0.15
+        reasons.append("high_signal_change_type")
+    if source in {"ai_repair", "config_center", "deploy", "release", "operator"}:
+        score += 0.1
+        reasons.append("known_change_source")
+    created_at = parse_iso_datetime(event.get("created_at"))
+    if created_at:
+        age_seconds = abs((occurred_at - created_at).total_seconds())
+        if age_seconds <= 6 * 3600:
+            score += 0.15
+            reasons.append("within_6_hours")
+        elif age_seconds <= 24 * 3600:
+            score += 0.08
+            reasons.append("within_24_hours")
+    if str(event.get("status") or "") in {"failed", "partial", "rolled_back", "rollback_failed"}:
+        score += 0.12
+        reasons.append("change_status_not_clean")
+    return min(score, 1.0), reasons
 
 
 def count_by_key(rows: list[dict], key: str, default: str = "unknown") -> dict[str, int]:

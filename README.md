@@ -230,6 +230,34 @@ POST /api/learning/config-patches/1/reject
 POST /api/learning/config-patches/1/apply
 ```
 
+## 变更关联中心
+
+系统会把发布、配置修改、人工操作和 AI 修复部署统一写入 `change_events` 表。事件诊断时会自动关联最近 24 小时内同环境、同运行类型、同项目或直接绑定的变更，用来判断“是不是最近改动引起的问题”。
+
+接口：
+```text
+GET /api/change-events
+GET /api/change-events?project_id=ops-agent&change_type=deployment
+POST /api/change-events
+GET /api/incidents/1/changes
+```
+
+写入示例：
+```json
+{
+  "title": "Deploy website release",
+  "source": "deploy",
+  "change_type": "deployment",
+  "project_id": "website",
+  "environment": "prod",
+  "run_type": "normal",
+  "commit_sha": "abc123",
+  "actor": "operator"
+}
+```
+
+AI 修复部署和回滚会自动写入变更事件，并关联 `related_incident_id` 和 `related_ai_repair_id`。这一步不会直接修改业务代码，只负责沉淀变更上下文，供误报压降、根因诊断和后续大模型修复策略使用。
+
 Learning recommendation review flow:
 - `accept` keeps the suggestion in an accepted state and stores a generated optimization draft.
 - `dismiss` closes a noisy or expected suggestion without applying changes.

@@ -22,7 +22,15 @@ def build_incident_diagnosis(
     related = related_incidents(storage, incident, results)
     collection_plan = build_collection_plan(causes, results, config)
     signals = normalize_signals(results)
-    evidence = build_evidence_package(incident, signals, causes, collection_plan, collected_evidence)
+    change_correlation = storage.correlate_incident_changes(incident, hours=24, limit=10)
+    evidence = build_evidence_package(
+        incident,
+        signals,
+        causes,
+        collection_plan,
+        collected_evidence,
+        change_correlation,
+    )
     return {
         "incident": incident,
         "context": {
@@ -37,6 +45,7 @@ def build_incident_diagnosis(
         "evidence": evidence,
         "collection_plan": collection_plan,
         "related_incidents": related,
+        "change_correlation": change_correlation,
         "next_decision": next_decision(causes, incident),
     }
 
@@ -59,6 +68,7 @@ def build_evidence_package(
     causes: list[dict[str, Any]],
     collection_plan: list[dict[str, Any]],
     collected_evidence: dict[str, Any] | None,
+    change_correlation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     top = causes[0] if causes else {}
     return {
@@ -71,6 +81,7 @@ def build_evidence_package(
             "last_summary": incident.get("last_summary") or "",
         },
         "monitor_signals": signals,
+        "recent_changes": change_correlation if isinstance(change_correlation, dict) else {},
         "top_cause": {
             "category": top.get("category") or "",
             "confidence": top.get("confidence") or 0,

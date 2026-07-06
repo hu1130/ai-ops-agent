@@ -1203,12 +1203,16 @@ class AiRepairTest(unittest.TestCase):
                     assume_merged=True,
                 )
             deployed_content = (repo / "sample.txt").read_text(encoding="utf-8")
+            changes = storage.latest_change_events(related_ai_repair_id=proposal["id"])
             storage.close()
 
         self.assertEqual("deployed", deployed["status"])
         self.assertEqual("new\n", deployed_content)
         self.assertTrue(deployed["test_result"]["deploy_result"]["ready"])
         self.assertEqual("passed", deployed["test_result"]["deploy_result"]["verification"]["status"])
+        self.assertEqual(1, len(changes))
+        self.assertEqual("deployment", changes[0]["change_type"])
+        self.assertEqual("ai_repair", changes[0]["source"])
 
     def test_deploy_after_merge_rolls_back_when_verification_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
