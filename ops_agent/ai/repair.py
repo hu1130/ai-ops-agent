@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -706,9 +708,11 @@ def run_patch_in_sandbox(repo_root: Path, patch: dict[str, Any], commands: list[
         combined_error: list[str] = []
         all_passed = True
         for command in requested_commands:
-            result = run_subprocess(command, sandbox_dir, timeout_seconds=DEFAULT_SANDBOX_TEST_TIMEOUT_SECONDS)
+            executed_command = runtime_test_command(command)
+            result = run_subprocess(executed_command, sandbox_dir, timeout_seconds=DEFAULT_SANDBOX_TEST_TIMEOUT_SECONDS)
             command_result = {
                 "command": command,
+                "executed_command": executed_command,
                 "returncode": result["returncode"],
                 "stdout": truncate_text(result["stdout"], DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
                 "stderr": truncate_text(result["stderr"], DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
@@ -808,6 +812,23 @@ def build_approval_report(repair: dict[str, Any], validation: dict[str, Any], sa
 def is_safe_test_command(command: str) -> bool:
     normalized = " ".join(command.strip().split())
     return any(normalized == prefix or normalized.startswith(prefix + " ") for prefix in SAFE_TEST_COMMAND_PREFIXES)
+
+
+def runtime_test_command(command: str) -> str:
+    normalized = command.strip()
+    replacements = ("python ", "python3 ", "py ")
+    for prefix in replacements:
+        if normalized == prefix.strip():
+            return quote_shell_arg(sys.executable)
+        if normalized.startswith(prefix):
+            return f"{quote_shell_arg(sys.executable)} {normalized[len(prefix):]}"
+    return normalized
+
+
+def quote_shell_arg(value: str) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline([value])
+    return shlex.quote(value)
 
 
 def truncate_text(value: str, max_chars: int) -> str:
