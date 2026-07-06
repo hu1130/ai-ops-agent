@@ -633,7 +633,9 @@ POST /api/config/ai-repair-policy
 POST /api/config/deepseek
 GET  /api/ai-repairs
 GET  /api/ai-repairs/approval-queue
+POST /api/ai-repairs/approval-queue/notify
 GET  /api/ai-repairs/1
+POST /api/ai-repairs/1/advance
 POST /api/projects/prod/ai-repair/drill
 POST /api/incidents/1/ai-repair/propose
 POST /api/incidents/1/ai-repair/run-pipeline
@@ -648,6 +650,10 @@ POST /api/ai-repairs/1/deploy-merged
 `POST /api/ai-repairs/{id}/deploy-merged` runs the merged PR deployment, health verification, and automatic rollback on deployment or verification failure. Optional JSON fields: `commands`, `verify_urls`, `rollback_commands`, `rollback_verify_urls`.
 
 `GET /api/ai-repairs/approval-queue` returns the human approval queue for AI repair proposals. Each item includes `queue_state`, blockers, warnings, safe next action, and booleans such as `can_approve`, `can_prepare_branch`, `can_create_pr`, and `can_deploy`. Optional query fields: `status`, `include_done`, `risk`, `model_provider`, `limit`.
+
+`POST /api/ai-repairs/approval-queue/notify` sends the current approval queue through the configured notifier and records a notification log. Optional JSON fields: `states` (default `["ready_for_approval"]`), `include_done`, `limit`, `actor`.
+
+`POST /api/ai-repairs/{id}/advance` executes the queue item safe next action from `next_action`: dry-run, sandbox-test, approve, prepare-branch, create-pr, or deploy-merged. It uses project repo/test configuration from the proposal context when available and refuses actions that do not match the current queue state unless `force` is true.
 
 `POST /api/projects/{project_id}/ai-repair/drill` creates a safe synthetic incident for a configured project, asks the repair model for a proposal, and runs patch dry-run validation. It records the result for review but does not mutate production, approve, prepare a branch, open a PR, or deploy. Optional JSON fields: `summary`, `severity`, `run_sandbox`, `commands`, `force`. If readiness is blocked, the API returns `409` unless `force` is true.
 

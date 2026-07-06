@@ -37,11 +37,13 @@ from ops_agent.ai.repair import (
     build_ai_repair_proposal,
     deploy_ai_repair_after_merge,
     dry_run_ai_repair_proposal,
+    notify_ai_repair_approval_queue,
     prepare_ai_repair_branch,
     publish_ai_repair_pull_request,
     record_ai_repair_test_result,
     run_ai_repair_pipeline,
     run_ai_repair_pipeline_for_incident,
+    run_ai_repair_queue_next_action,
     run_project_ai_repair_drill,
     sandbox_test_ai_repair_proposal,
 )
@@ -353,6 +355,10 @@ def start_dashboard(
                 self.handle_learning_recommendation_post(learning_request, auth)
                 return
 
+            if path == "/api/ai-repairs/approval-queue/notify":
+                self.handle_ai_repair_queue_notify_post(auth)
+                return
+
             ai_repair_request = parse_ai_repair_api_path(path)
             if ai_repair_request:
                 self.handle_ai_repair_post(ai_repair_request, auth)
@@ -620,6 +626,31 @@ def start_dashboard(
                 self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
                 self.send_json({"error": str(exc)}, status=500)
 
+        def handle_ai_repair_queue_notify_post(self, auth: AuthResult) -> None:
+            path = self.path.split("?", 1)[0]
+            actor = "api"
+            try:
+                body = self.read_json_body()
+                actor = self.actor_from_body(body, auth)
+                result = notify_ai_repair_approval_queue(
+                    storage,
+                    config,
+                    notifier=notifier,
+                    limit=int(body.get("limit") or 50),
+                    states=body.get("states") if isinstance(body.get("states"), list) else None,
+                    include_done=bool(body.get("include_done", False)),
+                    actor=actor,
+                )
+                outcome = "success" if result.get("status") in {"sent", "skipped", "suppressed"} else "error"
+                self.record_audit(path, 200, outcome, "AI repair approval queue notification processed", actor=actor, auth=auth)
+                self.send_json(result)
+            except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
+
         def handle_ai_repair_post(
             self,
             repair_request: tuple[int, str],
@@ -632,6 +663,17 @@ def start_dashboard(
                 body = self.read_json_body()
                 actor = self.actor_from_body(body, auth)
                 note = str(body.get("note") or body.get("reason") or "")
+                if action in {"advance", "run-next", "next-action"}:
+                    updated = run_ai_repair_queue_next_action(
+                        storage,
+                        config,
+                        repair_id,
+                        actor=actor,
+                        request=body,
+                    )
+                    self.record_audit(path, 200, "success", "AI repair queue next action executed", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
                 if action in {"run-pipeline", "pipeline", "autopilot"}:
                     if config is None:
                         self.record_audit(path, 503, "error", "config is not configured", actor=actor, auth=auth)
@@ -2030,6 +2072,7 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/learning/summary": ("learning.summary", "learning", None),
         "/api/ai-repairs": ("ai_repair.list", "ai_repair", None),
         "/api/ai-repairs/approval-queue": ("ai_repair.approval_queue", "ai_repair", None),
+        "/api/ai-repairs/approval-queue/notify": ("ai_repair.approval_queue.notify", "ai_repair", None),
         "/api/ops/metrics": ("ops.metrics", "ops", None),
         "/api/ops/report": ("ops.report", "ops", None),
         "/api/remediation/audit": ("remediation.audit", "remediation", None),

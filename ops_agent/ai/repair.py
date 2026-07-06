@@ -13,6 +13,7 @@ from typing import Any
 import urllib.error
 import urllib.request
 
+from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig
 from ops_agent.events import CheckResult
 from ops_agent.projects import list_projects
@@ -191,6 +192,228 @@ def ai_repair_approval_queue(
     }
 
 
+def notify_ai_repair_approval_queue(
+    storage: Storage,
+    config: AppConfig | None,
+    notifier: Notifier | None = None,
+    limit: int = 50,
+    states: list[str] | None = None,
+    include_done: bool = False,
+    actor: str = "operator",
+) -> dict[str, Any]:
+    target_states = [str(item).strip() for item in safe_list(states) if str(item).strip()] or ["ready_for_approval"]
+    queue = ai_repair_approval_queue(storage, limit=limit, include_done=include_done)
+    items = [
+        item
+        for item in safe_list(queue.get("items"))
+        if safe_dict(item).get("queue_state") in set(target_states)
+    ]
+    title = f"Ops Agent AI repair approval queue: {len(items)} item(s)"
+    dedupe_key = "ai-repair-approval-queue:" + ",".join(target_states) + ":" + ",".join(
+        str(safe_dict(item).get("id") or "") for item in items
+    )
+    environment = str(safe_dict(config.app if config else {}).get("environment") or "prod")
+    run_type = str(safe_dict(config.app if config else {}).get("run_type") or "normal")
+    channels = notification_channels_from_config(config)
+    if not items:
+        log_id = storage.save_notification_log(
+            title,
+            dedupe_key,
+            "suppressed",
+            severity="warning",
+            route_names=["ai-repair-approval-queue"],
+            channels=channels,
+            suppressed_reason="no matching queue items",
+            environment=environment,
+            run_type=run_type,
+            metadata={"states": target_states, "actor": actor, "queue_summary": safe_dict(queue.get("summary"))},
+        )
+        return {
+            "mode": "ai_repair_approval_queue_notification",
+            "status": "skipped",
+            "reason": "no matching queue items",
+            "notification_log_id": log_id,
+            "queue": queue,
+            "items": [],
+        }
+
+    text = format_ai_repair_approval_queue_notification(queue, items, target_states)
+    sender = notifier or Notifier(
+        webhook_url=str(safe_dict(config.alerts if config else {}).get("webhook_url") or ""),
+        cooldown_seconds=safe_int(safe_dict(config.alerts if config else {}).get("cooldown_seconds"), 300),
+        email=safe_dict(safe_dict(config.alerts if config else {}).get("email")),
+    )
+    status = "sent"
+    error = ""
+    suppressed_reason = ""
+    try:
+        sent = sender.send(title, text, dedupe_key=dedupe_key)
+        if not sent:
+            status = "suppressed"
+            suppressed_reason = "notifier cooldown"
+    except Exception as exc:
+        status = "failed"
+        error = str(exc)
+    log_id = storage.save_notification_log(
+        title,
+        dedupe_key,
+        status,
+        severity="warning",
+        route_names=["ai-repair-approval-queue"],
+        channels=channels,
+        suppressed_reason=suppressed_reason,
+        error=error,
+        environment=environment,
+        run_type=run_type,
+        metadata={
+            "states": target_states,
+            "actor": actor,
+            "queue_summary": safe_dict(queue.get("summary")),
+            "item_ids": [safe_int(safe_dict(item).get("id")) for item in items],
+        },
+    )
+    return {
+        "mode": "ai_repair_approval_queue_notification",
+        "status": status,
+        "error": error,
+        "notification_log_id": log_id,
+        "title": title,
+        "text": text,
+        "queue": queue,
+        "items": items,
+    }
+
+
+def run_ai_repair_queue_next_action(
+    storage: Storage,
+    config: AppConfig | None,
+    repair_id: int,
+    actor: str = "operator",
+    request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    request_payload = safe_dict(request)
+    repair = require_ai_repair(storage, repair_id)
+    before = ai_repair_approval_queue_item(storage, repair)
+    next_action = safe_dict(before.get("next_action"))
+    action_type = str(request_payload.get("action") or next_action.get("type") or "").strip()
+    if not action_type:
+        raise ValueError(f"AI repair #{repair_id} has no executable next action")
+    if next_action.get("type") and action_type != next_action.get("type") and not bool(request_payload.get("force")):
+        raise ValueError(f"next action is {next_action.get('type')}, not {action_type}")
+
+    runtime = empty_queue_action_runtime()
+    note = str(request_payload.get("note") or request_payload.get("reason") or f"queue next action: {action_type}")
+    if action_type == "dry-run":
+        updated = dry_run_ai_repair_proposal(storage, repair_id, actor=actor, note=note)
+    elif action_type == "sandbox-test":
+        runtime = queue_action_runtime(config, repair, request_payload)
+        updated = sandbox_test_ai_repair_proposal(
+            storage,
+            repair_id,
+            runtime["repo_root"],
+            actor=actor,
+            note=note,
+            commands=runtime["commands"],
+        )
+    elif action_type == "approve":
+        if not before.get("can_approve"):
+            raise ValueError(f"AI repair #{repair_id} is not ready for approval")
+        updated = storage.update_ai_repair_proposal_status(repair_id, "approved", actor=actor, note=note)
+    elif action_type == "prepare-branch":
+        if not before.get("can_prepare_branch"):
+            raise ValueError(f"AI repair #{repair_id} is not ready to prepare a branch")
+        runtime = queue_action_runtime(config, repair, request_payload)
+        updated = prepare_ai_repair_branch(
+            storage,
+            repair_id,
+            runtime["repo_root"],
+            actor=actor,
+            note=note,
+            commands=runtime["commands"],
+        )
+    elif action_type == "create-pr":
+        if not before.get("can_create_pr"):
+            raise ValueError(f"AI repair #{repair_id} is not ready to create a PR")
+        runtime = queue_action_runtime(config, repair, request_payload)
+        updated = publish_ai_repair_pull_request(
+            storage,
+            repair_id,
+            runtime["repo_root"],
+            actor=actor,
+            note=note,
+            remote=runtime["remote"],
+            base=runtime["base"],
+            draft=runtime["draft"],
+        )
+    elif action_type == "deploy-merged":
+        if not before.get("can_deploy"):
+            raise ValueError(f"AI repair #{repair_id} is not ready for deployment verification")
+        runtime = queue_action_runtime(config, repair, request_payload)
+        updated = deploy_ai_repair_after_merge(
+            storage,
+            repair_id,
+            runtime["repo_root"],
+            actor=actor,
+            note=note,
+            remote=runtime["remote"],
+            base=runtime["base"],
+            commands=runtime["commands"],
+            verify_urls=runtime["verify_urls"],
+            rollback_commands=runtime["rollback_commands"],
+            rollback_verify_urls=runtime["rollback_verify_urls"],
+        )
+    else:
+        raise ValueError(f"unsupported AI repair queue action: {action_type}")
+
+    return {
+        "mode": "ai_repair_queue_next_action",
+        "action": action_type,
+        "repair": updated,
+        "before": before,
+        "after": ai_repair_approval_queue_item(storage, updated),
+        "runtime": {
+            "repo_root": str(runtime["repo_root"]),
+            "commands": runtime["commands"] or [],
+            "remote": runtime["remote"],
+            "base": runtime["base"],
+        },
+    }
+
+
+def format_ai_repair_approval_queue_notification(
+    queue: dict[str, Any],
+    items: list[dict[str, Any]],
+    states: list[str],
+) -> str:
+    summary = safe_dict(queue.get("summary"))
+    lines = [
+        "AI 修复审批队列需要处理。",
+        "",
+        f"匹配状态: {', '.join(states)}",
+        f"待处理: {len(items)}",
+        f"可审批: {summary.get('ready_for_approval', 0)}; 需要沙箱: {summary.get('needs_sandbox', 0)}; 阻塞: {summary.get('blocked', 0)}; 仅建议: {summary.get('review_only', 0)}",
+        "",
+        "队列明细:",
+    ]
+    for item in items[:10]:
+        payload = safe_dict(item)
+        next_action = safe_dict(payload.get("next_action"))
+        incident = safe_dict(payload.get("incident"))
+        lines.extend(
+            [
+                f"- #{payload.get('id')} [{payload.get('queue_state')}] {payload.get('title')}",
+                f"  风险: {payload.get('risk')}; 事件: #{incident.get('id')} {incident.get('title')}",
+                f"  下一步: {next_action.get('type') or 'manual-review'} {next_action.get('path') or ''}",
+            ]
+        )
+        blockers = [str(item) for item in safe_list(payload.get("blockers")) if str(item)]
+        if blockers:
+            lines.append(f"  阻塞: {'; '.join(blockers[:3])}")
+    if len(items) > 10:
+        lines.append(f"- 还有 {len(items) - 10} 条未展示")
+    return "\n".join(lines)
+
+
 def ai_repair_approval_queue_item(storage: Storage, repair: dict[str, Any]) -> dict[str, Any]:
     repair_id = safe_int(repair.get("id"))
     incident_id = safe_int(repair.get("incident_id"))
@@ -365,6 +588,83 @@ def public_queue_incident(incident: dict[str, Any]) -> dict[str, Any]:
         "run_type": str(incident.get("run_type") or ""),
         "last_summary": str(incident.get("last_summary") or ""),
     }
+
+
+def queue_action_runtime(
+    config: AppConfig | None,
+    repair: dict[str, Any],
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    project = repair_project_from_context(config, repair, request)
+    fallback = config.base_dir if config is not None else Path(".")
+    commands = request.get("commands")
+    verify_urls = request.get("verify_urls") or request.get("verification_urls")
+    rollback_commands = request.get("rollback_commands")
+    rollback_verify_urls = request.get("rollback_verify_urls") or request.get("rollback_verification_urls")
+    return {
+        "project": project,
+        "repo_root": resolve_repair_repo_root(config, project, request, fallback),
+        "commands": commands if isinstance(commands, list) else string_list(project.get("test_commands")) or None,
+        "remote": str(request.get("remote") or project.get("git_remote") or "origin"),
+        "base": str(request.get("base") or project.get("base_branch") or "main"),
+        "draft": bool(request.get("draft", True)),
+        "verify_urls": verify_urls if isinstance(verify_urls, list) else None,
+        "rollback_commands": rollback_commands if isinstance(rollback_commands, list) else None,
+        "rollback_verify_urls": rollback_verify_urls if isinstance(rollback_verify_urls, list) else None,
+    }
+
+
+def empty_queue_action_runtime() -> dict[str, Any]:
+    return {
+        "project": {},
+        "repo_root": "",
+        "commands": [],
+        "remote": "",
+        "base": "",
+        "draft": True,
+        "verify_urls": None,
+        "rollback_commands": None,
+        "rollback_verify_urls": None,
+    }
+
+
+def repair_project_from_context(
+    config: AppConfig | None,
+    repair: dict[str, Any],
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    requested = str(request.get("project_id") or request.get("project") or "").strip()
+    if requested and config is not None:
+        project = find_repair_project_by_id(config, requested)
+        if project:
+            return project
+    prompt_project = safe_dict(repair_prompt_payload(repair).get("project"))
+    prompt_project_id = str(prompt_project.get("id") or prompt_project.get("name") or "").strip()
+    if prompt_project_id and config is not None:
+        project = find_repair_project_by_id(config, prompt_project_id)
+        if project:
+            return project
+    return prompt_project
+
+
+def repair_prompt_payload(repair: dict[str, Any]) -> dict[str, Any]:
+    prompt = safe_dict(repair.get("prompt"))
+    user = str(prompt.get("user") or "")
+    if not user.strip():
+        return {}
+    if user.strip().endswith("...[truncated]"):
+        user = user.rsplit("\n...[truncated]", 1)[0]
+    return parse_json_object(user)
+
+
+def notification_channels_from_config(config: AppConfig | None) -> list[str]:
+    alerts = safe_dict(config.alerts if config else {})
+    channels: list[str] = []
+    if str(alerts.get("webhook_url") or "").strip():
+        channels.append("webhook")
+    if bool(safe_dict(alerts.get("email")).get("enabled")):
+        channels.append("email")
+    return channels or ["console"]
 
 
 def run_ai_repair_pipeline_for_incident(

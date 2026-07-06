@@ -14,19 +14,32 @@ from ops_agent.ai.repair import (
     build_ai_repair_proposal,
     deploy_ai_repair_after_merge,
     dry_run_ai_repair_proposal,
+    notify_ai_repair_approval_queue,
     normalize_model_endpoint_url,
     prepare_ai_repair_branch,
     publish_ai_repair_pull_request,
     record_ai_repair_test_result,
     run_ai_repair_pipeline_for_incident,
+    run_ai_repair_queue_next_action,
     run_project_ai_repair_drill,
     sandbox_test_ai_repair_proposal,
     validate_patch_dry_run,
 )
+from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig
 from ops_agent.dashboard import start_dashboard
 from ops_agent.events import CheckResult
 from ops_agent.storage import Storage
+
+
+class RecordingNotifier(Notifier):
+    def __init__(self) -> None:
+        super().__init__(cooldown_seconds=0)
+        self.sent: list[tuple[str, str, str]] = []
+
+    def send(self, title: str, text: str, dedupe_key: str = "default") -> bool:
+        self.sent.append((title, text, dedupe_key))
+        return True
 
 
 class AiRepairTest(unittest.TestCase):
@@ -185,6 +198,65 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual("ready_for_approval", queue["items"][0]["queue_state"])
         self.assertEqual("approve", queue["items"][0]["next_action"]["type"])
         self.assertEqual(incident_id, queue["items"][0]["incident"]["id"])
+
+    def test_ai_repair_dashboard_api_notifies_and_advances_queue_item(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "app": {"name": "ops"},
+                    "alerts": {"email": {"enabled": True, "to_emails": ["owner@example.local"]}},
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    },
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+            dry_run_ai_repair_proposal(storage, proposal["id"], actor="tester")
+            notifier = RecordingNotifier()
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config, notifier=notifier)
+            host, port = server.server_address
+            try:
+                tested = post_json(
+                    f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/advance",
+                    {"actor": "tester"},
+                )
+                notified = post_json(
+                    f"http://{host}:{port}/api/ai-repairs/approval-queue/notify",
+                    {"actor": "tester"},
+                )
+                approved = post_json(
+                    f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/advance",
+                    {"actor": "tester"},
+                )
+                audit = storage.latest_api_audit_logs(10)
+                logs = storage.latest_notification_logs()
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("sandbox-test", tested["action"])
+        self.assertEqual("test_passed", tested["repair"]["status"])
+        self.assertEqual("sent", notified["status"])
+        self.assertEqual(1, len(notifier.sent))
+        self.assertEqual("approve", approved["action"])
+        self.assertEqual("approved", approved["repair"]["status"])
+        self.assertEqual("sent", logs[0]["status"])
+        self.assertIn("ai_repair.advance", {row["operation"] for row in audit})
+        self.assertIn("ai_repair.approval_queue.notify", {row["operation"] for row in audit})
 
     def test_model_repair_uses_openai_compatible_mock_response(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -610,6 +682,132 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual("approved_needs_branch", approved["items"][0]["queue_state"])
         self.assertTrue(approved["items"][0]["can_prepare_branch"])
         self.assertEqual("prepare-branch", approved["items"][0]["next_action"]["type"])
+
+    def test_ai_repair_approval_queue_notification_records_and_sends_ready_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "alerts": {"email": {"enabled": True, "to_emails": ["owner@example.local"]}},
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    },
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+            dry_run_ai_repair_proposal(storage, proposal["id"], actor="tester")
+            sandbox_test_ai_repair_proposal(storage, proposal["id"], repo, actor="tester")
+            notifier = RecordingNotifier()
+
+            result = notify_ai_repair_approval_queue(storage, config, notifier=notifier, actor="tester")
+            logs = storage.latest_notification_logs()
+            storage.close()
+
+        self.assertEqual("sent", result["status"])
+        self.assertEqual(1, len(notifier.sent))
+        self.assertIn("ready_for_approval", notifier.sent[0][1])
+        self.assertEqual("sent", logs[0]["status"])
+        self.assertEqual("ai-repair-approval-queue", json.loads(logs[0]["route_names_json"])[0])
+        self.assertEqual(["email"], json.loads(logs[0]["channels_json"]))
+
+    def test_ai_repair_queue_next_action_advances_approval_and_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_git_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "projects": [
+                        {
+                            "id": "prod",
+                            "environment": "prod",
+                            "run_types": ["normal"],
+                            "repo_root": str(repo),
+                            "test_commands": ["python -m unittest discover -s tests"],
+                        }
+                    ],
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    },
+                },
+                base_dir=Path(tmp),
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            proposal = build_ai_repair_proposal(
+                storage,
+                config,
+                incident_id,
+                request={"actor": "tester", "project_id": "prod"},
+            )
+            dry_run_ai_repair_proposal(storage, proposal["id"], actor="tester")
+            tested = run_ai_repair_queue_next_action(storage, config, proposal["id"], actor="tester")
+            approved = run_ai_repair_queue_next_action(storage, config, proposal["id"], actor="tester")
+            prepared = run_ai_repair_queue_next_action(storage, config, proposal["id"], actor="tester")
+            main_status = run_git_fixture(repo, ["status", "--porcelain"])
+            storage.close()
+
+        self.assertEqual("sandbox-test", tested["action"])
+        self.assertEqual("test_passed", tested["repair"]["status"])
+        self.assertEqual("approve", approved["action"])
+        self.assertEqual("approved", approved["repair"]["status"])
+        self.assertEqual("prepare-branch", prepared["action"])
+        self.assertEqual("branch_prepared", prepared["repair"]["status"])
+        self.assertEqual(str(repo), prepared["runtime"]["repo_root"])
+        self.assertEqual("", main_status)
+
+    def test_ai_repair_queue_approval_does_not_require_project_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    },
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+            dry_run_ai_repair_proposal(storage, proposal["id"], actor="tester")
+            sandbox_test_ai_repair_proposal(storage, proposal["id"], repo, actor="tester")
+
+            approved = run_ai_repair_queue_next_action(storage, None, proposal["id"], actor="tester")
+            storage.close()
+
+        self.assertEqual("approve", approved["action"])
+        self.assertEqual("approved", approved["repair"]["status"])
+        self.assertEqual("", approved["runtime"]["repo_root"])
 
     def test_ai_repair_pipeline_stops_at_human_approval_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
