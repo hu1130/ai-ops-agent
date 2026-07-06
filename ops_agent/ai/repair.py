@@ -198,15 +198,18 @@ def notify_ai_repair_approval_queue(
     notifier: Notifier | None = None,
     limit: int = 50,
     states: list[str] | None = None,
+    repair_ids: list[int] | None = None,
     include_done: bool = False,
     actor: str = "operator",
 ) -> dict[str, Any]:
     target_states = [str(item).strip() for item in safe_list(states) if str(item).strip()] or ["ready_for_approval"]
+    target_repair_ids = {safe_int(item) for item in safe_list(repair_ids) if safe_int(item) > 0}
     queue = ai_repair_approval_queue(storage, limit=limit, include_done=include_done)
     items = [
         item
         for item in safe_list(queue.get("items"))
         if safe_dict(item).get("queue_state") in set(target_states)
+        and (not target_repair_ids or safe_int(safe_dict(item).get("id")) in target_repair_ids)
     ]
     title = f"Ops Agent AI repair approval queue: {len(items)} item(s)"
     dedupe_key = "ai-repair-approval-queue:" + ",".join(target_states) + ":" + ",".join(
@@ -226,7 +229,12 @@ def notify_ai_repair_approval_queue(
             suppressed_reason="no matching queue items",
             environment=environment,
             run_type=run_type,
-            metadata={"states": target_states, "actor": actor, "queue_summary": safe_dict(queue.get("summary"))},
+            metadata={
+                "states": target_states,
+                "actor": actor,
+                "repair_ids": sorted(target_repair_ids),
+                "queue_summary": safe_dict(queue.get("summary")),
+            },
         )
         return {
             "mode": "ai_repair_approval_queue_notification",
@@ -268,6 +276,7 @@ def notify_ai_repair_approval_queue(
         metadata={
             "states": target_states,
             "actor": actor,
+            "repair_ids": sorted(target_repair_ids),
             "queue_summary": safe_dict(queue.get("summary")),
             "item_ids": [safe_int(safe_dict(item).get("id")) for item in items],
         },

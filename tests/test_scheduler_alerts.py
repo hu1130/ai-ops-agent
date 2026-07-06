@@ -137,6 +137,94 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertGreater(incident["classification_confidence"], 0.8)
         self.assertEqual("service_unavailable", stats["by_category"][0]["category"])
 
+    def test_alert_auto_triggers_ai_repair_proposal_and_queue_notification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {
+                        "consecutive_failures": 1,
+                        "email": {"enabled": True, "to_emails": ["owner@example.local"]},
+                    },
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {
+                        "enabled": True,
+                        "repair": {
+                            "provider": "rules",
+                            "auto_trigger": {
+                                "enabled": True,
+                                "severities": ["critical"],
+                                "categories": ["service_unavailable"],
+                                "min_classification_confidence": 0.65,
+                                "run_dry_run": True,
+                                "notify": True,
+                                "notify_states": ["review_only", "needs_sandbox", "blocked"],
+                            },
+                        },
+                    },
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            scheduler.process_alert_states(
+                [
+                    CheckResult(
+                        source="http",
+                        name="Site",
+                        status="critical",
+                        summary="HTTP 500",
+                        details={"url": "https://example.com", "status_code": 500},
+                    )
+                ]
+            )
+            incident = storage.latest_incidents(1)[0]
+            repairs = storage.latest_ai_repair_proposals(incident_id=incident["id"])
+            events = storage.latest_incident_events(incident["id"])
+            notifications = storage.latest_notification_logs()
+            storage.close()
+
+        self.assertEqual(1, len(repairs))
+        self.assertEqual("dry_run_passed", repairs[0]["status"])
+        self.assertEqual("rules", repairs[0]["model_provider"])
+        self.assertIn("AI repair auto trigger", incident["analysis"])
+        self.assertTrue(any(event["note"] == "AI repair auto-triggered" for event in events))
+        self.assertEqual(2, len(notifier.sent))
+        self.assertIn("Ops Agent AI repair approval queue: 1 item(s)", {title for title, _, _ in notifier.sent})
+        self.assertIn("Ops Agent detected 1 issue(s)", {title for title, _, _ in notifier.sent})
+        self.assertTrue(any(json.loads(row["route_names_json"]) == ["ai-repair-approval-queue"] for row in notifications))
+
+    def test_ai_repair_auto_trigger_skips_warning_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 1},
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {
+                        "enabled": True,
+                        "repair": {
+                            "provider": "rules",
+                            "auto_trigger": {"enabled": True},
+                        },
+                    },
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            scheduler.process_alert_states(
+                [CheckResult(source="json_api", name="Chat", status="warning", summary="Slow response: 8000 ms")]
+            )
+            incident = storage.latest_incidents(1)[0]
+            repairs = storage.latest_ai_repair_proposals(incident_id=incident["id"])
+            storage.close()
+
+        self.assertEqual([], repairs)
+        self.assertEqual(1, len(notifier.sent))
+
     def test_recovery_resolves_open_incident(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AppConfig(

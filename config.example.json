@@ -105,6 +105,28 @@
         "max_changed_files": 5,
         "allowed_patch_types": ["unified_diff"],
         "require_human_approval_risks": ["medium", "high", "critical"]
+      },
+      "auto_trigger": {
+        "enabled": false,
+        "severities": ["critical"],
+        "categories": [
+          "service_unavailable",
+          "dependency_failure",
+          "performance_degraded",
+          "probe_config_issue",
+          "route_or_healthcheck_config_mismatch",
+          "synthetic_quality_fail"
+        ],
+        "excluded_categories": ["unknown", "unclassified"],
+        "sources": [],
+        "excluded_sources": [],
+        "environments": [],
+        "run_types": [],
+        "min_classification_confidence": 0.65,
+        "run_dry_run": true,
+        "notify": true,
+        "notify_states": ["needs_dry_run", "needs_sandbox", "ready_for_approval", "blocked", "review_only"],
+        "notify_limit": 20
       }
     }
   },

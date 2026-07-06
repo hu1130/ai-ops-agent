@@ -638,6 +638,7 @@ def start_dashboard(
                     notifier=notifier,
                     limit=int(body.get("limit") or 50),
                     states=body.get("states") if isinstance(body.get("states"), list) else None,
+                    repair_ids=body.get("repair_ids") if isinstance(body.get("repair_ids"), list) else None,
                     include_done=bool(body.get("include_done", False)),
                     actor=actor,
                 )

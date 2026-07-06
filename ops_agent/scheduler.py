@@ -4,10 +4,16 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import time
 from pathlib import Path
+from typing import Any
 
 from ops_agent.ai.classifier import IncidentClassification, classify_incident
 from ops_agent.ai.analyzer import analyze_incident
 from ops_agent.ai.learning import build_learning_recommendations, format_learning_recommendations
+from ops_agent.ai.repair import (
+    build_ai_repair_proposal,
+    dry_run_ai_repair_proposal,
+    notify_ai_repair_approval_queue,
+)
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.alerts.routing import (
     alert_context_from_results,
@@ -37,6 +43,30 @@ from ops_agent.remediation.policy import decide_action_policy
 from ops_agent.remediation.verifier import verify_after_action
 from ops_agent.retention import format_retention_result, run_retention_cleanup
 from ops_agent.storage import Storage, fingerprint_target_keys
+
+
+DEFAULT_AI_REPAIR_AUTO_TRIGGER_POLICY = {
+    "enabled": False,
+    "severities": ["critical"],
+    "categories": [
+        "service_unavailable",
+        "dependency_failure",
+        "performance_degraded",
+        "probe_config_issue",
+        "route_or_healthcheck_config_mismatch",
+        "synthetic_quality_fail",
+    ],
+    "excluded_categories": ["unknown", "unclassified"],
+    "sources": [],
+    "excluded_sources": [],
+    "environments": [],
+    "run_types": [],
+    "min_classification_confidence": 0.65,
+    "run_dry_run": True,
+    "notify": True,
+    "notify_states": ["needs_dry_run", "needs_sandbox", "ready_for_approval", "blocked", "review_only"],
+    "notify_limit": 20,
+}
 
 
 @dataclass
@@ -183,6 +213,10 @@ class OpsScheduler:
             diagnosis_text = format_persisted_diagnosis_for_analysis(diagnosis)
             analysis = f"{analysis}{diagnosis_text}{remediation_text}"
             self.storage.update_incident_analysis(incident_id, analysis)
+            auto_repair = self.process_ai_repair_auto_trigger(incident_id, new_alerts)
+            if auto_repair.get("status") not in {"disabled", "skipped", "not_matched", "duplicate"}:
+                analysis = f"{analysis}{format_ai_repair_auto_trigger_result(auto_repair)}"
+                self.storage.update_incident_analysis(incident_id, analysis)
             for result in new_alerts:
                 self._issues[check_key(result)].incident_id = incident_id
             next_status = incident_status_from_action_results(action_results)
@@ -413,6 +447,90 @@ class OpsScheduler:
             metadata=decision,
         )
         return True
+
+    def process_ai_repair_auto_trigger(self, incident_id: int, results: list[CheckResult]) -> dict[str, Any]:
+        policy = ai_repair_auto_trigger_policy(self.config)
+        incident = self.storage.get_incident(incident_id) or {}
+        decision = ai_repair_auto_trigger_decision(incident, results, policy, self.config)
+        if decision["status"] != "matched":
+            return decision
+
+        existing = self.storage.latest_ai_repair_proposals(incident_id=incident_id, limit=1)
+        if existing:
+            return {
+                "status": "duplicate",
+                "reason": "incident already has an AI repair proposal",
+                "repair_id": existing[0].get("id"),
+                "policy": policy,
+            }
+
+        try:
+            repair = build_ai_repair_proposal(
+                self.storage,
+                self.config,
+                incident_id,
+                request={
+                    "actor": "scheduler",
+                    "source": "auto_trigger",
+                    "environment": incident.get("environment") or context_from_results(results).environment,
+                    "run_type": incident.get("run_type") or context_from_results(results).run_type,
+                },
+            )
+            if policy["run_dry_run"]:
+                repair = dry_run_ai_repair_proposal(
+                    self.storage,
+                    int(repair["id"]),
+                    actor="scheduler",
+                    note="AI repair auto trigger dry-run",
+                )
+            notify_result: dict[str, Any] = {}
+            if policy["notify"]:
+                notify_result = notify_ai_repair_approval_queue(
+                    self.storage,
+                    self.config,
+                    notifier=self.notifier,
+                    limit=policy["notify_limit"],
+                    states=policy["notify_states"],
+                    repair_ids=[int(repair["id"])],
+                    actor="scheduler",
+                )
+            current_status = str(incident.get("status") or "open")
+            self.storage.record_incident_event(
+                incident_id,
+                current_status,
+                current_status,
+                "scheduler",
+                "AI repair auto-triggered",
+                metadata={
+                    "repair_id": repair.get("id"),
+                    "repair_status": repair.get("status"),
+                    "notification_status": notify_result.get("status", ""),
+                    "decision": decision,
+                },
+            )
+            return {
+                "status": "triggered",
+                "reason": decision["reason"],
+                "repair": repair,
+                "notification": notify_result,
+                "policy": policy,
+            }
+        except Exception as exc:
+            current_status = str(incident.get("status") or "open")
+            self.storage.record_incident_event(
+                incident_id,
+                current_status,
+                current_status,
+                "scheduler",
+                "AI repair auto-trigger failed",
+                metadata={"error": str(exc), "decision": decision},
+            )
+            return {
+                "status": "failed",
+                "reason": str(exc),
+                "policy": policy,
+                "decision": decision,
+            }
 
     def process_remediation_actions(
         self,
@@ -683,6 +801,122 @@ def problem_key(problems: list[CheckResult]) -> str:
     return "|".join(f"{item.source}:{item.name}:{item.status}" for item in problems)
 
 
+def ai_repair_auto_trigger_policy(config: AppConfig) -> dict[str, Any]:
+    repair_config = safe_dict(safe_dict(config.raw.get("ai")).get("repair"))
+    raw = safe_dict(repair_config.get("auto_trigger"))
+    policy = dict(DEFAULT_AI_REPAIR_AUTO_TRIGGER_POLICY)
+    for key in ("enabled", "run_dry_run", "notify"):
+        if key in raw:
+            policy[key] = bool(raw.get(key))
+    for key in (
+        "severities",
+        "categories",
+        "excluded_categories",
+        "sources",
+        "excluded_sources",
+        "environments",
+        "run_types",
+        "notify_states",
+    ):
+        if key in raw:
+            policy[key] = clean_string_list(raw.get(key))
+    if "min_classification_confidence" in raw:
+        policy["min_classification_confidence"] = safe_float(raw.get("min_classification_confidence"), 0.65)
+    if "notify_limit" in raw:
+        policy["notify_limit"] = max(1, safe_int(raw.get("notify_limit"), 20))
+    return policy
+
+
+def ai_repair_auto_trigger_decision(
+    incident: dict[str, Any],
+    results: list[CheckResult],
+    policy: dict[str, Any],
+    config: AppConfig,
+) -> dict[str, Any]:
+    if not policy.get("enabled"):
+        return {"status": "disabled", "reason": "AI repair auto trigger is disabled", "policy": policy}
+    if safe_dict(config.ai).get("enabled") is False:
+        return {"status": "disabled", "reason": "AI is disabled", "policy": policy}
+    if not incident:
+        return {"status": "skipped", "reason": "incident not found", "policy": policy}
+    if int(incident.get("false_positive") or 0) == 1:
+        return {"status": "skipped", "reason": "incident is marked false positive", "policy": policy}
+
+    severity = str(incident.get("severity") or "").strip().lower()
+    allowed_severities = normalized_set(policy.get("severities"))
+    if allowed_severities and severity not in allowed_severities:
+        return {"status": "not_matched", "reason": f"severity not allowed: {severity}", "policy": policy}
+
+    category = str(incident.get("classification_category") or "").strip().lower()
+    excluded_categories = normalized_set(policy.get("excluded_categories"))
+    if category and category in excluded_categories:
+        return {"status": "not_matched", "reason": f"category excluded: {category}", "policy": policy}
+    allowed_categories = normalized_set(policy.get("categories"))
+    if allowed_categories and category not in allowed_categories:
+        return {"status": "not_matched", "reason": f"category not allowed: {category}", "policy": policy}
+
+    confidence = safe_float(incident.get("classification_confidence"), 0.0)
+    min_confidence = safe_float(policy.get("min_classification_confidence"), 0.65)
+    if confidence < min_confidence:
+        return {
+            "status": "not_matched",
+            "reason": f"classification confidence too low: {confidence}",
+            "policy": policy,
+        }
+
+    sources = {result.source.strip().lower() for result in results if result.source}
+    allowed_sources = normalized_set(policy.get("sources"))
+    if allowed_sources and sources.isdisjoint(allowed_sources):
+        return {"status": "not_matched", "reason": "source not allowed", "policy": policy}
+    excluded_sources = normalized_set(policy.get("excluded_sources"))
+    if excluded_sources and not sources.isdisjoint(excluded_sources):
+        return {"status": "not_matched", "reason": "source excluded", "policy": policy}
+
+    environment = str(incident.get("environment") or "").strip().lower()
+    allowed_environments = normalized_set(policy.get("environments"))
+    if allowed_environments and environment not in allowed_environments:
+        return {"status": "not_matched", "reason": f"environment not allowed: {environment}", "policy": policy}
+
+    run_type = str(incident.get("run_type") or "").strip().lower()
+    allowed_run_types = normalized_set(policy.get("run_types"))
+    if allowed_run_types and run_type not in allowed_run_types:
+        return {"status": "not_matched", "reason": f"run type not allowed: {run_type}", "policy": policy}
+
+    return {
+        "status": "matched",
+        "reason": "incident matched AI repair auto trigger policy",
+        "severity": severity,
+        "category": category,
+        "confidence": confidence,
+        "sources": sorted(sources),
+        "policy": policy,
+    }
+
+
+def format_ai_repair_auto_trigger_result(result: dict[str, Any]) -> str:
+    repair = safe_dict(result.get("repair"))
+    notification = safe_dict(result.get("notification"))
+    lines = [
+        "",
+        "",
+        "AI repair auto trigger:",
+        f"- status: {result.get('status', '')}",
+        f"- reason: {result.get('reason', '')}",
+    ]
+    if repair:
+        lines.extend(
+            [
+                f"- repair_id: {repair.get('id', '')}",
+                f"- repair_status: {repair.get('status', '')}",
+                f"- repair_risk: {repair.get('risk', '')}",
+                f"- model_provider: {repair.get('model_provider', '')}",
+            ]
+        )
+    if notification:
+        lines.append(f"- notification_status: {notification.get('status', '')}")
+    return "\n".join(lines)
+
+
 def incident_fingerprint(results: list[CheckResult]) -> str:
     context = context_from_results(results)
     targets = sorted({check_key(result) for result in results})
@@ -832,6 +1066,36 @@ def common_context_value(values: list[str], default: str) -> str:
 def clean_context_value(value: object, default: str) -> str:
     text = str(value or "").strip()
     return text or default
+
+
+def safe_dict(value: Any) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def clean_string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def normalized_set(value: Any) -> set[str]:
+    return {item.lower() for item in clean_string_list(value)}
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def incident_status_from_action_results(action_results) -> str:

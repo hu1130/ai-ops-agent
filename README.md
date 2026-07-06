@@ -661,6 +661,26 @@ POST /api/ai-repairs/1/deploy-merged
 
 Incident-based pipeline runs are project-aware. The agent selects the project by `project_id` from the request, or by the incident `environment` and `run_type`. Project `repo_root`, `test_commands`, `git_remote`, `base_branch`, and `repair_policy` override global defaults for that run.
 
+AI repair auto-trigger can be enabled under `ai.repair.auto_trigger`. When enabled, new incidents are matched against severity, category, source, environment, run type, and classifier confidence before the scheduler creates a repair proposal. The scheduler never mutates production through this path; it creates a proposal, optionally runs dry-run validation, records an incident event, and can notify only the newly created queue item.
+
+```json
+{
+  "ai": {
+    "repair": {
+      "auto_trigger": {
+        "enabled": true,
+        "severities": ["critical"],
+        "categories": ["service_unavailable", "performance_degraded", "synthetic_quality_fail"],
+        "min_classification_confidence": 0.65,
+        "run_dry_run": true,
+        "notify": true,
+        "notify_states": ["needs_sandbox", "ready_for_approval", "blocked", "review_only"]
+      }
+    }
+  }
+}
+```
+
 `GET /api/projects/repair-readiness` reports whether each project is ready for AI repair: repository path availability, safe test commands, configured model key, loaded context files, skipped/missing files, and effective repair policy. Use this before allowing DeepSeek to generate patches for a real business project.
 
 Model repair proposals can include bounded repository context so DeepSeek/OpenAI-compatible models can generate concrete reviewable diffs instead of guessing. Configure it globally under `ai.repair.repository_context`, and optionally add project-level `repair_context_files`:
