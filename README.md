@@ -651,6 +651,8 @@ POST /api/ai-repairs/1/deploy-merged
 
 `POST /api/ai-repairs/{id}/deploy-merged` runs the merged PR deployment, health verification, and automatic rollback on deployment or verification failure. Optional JSON fields: `commands`, `verify_urls`, `rollback_commands`, `rollback_verify_urls`.
 
+`POST /api/ai-repairs/{id}/sandbox-test` records `test_result.guardrails` and folds guardrail blockers into `approval_report.blockers`. Approval is blocked when a model patch targets sensitive paths such as `.env`, `.ssh`, private key files, uses path traversal, changes more files than policy allows, or requests non-whitelisted test commands.
+
 `GET /api/ai-repairs/approval-queue` returns the human approval queue for AI repair proposals. Each item includes `queue_state`, blockers, warnings, safe next action, and booleans such as `can_approve`, `can_prepare_branch`, `can_create_pr`, and `can_deploy`. Optional query fields: `status`, `include_done`, `risk`, `model_provider`, `limit`.
 
 `POST /api/ai-repairs/approval-queue/notify` sends the current approval queue through the configured notifier and records a notification log. Optional JSON fields: `states` (default `["ready_for_approval"]`), `include_done`, `limit`, `actor`.

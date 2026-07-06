@@ -36,6 +36,7 @@ from ops_agent.ai.config_patches import (
 from ops_agent.ai.learning_review import build_learning_optimization_draft
 from ops_agent.ai.repair import (
     ai_repair_approval_queue,
+    ai_repair_policy_from_config,
     build_ai_repair_proposal,
     deploy_ai_repair_after_merge,
     dry_run_ai_repair_proposal,
@@ -736,6 +737,7 @@ def start_dashboard(
                         actor=actor,
                         note=note,
                         commands=commands if isinstance(commands, list) else None,
+                        policy=ai_repair_policy_from_config(config),
                     )
                     outcome = "success" if updated.get("status") == "test_passed" else "error"
                     self.record_audit(path, 200, outcome, "AI repair sandbox test completed", actor=actor, auth=auth)

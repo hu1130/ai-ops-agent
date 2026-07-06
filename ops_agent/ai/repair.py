@@ -80,6 +80,7 @@ SENSITIVE_FILENAMES = {
     "id_ed25519",
     "id_rsa",
 }
+SENSITIVE_FILE_SUFFIXES = {".key", ".pem", ".p12", ".pfx"}
 SENSITIVE_PATH_PARTS = {".git", ".ssh", "secrets", "__pycache__"}
 REPOSITORY_CONTEXT_EXCLUDED_PARTS = SENSITIVE_PATH_PARTS | {
     ".mypy_cache",
@@ -108,6 +109,7 @@ DEFAULT_AI_REPAIR_POLICY = {
     "allowed_patch_types": ["unified_diff"],
     "require_human_approval_risks": ["medium", "high", "critical"],
 }
+DEFAULT_SANDBOX_MAX_COMMANDS = 5
 AI_REPAIR_QUEUE_ACTIVE_STATUSES = [
     "proposed",
     "dry_run_failed",
@@ -323,6 +325,7 @@ def run_ai_repair_queue_next_action(
             actor=actor,
             note=note,
             commands=runtime["commands"],
+            policy=safe_dict(runtime.get("policy")),
         )
     elif action_type == "approve":
         if not before.get("can_approve"):
@@ -432,6 +435,7 @@ def ai_repair_approval_queue_item(storage: Storage, repair: dict[str, Any]) -> d
     dry_run = safe_dict(repair.get("dry_run"))
     test_result = safe_dict(repair.get("test_result"))
     approval_report = safe_dict(test_result.get("approval_report"))
+    guardrails = safe_dict(test_result.get("guardrails"))
     controlled_apply = safe_dict(test_result.get("controlled_apply"))
     pull_request = safe_dict(test_result.get("pull_request"))
     deploy_result = safe_dict(test_result.get("deploy_result"))
@@ -471,6 +475,7 @@ def ai_repair_approval_queue_item(storage: Storage, repair: dict[str, Any]) -> d
             "error": str(test_result.get("error") or ""),
             "approval_ready": bool(approval_report.get("ready_to_approve")),
             "approval_decision": str(approval_report.get("decision") or ""),
+            "guardrail_status": str(guardrails.get("status") or ""),
             "sandbox_status": str(safe_dict(test_result.get("sandbox")).get("status") or ""),
             "controlled_branch_ready": bool(controlled_apply.get("ready_for_pr")),
             "pull_request_ready": bool(pull_request.get("ready_for_review")),
@@ -614,6 +619,7 @@ def queue_action_runtime(
         "project": project,
         "repo_root": resolve_repair_repo_root(config, project, request, fallback),
         "commands": commands if isinstance(commands, list) else string_list(project.get("test_commands")) or None,
+        "policy": ai_repair_policy_from_config(config, project=project),
         "remote": str(request.get("remote") or project.get("git_remote") or "origin"),
         "base": str(request.get("base") or project.get("base_branch") or "main"),
         "draft": bool(request.get("draft", True)),
@@ -628,6 +634,7 @@ def empty_queue_action_runtime() -> dict[str, Any]:
         "project": {},
         "repo_root": "",
         "commands": [],
+        "policy": {},
         "remote": "",
         "base": "",
         "draft": True,
@@ -827,6 +834,7 @@ def run_project_ai_repair_drill(
             actor=actor,
             note=str(request_payload.get("note") or "project AI repair drill sandbox test"),
             commands=commands if isinstance(commands, list) else string_list(project.get("test_commands")) or None,
+            policy=ai_repair_policy_from_config(config, project=project),
         )
         sandbox_result = safe_dict(repair.get("test_result"))
     elif run_sandbox:
@@ -904,6 +912,7 @@ def run_ai_repair_pipeline(
         actor=actor,
         note=note,
         commands=commands,
+        policy=repair_policy,
     )
     append_pipeline_stage(pipeline, "sandbox_test", repair)
     if repair.get("status") != "test_passed":
@@ -992,16 +1001,21 @@ def sandbox_test_ai_repair_proposal(
     actor: str = "operator",
     note: str = "",
     commands: list[str] | None = None,
+    policy: dict[str, Any] | None = None,
 ) -> dict:
     repair = require_ai_repair(storage, repair_id)
     patch = safe_dict(repair.get("patch"))
     validation = validate_patch_dry_run(patch)
+    requested_commands = (
+        safe_list(commands) if commands is not None else safe_list(safe_dict(repair.get("test_plan")).get("commands"))
+    )
+    guardrails = build_sandbox_guardrail_report(patch, requested_commands, validation=validation, policy=policy)
     sandbox = run_patch_in_sandbox(
         Path(repo_root),
         patch,
-        safe_list(commands) if commands is not None else safe_list(safe_dict(repair.get("test_plan")).get("commands")),
+        requested_commands,
     )
-    report = build_approval_report(repair, validation, sandbox)
+    report = build_approval_report(repair, validation, sandbox, guardrails=guardrails)
     status = "passed" if report["ready_to_approve"] else "failed"
     if not str(patch.get("diff") or "").strip():
         status = "skipped"
@@ -1012,6 +1026,7 @@ def sandbox_test_ai_repair_proposal(
         "error": sandbox.get("error", ""),
         "note": note or "sandbox patch validation completed",
         "validation": validation,
+        "guardrails": guardrails,
         "sandbox": sandbox,
         "approval_report": report,
     }
@@ -1045,6 +1060,7 @@ def prepare_ai_repair_branch(
         "error": controlled_apply.get("error", ""),
         "note": note or "approved repair branch preparation completed",
         "validation": safe_dict(controlled_apply.get("validation")),
+        "guardrails": safe_dict(safe_dict(repair.get("test_result")).get("guardrails")),
         "sandbox": safe_dict(safe_dict(repair.get("test_result")).get("sandbox")),
         "approval_report": approval_report,
         "controlled_apply": controlled_apply,
@@ -1703,6 +1719,62 @@ def validate_patch_dry_run(patch: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_sandbox_guardrail_report(
+    patch: dict[str, Any],
+    commands: list[Any],
+    validation: dict[str, Any] | None = None,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    validation_payload = safe_dict(validation) or validate_patch_dry_run(patch)
+    policy_payload = normalize_ai_repair_policy(policy or {})
+    diff = str(patch.get("diff") or "")
+    checked_files = [
+        str(path)
+        for path in safe_list(validation_payload.get("checked_files"))
+        if str(path).strip()
+    ]
+    requested_commands = [str(item).strip() for item in commands if str(item).strip()]
+    if not requested_commands:
+        requested_commands = list(DEFAULT_TEST_COMMANDS)
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if not validation_payload.get("valid"):
+        blockers.extend(str(error) for error in safe_list(validation_payload.get("errors")))
+    if not diff.strip():
+        blockers.append("patch has no unified diff to sandbox")
+    max_changed_files = safe_int(
+        policy_payload.get("max_changed_files"),
+        safe_int(DEFAULT_AI_REPAIR_POLICY["max_changed_files"], 5),
+    )
+    if len(checked_files) > max_changed_files:
+        blockers.append(f"patch changes too many files: {len(checked_files)} > {max_changed_files}")
+    for path in checked_files:
+        reason = patch_path_guardrail_reason(path)
+        if reason:
+            blockers.append(f"{reason}: {path}")
+
+    if len(requested_commands) > DEFAULT_SANDBOX_MAX_COMMANDS:
+        blockers.append(f"too many sandbox test commands: {len(requested_commands)} > {DEFAULT_SANDBOX_MAX_COMMANDS}")
+    for command in requested_commands:
+        if not is_safe_test_command(command):
+            blockers.append(f"unsafe test command: {command}")
+
+    warnings.extend(str(item) for item in safe_list(validation_payload.get("warnings")))
+    return {
+        "status": "blocked" if blockers else "passed",
+        "blockers": unique_strings(blockers),
+        "warnings": unique_strings(warnings),
+        "checked_files": checked_files,
+        "commands": requested_commands,
+        "limits": {
+            "max_changed_files": max_changed_files,
+            "max_commands": DEFAULT_SANDBOX_MAX_COMMANDS,
+            "max_diff_chars": MAX_DIFF_CHARS,
+        },
+    }
+
+
 def normalize_test_result(result: dict[str, Any], repair: dict[str, Any]) -> dict[str, Any]:
     status = str(result.get("status") or "").strip().lower()
     if status not in SAFE_STATUSES:
@@ -1717,6 +1789,7 @@ def normalize_test_result(result: dict[str, Any], repair: dict[str, Any]) -> dic
         "error": str(result.get("error") or ""),
         "note": str(result.get("note") or "test execution is external until sandbox runner is configured"),
         "validation": safe_dict(result.get("validation")),
+        "guardrails": safe_dict(result.get("guardrails")),
         "sandbox": safe_dict(result.get("sandbox")),
         "approval_report": safe_dict(result.get("approval_report")),
         "controlled_apply": safe_dict(result.get("controlled_apply")),
@@ -2766,11 +2839,19 @@ def run_subprocess(command: str | list[str], cwd: Path, timeout_seconds: int) ->
         }
 
 
-def build_approval_report(repair: dict[str, Any], validation: dict[str, Any], sandbox: dict[str, Any]) -> dict[str, Any]:
+def build_approval_report(
+    repair: dict[str, Any],
+    validation: dict[str, Any],
+    sandbox: dict[str, Any],
+    guardrails: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     blockers: list[str] = []
     warnings: list[str] = []
+    guardrail_report = safe_dict(guardrails)
     if not validation.get("valid"):
         blockers.extend(str(error) for error in safe_list(validation.get("errors")))
+    if guardrail_report.get("status") == "blocked":
+        blockers.extend(str(item) for item in safe_list(guardrail_report.get("blockers")))
     if str(sandbox.get("status") or "") == "skipped":
         blockers.append("sandbox test skipped because no diff was available")
     if not sandbox.get("patch_applied"):
@@ -2778,12 +2859,16 @@ def build_approval_report(repair: dict[str, Any], validation: dict[str, Any], sa
     if str(sandbox.get("status") or "") == "failed":
         blockers.append("sandbox tests failed")
     warnings.extend(str(item) for item in safe_list(validation.get("warnings")))
+    warnings.extend(str(item) for item in safe_list(guardrail_report.get("warnings")))
+    blockers = unique_strings(blockers)
+    warnings = unique_strings(warnings)
     ready = not blockers
     return {
         "ready_to_approve": ready,
         "decision": "ready_for_human_approval" if ready else "blocked",
         "blockers": blockers,
         "warnings": warnings,
+        "guardrail_status": str(guardrail_report.get("status") or ""),
         "repair_id": repair.get("id"),
         "incident_id": repair.get("incident_id"),
         "checked_files": safe_list(validation.get("checked_files")),
@@ -3351,25 +3436,36 @@ def diff_paths(diff: str) -> list[str]:
 
 
 def is_safe_patch_path(value: str) -> bool:
-    if not is_safe_relative_path(value):
+    if patch_path_guardrail_reason(value):
         return False
-    path = Path(value)
-    parts = {part.lower() for part in path.parts}
-    if parts & SENSITIVE_PATH_PARTS:
-        return False
-    name = path.name.lower()
-    if name in SENSITIVE_FILENAMES:
-        return False
+    path = Path(str(value or "").strip().replace("\\", "/"))
     if path.name in ALLOWED_DIFF_FILENAMES:
         return True
     suffix = path.suffix.lower()
     return suffix in ALLOWED_DIFF_SUFFIXES
 
 
+def patch_path_guardrail_reason(value: str) -> str:
+    if not is_safe_relative_path(value):
+        return "unsafe patch path"
+    path = Path(str(value or "").strip().replace("\\", "/"))
+    parts = {part.lower() for part in path.parts}
+    sensitive_parts = sorted(parts & SENSITIVE_PATH_PARTS)
+    if sensitive_parts:
+        return f"sensitive path segment {sensitive_parts[0]}"
+    name = path.name.lower()
+    if name in SENSITIVE_FILENAMES:
+        return "sensitive file"
+    if path.suffix.lower() in SENSITIVE_FILE_SUFFIXES:
+        return "sensitive file suffix"
+    return ""
+
+
 def is_safe_relative_path(value: str) -> bool:
-    if not value:
+    path_text = str(value or "").strip().replace("\\", "/")
+    if not path_text:
         return False
-    path = Path(value)
+    path = Path(path_text)
     if path.is_absolute():
         return False
     return ".." not in path.parts

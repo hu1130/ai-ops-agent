@@ -637,8 +637,97 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual("test_passed", tested["status"])
         self.assertTrue(tested["test_result"]["sandbox"]["patch_applied"])
         self.assertEqual("passed", tested["test_result"]["sandbox"]["status"])
+        self.assertEqual("passed", tested["test_result"]["guardrails"]["status"])
+        self.assertEqual("passed", tested["test_result"]["approval_report"]["guardrail_status"])
         self.assertTrue(tested["test_result"]["approval_report"]["ready_to_approve"])
         self.assertEqual("old\n", original_content)
+
+    def test_sandbox_guardrails_block_unsafe_test_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    }
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+
+            tested = sandbox_test_ai_repair_proposal(
+                storage,
+                proposal["id"],
+                repo,
+                actor="tester",
+                commands=["rm -rf ."],
+            )
+            storage.close()
+
+        self.assertEqual("test_failed", tested["status"])
+        self.assertEqual("blocked", tested["test_result"]["guardrails"]["status"])
+        self.assertFalse(tested["test_result"]["approval_report"]["ready_to_approve"])
+        self.assertTrue(
+            any("unsafe test command" in item for item in tested["test_result"]["approval_report"]["blockers"])
+        )
+
+    def test_sandbox_guardrails_block_sensitive_file_patches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            (repo / ".env").write_text("TOKEN=old\n", encoding="utf-8")
+            response = sandbox_patch_response()
+            response["patch"]["diff"] = (
+                "diff --git a/.env b/.env\n"
+                "--- a/.env\n"
+                "+++ b/.env\n"
+                "@@ -1 +1 @@\n"
+                "-TOKEN=old\n"
+                "+TOKEN=new\n"
+            )
+            response["patch"]["files"] = [{"path": ".env", "change_type": "modify", "reason": "unsafe secret edit"}]
+            response["test_plan"]["commands"] = ["python -m py_compile tests/test_sample.py"]
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": response,
+                        }
+                    }
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+
+            tested = sandbox_test_ai_repair_proposal(storage, proposal["id"], repo, actor="tester")
+            env_content = (repo / ".env").read_text(encoding="utf-8")
+            storage.close()
+
+        self.assertEqual("test_failed", tested["status"])
+        self.assertEqual("blocked", tested["test_result"]["guardrails"]["status"])
+        self.assertFalse(tested["test_result"]["sandbox"]["patch_applied"])
+        self.assertFalse(tested["test_result"]["approval_report"]["ready_to_approve"])
+        self.assertTrue(any("sensitive file" in item for item in tested["test_result"]["approval_report"]["blockers"]))
+        self.assertEqual("TOKEN=old\n", env_content)
 
     def test_ai_repair_approval_queue_tracks_human_review_next_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
