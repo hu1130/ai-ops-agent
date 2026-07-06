@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from ops_agent.ai.repair import (
+    ai_repair_approval_queue,
     build_ai_repair_proposal,
     deploy_ai_repair_after_merge,
     dry_run_ai_repair_proposal,
@@ -143,6 +144,47 @@ class AiRepairTest(unittest.TestCase):
         self.assertIn("ai_repair.propose", {row["operation"] for row in audit})
         self.assertIn("ai_repair.dry_run", {row["operation"] for row in audit})
         self.assertIn("ai_repair.approve", {row["operation"] for row in audit})
+
+    def test_ai_repair_dashboard_api_returns_approval_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "app": {"name": "ops"},
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    },
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+            dry_run_ai_repair_proposal(storage, proposal["id"], actor="tester")
+            sandbox_test_ai_repair_proposal(storage, proposal["id"], repo, actor="tester")
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                queue = get_json(f"http://{host}:{port}/api/ai-repairs/approval-queue")
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("ai_repair_approval_queue", queue["mode"])
+        self.assertEqual(1, queue["summary"]["ready_for_approval"])
+        self.assertEqual("ready_for_approval", queue["items"][0]["queue_state"])
+        self.assertEqual("approve", queue["items"][0]["next_action"]["type"])
+        self.assertEqual(incident_id, queue["items"][0]["incident"]["id"])
 
     def test_model_repair_uses_openai_compatible_mock_response(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -525,6 +567,49 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual("passed", tested["test_result"]["sandbox"]["status"])
         self.assertTrue(tested["test_result"]["approval_report"]["ready_to_approve"])
         self.assertEqual("old\n", original_content)
+
+    def test_ai_repair_approval_queue_tracks_human_review_next_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    }
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+            dry_run_ai_repair_proposal(storage, proposal["id"], actor="tester")
+
+            needs_sandbox = ai_repair_approval_queue(storage)
+            sandbox_test_ai_repair_proposal(storage, proposal["id"], repo, actor="tester")
+            ready = ai_repair_approval_queue(storage)
+            storage.update_ai_repair_proposal_status(proposal["id"], "approved", actor="tester")
+            approved = ai_repair_approval_queue(storage)
+            storage.close()
+
+        self.assertEqual("needs_sandbox", needs_sandbox["items"][0]["queue_state"])
+        self.assertEqual("sandbox-test", needs_sandbox["items"][0]["next_action"]["type"])
+        self.assertFalse(needs_sandbox["items"][0]["can_approve"])
+        self.assertEqual("ready_for_approval", ready["items"][0]["queue_state"])
+        self.assertEqual(1, ready["summary"]["ready_for_approval"])
+        self.assertTrue(ready["items"][0]["can_approve"])
+        self.assertEqual("approve", ready["items"][0]["next_action"]["type"])
+        self.assertEqual("approved_needs_branch", approved["items"][0]["queue_state"])
+        self.assertTrue(approved["items"][0]["can_prepare_branch"])
+        self.assertEqual("prepare-branch", approved["items"][0]["next_action"]["type"])
 
     def test_ai_repair_pipeline_stops_at_human_approval_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

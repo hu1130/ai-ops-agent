@@ -33,6 +33,7 @@ from ops_agent.ai.config_patches import (
 )
 from ops_agent.ai.learning_review import build_learning_optimization_draft
 from ops_agent.ai.repair import (
+    ai_repair_approval_queue,
     build_ai_repair_proposal,
     deploy_ai_repair_after_merge,
     dry_run_ai_repair_proposal,
@@ -119,6 +120,9 @@ def start_dashboard(
                 return
             if path == "/api/ai-repairs":
                 self.send_json(storage.latest_ai_repair_proposals(**ai_repair_filters_from_query(query)))
+                return
+            if path == "/api/ai-repairs/approval-queue":
+                self.send_json(ai_repair_approval_queue(storage, **ai_repair_queue_filters_from_query(query)))
                 return
             if path == "/api/config":
                 if config is None:
@@ -1446,6 +1450,16 @@ def ai_repair_filters_from_query(query: dict[str, list[str]]) -> dict:
     }
 
 
+def ai_repair_queue_filters_from_query(query: dict[str, list[str]]) -> dict:
+    return {
+        "limit": query_limit(query, default=50, maximum=200),
+        "statuses": query_statuses(query),
+        "include_done": bool(query_optional_bool(query, "include_done")),
+        "risk": query_text(query, "risk"),
+        "model_provider": query_text(query, "model_provider"),
+    }
+
+
 def query_text(query: dict[str, list[str]], key: str) -> str:
     values = query.get(key, [])
     return str(values[0]).strip() if values else ""
@@ -2015,6 +2029,7 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/learning/recommendations": ("learning.recommendation.list", "learning", None),
         "/api/learning/summary": ("learning.summary", "learning", None),
         "/api/ai-repairs": ("ai_repair.list", "ai_repair", None),
+        "/api/ai-repairs/approval-queue": ("ai_repair.approval_queue", "ai_repair", None),
         "/api/ops/metrics": ("ops.metrics", "ops", None),
         "/api/ops/report": ("ops.report", "ops", None),
         "/api/remediation/audit": ("remediation.audit", "remediation", None),

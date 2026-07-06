@@ -107,6 +107,23 @@ DEFAULT_AI_REPAIR_POLICY = {
     "allowed_patch_types": ["unified_diff"],
     "require_human_approval_risks": ["medium", "high", "critical"],
 }
+AI_REPAIR_QUEUE_ACTIVE_STATUSES = [
+    "proposed",
+    "dry_run_failed",
+    "dry_run_passed",
+    "test_failed",
+    "test_not_run",
+    "test_passed",
+    "approved",
+    "branch_failed",
+    "branch_prepared",
+    "pr_failed",
+    "pr_created",
+    "merge_pending",
+    "deploy_failed",
+    "rollback_failed",
+]
+AI_REPAIR_QUEUE_DONE_STATUSES = ["deployed", "rollback_succeeded", "rejected"]
 
 
 def build_ai_repair_proposal(
@@ -125,6 +142,229 @@ def build_ai_repair_proposal(
     context = proposal_context(incident, diagnosis, recommendations, actions, config, request)
     proposal = model_based_repair(context) if should_use_model(context) else rule_based_repair(context)
     return storage.save_ai_repair_proposal(incident_id, proposal)
+
+
+def ai_repair_approval_queue(
+    storage: Storage,
+    limit: int = 50,
+    statuses: list[str] | None = None,
+    include_done: bool = False,
+    risk: str = "",
+    model_provider: str = "",
+) -> dict[str, Any]:
+    requested_statuses = [str(status).strip() for status in safe_list(statuses) if str(status).strip()]
+    effective_statuses = requested_statuses or (None if include_done else AI_REPAIR_QUEUE_ACTIVE_STATUSES)
+    repairs = storage.latest_ai_repair_proposals(
+        limit=limit,
+        statuses=effective_statuses,
+        risk=risk,
+        model_provider=model_provider,
+    )
+    items = [ai_repair_approval_queue_item(storage, repair) for repair in repairs]
+    by_state: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    by_risk: dict[str, int] = {}
+    for item in items:
+        by_state[str(item.get("queue_state") or "unknown")] = by_state.get(str(item.get("queue_state") or "unknown"), 0) + 1
+        by_status[str(item.get("status") or "unknown")] = by_status.get(str(item.get("status") or "unknown"), 0) + 1
+        by_risk[str(item.get("risk") or "unknown")] = by_risk.get(str(item.get("risk") or "unknown"), 0) + 1
+    return {
+        "mode": "ai_repair_approval_queue",
+        "summary": {
+            "total": len(items),
+            "ready_for_approval": sum(1 for item in items if item.get("can_approve")),
+            "needs_sandbox": sum(1 for item in items if item.get("queue_state") == "needs_sandbox"),
+            "blocked": sum(1 for item in items if item.get("queue_state") == "blocked"),
+            "review_only": sum(1 for item in items if item.get("queue_state") == "review_only"),
+            "by_state": by_state,
+            "by_status": by_status,
+            "by_risk": by_risk,
+        },
+        "filters": {
+            "limit": limit,
+            "statuses": effective_statuses or [],
+            "include_done": include_done,
+            "risk": risk,
+            "model_provider": model_provider,
+        },
+        "items": items,
+    }
+
+
+def ai_repair_approval_queue_item(storage: Storage, repair: dict[str, Any]) -> dict[str, Any]:
+    repair_id = safe_int(repair.get("id"))
+    incident_id = safe_int(repair.get("incident_id"))
+    incident = storage.get_incident(incident_id) if incident_id else None
+    state = ai_repair_queue_state(repair)
+    patch = safe_dict(repair.get("patch"))
+    dry_run = safe_dict(repair.get("dry_run"))
+    test_result = safe_dict(repair.get("test_result"))
+    approval_report = safe_dict(test_result.get("approval_report"))
+    controlled_apply = safe_dict(test_result.get("controlled_apply"))
+    pull_request = safe_dict(test_result.get("pull_request"))
+    deploy_result = safe_dict(test_result.get("deploy_result"))
+    return {
+        "id": repair_id,
+        "incident_id": incident_id,
+        "status": str(repair.get("status") or ""),
+        "queue_state": state["queue_state"],
+        "risk": str(repair.get("risk") or ""),
+        "title": str(repair.get("title") or ""),
+        "summary": str(repair.get("summary") or ""),
+        "model_provider": str(repair.get("model_provider") or ""),
+        "model_name": str(repair.get("model_name") or ""),
+        "created_at": str(repair.get("created_at") or ""),
+        "updated_at": str(repair.get("updated_at") or ""),
+        "incident": public_queue_incident(incident or {}),
+        "patch": {
+            "patch_type": str(patch.get("patch_type") or ""),
+            "apply_mode": str(patch.get("apply_mode") or ""),
+            "has_diff": bool(str(patch.get("diff") or "").strip()),
+            "file_count": len(safe_list(patch.get("files"))),
+            "files": [
+                str(safe_dict(item).get("path") or "")
+                for item in safe_list(patch.get("files"))
+                if str(safe_dict(item).get("path") or "")
+            ],
+        },
+        "dry_run": {
+            "valid": bool(dry_run.get("valid")),
+            "mutates_files": bool(dry_run.get("mutates_files")),
+            "errors": [str(item) for item in safe_list(dry_run.get("errors"))],
+            "warnings": [str(item) for item in safe_list(dry_run.get("warnings"))],
+            "checked_files": [str(item) for item in safe_list(dry_run.get("checked_files"))],
+        },
+        "test": {
+            "status": str(test_result.get("status") or ""),
+            "error": str(test_result.get("error") or ""),
+            "approval_ready": bool(approval_report.get("ready_to_approve")),
+            "approval_decision": str(approval_report.get("decision") or ""),
+            "sandbox_status": str(safe_dict(test_result.get("sandbox")).get("status") or ""),
+            "controlled_branch_ready": bool(controlled_apply.get("ready_for_pr")),
+            "pull_request_ready": bool(pull_request.get("ready_for_review")),
+            "deploy_status": str(deploy_result.get("status") or ""),
+        },
+        "blockers": state["blockers"],
+        "warnings": state["warnings"],
+        "can_approve": state["can_approve"],
+        "can_prepare_branch": state["can_prepare_branch"],
+        "can_create_pr": state["can_create_pr"],
+        "can_deploy": state["can_deploy"],
+        "next_action": state["next_action"],
+    }
+
+
+def ai_repair_queue_state(repair: dict[str, Any]) -> dict[str, Any]:
+    repair_id = safe_int(repair.get("id"))
+    status = str(repair.get("status") or "proposed")
+    patch = safe_dict(repair.get("patch"))
+    dry_run = safe_dict(repair.get("dry_run"))
+    test_result = safe_dict(repair.get("test_result"))
+    approval_report = safe_dict(test_result.get("approval_report"))
+    controlled_apply = safe_dict(test_result.get("controlled_apply"))
+    has_diff = bool(str(patch.get("diff") or "").strip())
+    approval_ready = bool(approval_report.get("ready_to_approve"))
+    blockers = unique_strings(
+        [
+            *[str(item) for item in safe_list(dry_run.get("errors"))],
+            *[str(item) for item in safe_list(approval_report.get("blockers"))],
+            str(test_result.get("error") or ""),
+        ]
+    )
+    warnings = unique_strings(
+        [
+            *[str(item) for item in safe_list(dry_run.get("warnings"))],
+            *[str(item) for item in safe_list(approval_report.get("warnings"))],
+        ]
+    )
+    queue_state = "unknown"
+    next_action: dict[str, Any] = {}
+    can_approve = False
+    can_prepare_branch = False
+    can_create_pr = False
+    can_deploy = False
+
+    if status == "proposed":
+        queue_state = "needs_dry_run"
+        next_action = action_descriptor(repair_id, "dry-run", "Run dry-run validation")
+    elif status == "dry_run_failed":
+        queue_state = "blocked"
+    elif status == "dry_run_passed":
+        if has_diff:
+            queue_state = "needs_sandbox"
+            next_action = action_descriptor(repair_id, "sandbox-test", "Run sandbox test")
+        else:
+            queue_state = "review_only"
+            warnings = unique_strings([*warnings, "No patch diff was generated; review the guidance manually."])
+    elif status in {"test_failed", "branch_failed", "pr_failed", "deploy_failed", "rollback_failed"}:
+        queue_state = "blocked"
+    elif status == "test_not_run":
+        queue_state = "needs_sandbox"
+        next_action = action_descriptor(repair_id, "sandbox-test", "Run sandbox test")
+    elif status == "test_passed":
+        if approval_ready and has_diff:
+            queue_state = "ready_for_approval"
+            can_approve = True
+            next_action = action_descriptor(repair_id, "approve", "Approve repair")
+        else:
+            queue_state = "blocked"
+            if not has_diff:
+                blockers = unique_strings([*blockers, "patch has no unified diff to approve"])
+            if not approval_ready:
+                blockers = unique_strings([*blockers, "approval report is not ready"])
+    elif status == "approved":
+        if approval_ready and has_diff:
+            queue_state = "approved_needs_branch"
+            can_prepare_branch = True
+            next_action = action_descriptor(repair_id, "prepare-branch", "Prepare controlled branch")
+        else:
+            queue_state = "approved_manual_review"
+            warnings = unique_strings([*warnings, "Approved repair cannot prepare a branch without a ready patch."])
+    elif status == "branch_prepared":
+        queue_state = "ready_for_pr"
+        can_create_pr = bool(controlled_apply.get("ready_for_pr"))
+        next_action = action_descriptor(repair_id, "create-pr", "Create pull request") if can_create_pr else {}
+    elif status == "pr_created":
+        queue_state = "waiting_for_merge"
+        warnings = unique_strings([*warnings, "Pull request exists; merge it before deployment verification."])
+    elif status == "merge_pending":
+        queue_state = "ready_for_deploy"
+        can_deploy = True
+        next_action = action_descriptor(repair_id, "deploy-merged", "Verify merged deployment")
+    elif status in AI_REPAIR_QUEUE_DONE_STATUSES:
+        queue_state = "done"
+
+    return {
+        "queue_state": queue_state,
+        "blockers": blockers,
+        "warnings": warnings,
+        "can_approve": can_approve,
+        "can_prepare_branch": can_prepare_branch,
+        "can_create_pr": can_create_pr,
+        "can_deploy": can_deploy,
+        "next_action": next_action,
+    }
+
+
+def action_descriptor(repair_id: int, action: str, label: str) -> dict[str, Any]:
+    return {
+        "type": action,
+        "label": label,
+        "method": "POST",
+        "path": f"/api/ai-repairs/{repair_id}/{action}",
+    }
+
+
+def public_queue_incident(incident: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": safe_int(incident.get("id")),
+        "status": str(incident.get("status") or ""),
+        "severity": str(incident.get("severity") or ""),
+        "title": str(incident.get("title") or ""),
+        "environment": str(incident.get("environment") or ""),
+        "run_type": str(incident.get("run_type") or ""),
+        "last_summary": str(incident.get("last_summary") or ""),
+    }
 
 
 def run_ai_repair_pipeline_for_incident(
@@ -2609,6 +2849,18 @@ def unique_strings(values: list[Any]) -> list[str]:
 
 def string_list(value: Any) -> list[str]:
     return [str(item) for item in safe_list(value) if str(item).strip()]
+
+
+def unique_strings(values: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
 
 
 def ai_repair_policy_from_config(config: AppConfig | None, project: dict[str, Any] | None = None) -> dict[str, Any]:
