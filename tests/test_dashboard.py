@@ -657,8 +657,18 @@ class DashboardTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")
             result = CheckResult(source="json_api", name="AI", status="warning", summary="Slow")
+            storage.save_results([result])
             incident_id = storage.save_incident("warning", "Ops Agent detected 1 issue(s)", "analysis", [result])
             storage.escalate_incident(incident_id, 1, "failed remediation", metadata={"rule": "test"})
+            storage.save_incident_diagnosis(
+                incident_id,
+                {
+                    "context": {"environment": "prod", "run_type": "normal"},
+                    "probable_causes": [{"category": "performance_degraded", "confidence": 0.74}],
+                    "next_decision": {"action": "collect_targeted_evidence"},
+                    "evidence": {"signals": ["json_api/AI slow"]},
+                },
+            )
             storage.save_incident_recommendations(
                 incident_id,
                 [
@@ -710,6 +720,17 @@ class DashboardTest(unittest.TestCase):
                 channels=["email"],
                 incident_id=incident_id,
             )
+            change = storage.save_change_event(
+                {
+                    "title": "Deploy AI customer service config",
+                    "source": "config_center",
+                    "change_type": "config",
+                    "project_id": "ai-service",
+                    "actor": "tester",
+                    "related_incident_id": incident_id,
+                    "risk": "medium",
+                }
+            )
             server = start_dashboard(storage, "127.0.0.1", 0)
             host, port = server.server_address
             try:
@@ -728,6 +749,11 @@ class DashboardTest(unittest.TestCase):
                     timeout=5,
                 ) as response:
                     recommendations = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/timeline?hours=24",
+                    timeout=5,
+                ) as response:
+                    timeline = json.loads(response.read().decode("utf-8"))
             finally:
                 server.shutdown()
                 server.server_close()
@@ -740,6 +766,7 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(2, detail["summary"]["action_count"])
         self.assertEqual(1, detail["summary"]["failed_action_count"])
         self.assertEqual(1, detail["summary"]["notification_count"])
+        self.assertEqual(detail["summary"]["timeline_count"], detail["timeline"]["summary"]["total"])
         self.assertEqual("failed remediation", detail["incident"]["escalation_reason"])
         self.assertEqual("check_port", detail["recommendations"][0]["action_type"])
         self.assertEqual(notification_id, detail["notifications"][0]["id"])
@@ -749,6 +776,17 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("check_port", recommendations[0]["action_type"])
         self.assertEqual(1, len(failed_actions))
         self.assertEqual(incident_id, failed_actions[0]["incident_id"])
+        kinds = {entry["kind"] for entry in timeline["entries"]}
+        self.assertIn("incident", kinds)
+        self.assertIn("check_result", kinds)
+        self.assertIn("incident_event", kinds)
+        self.assertIn("diagnosis", kinds)
+        self.assertIn("recommendation", kinds)
+        self.assertIn("action", kinds)
+        self.assertIn("notification", kinds)
+        self.assertIn("change_event", kinds)
+        self.assertEqual(1, timeline["change_correlation"]["related_count"])
+        self.assertEqual(change["id"], timeline["change_correlation"]["related_changes"][0]["id"])
 
     def test_escalated_and_failed_action_list_apis(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

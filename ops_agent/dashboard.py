@@ -283,6 +283,17 @@ def start_dashboard(
                     except ValueError as exc:
                         self.send_json({"error": str(exc)}, status=404)
                     return
+                if action == "timeline":
+                    timeline = storage.incident_timeline(
+                        incident_id,
+                        hours=query_hours(query),
+                        limit=query_limit(query, default=200, maximum=1000),
+                    )
+                    if not timeline:
+                        self.send_json({"error": "incident not found"}, status=404)
+                        return
+                    self.send_json(timeline)
+                    return
                 if action == "changes":
                     incident = storage.get_incident(incident_id)
                     if not incident:

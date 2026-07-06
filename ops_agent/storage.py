@@ -1120,6 +1120,7 @@ class Storage:
         actions = self.latest_action_logs(100, incident_id=incident_id)
         failed_actions = self.latest_failed_action_logs(100, incident_id=incident_id)
         notifications = self.latest_notification_logs(100, incident_id=incident_id)
+        timeline = self.incident_timeline(incident_id)
         return {
             "incident": incident,
             "events": events,
@@ -1130,6 +1131,7 @@ class Storage:
             "actions": actions,
             "failed_actions": failed_actions,
             "notifications": notifications,
+            "timeline": timeline,
             "summary": {
                 "is_escalated": int(incident.get("escalation_level") or 0) > 0,
                 "escalation_level": int(incident.get("escalation_level") or 0),
@@ -1140,9 +1142,197 @@ class Storage:
                 "action_count": len(actions),
                 "failed_action_count": len(failed_actions),
                 "notification_count": len(notifications),
+                "timeline_count": len(timeline.get("entries", [])) if timeline else 0,
                 "status": incident.get("status", ""),
                 "severity": incident.get("severity", ""),
             },
+        }
+
+    def incident_timeline(self, incident_id: int, hours: int = 24, limit: int = 200) -> dict | None:
+        incident = self.get_incident(incident_id)
+        if not incident:
+            return None
+        bounded_hours = max(1, int(hours or 24))
+        bounded_limit = min(max(int(limit or 200), 1), 1000)
+        occurred_at = (
+            parse_iso_datetime(incident.get("last_seen_at"))
+            or parse_iso_datetime(incident.get("updated_at"))
+            or parse_iso_datetime(incident.get("created_at"))
+            or datetime.now(timezone.utc)
+        )
+        since = occurred_at - timedelta(hours=bounded_hours)
+        since_iso = since.isoformat()
+        environment = str(incident.get("environment") or "prod")
+        run_type = str(incident.get("run_type") or "normal")
+        targets = incident_result_targets(incident)
+        entries: list[dict] = [
+            timeline_entry(
+                "incident",
+                incident.get("created_at"),
+                str(incident.get("title") or f"Incident #{incident_id}"),
+                str(incident.get("last_summary") or incident.get("analysis") or ""),
+                status=str(incident.get("status") or ""),
+                severity=str(incident.get("severity") or ""),
+                source_id=f"incident:{incident_id}",
+                payload={
+                    "id": incident_id,
+                    "classification_category": incident.get("classification_category") or "",
+                    "classification_confidence": incident.get("classification_confidence") or 0,
+                    "occurrence_count": incident.get("occurrence_count") or 1,
+                },
+            )
+        ]
+
+        for row in self.recent_results_for_targets(since_iso, environment, run_type, targets, limit=bounded_limit):
+            entries.append(
+                timeline_entry(
+                    "check_result",
+                    row.get("created_at"),
+                    f"{row.get('source')}/{row.get('name')}",
+                    str(row.get("summary") or ""),
+                    status=str(row.get("status") or ""),
+                    severity=str(row.get("status") or ""),
+                    source=str(row.get("source") or ""),
+                    source_id=f"check_result:{row.get('id')}",
+                    payload={
+                        "id": row.get("id"),
+                        "name": row.get("name"),
+                        "trace_id": row.get("trace_id"),
+                        "details": parse_json_object(str(row.get("details_json") or "{}")),
+                    },
+                )
+            )
+
+        for row in self.latest_incident_events(incident_id, limit=bounded_limit):
+            entries.append(
+                timeline_entry(
+                    "incident_event",
+                    row.get("created_at"),
+                    f"{row.get('from_status')} -> {row.get('to_status')}",
+                    str(row.get("note") or ""),
+                    status=str(row.get("to_status") or ""),
+                    source_id=f"incident_event:{row.get('id')}",
+                    payload={
+                        **row,
+                        "metadata": parse_json_object(str(row.get("metadata_json") or "{}")),
+                    },
+                )
+            )
+
+        for row in self.latest_incident_comments(incident_id, limit=bounded_limit):
+            entries.append(
+                timeline_entry(
+                    "comment",
+                    row.get("created_at"),
+                    f"Comment by {row.get('actor') or 'operator'}",
+                    str(row.get("comment") or ""),
+                    source_id=f"comment:{row.get('id')}",
+                    payload={
+                        **row,
+                        "metadata": parse_json_object(str(row.get("metadata_json") or "{}")),
+                    },
+                )
+            )
+
+        for row in self.latest_incident_diagnoses(incident_id, limit=bounded_limit):
+            entries.append(
+                timeline_entry(
+                    "diagnosis",
+                    row.get("created_at"),
+                    f"Diagnosis: {row.get('top_category') or 'unknown'}",
+                    f"confidence={row.get('top_confidence')}; next={row.get('next_decision')}",
+                    status=str(row.get("next_decision") or ""),
+                    source_id=f"diagnosis:{row.get('id')}",
+                    payload=row,
+                )
+            )
+
+        for row in self.latest_incident_recommendations(incident_id, limit=bounded_limit):
+            entries.append(
+                timeline_entry(
+                    "recommendation",
+                    row.get("created_at"),
+                    str(row.get("title") or row.get("action_type") or "Recommendation"),
+                    str(row.get("reason") or ""),
+                    status=str(row.get("status") or ""),
+                    severity=str(row.get("risk") or ""),
+                    source=str(row.get("source") or ""),
+                    source_id=f"recommendation:{row.get('id')}",
+                    payload=row,
+                )
+            )
+
+        for row in self.latest_action_logs(bounded_limit, incident_id=incident_id):
+            entries.append(
+                timeline_entry(
+                    "action",
+                    row.get("created_at"),
+                    str(row.get("title") or row.get("action_type") or "Action"),
+                    str(row.get("error") or row.get("output") or row.get("reason") or ""),
+                    status=str(row.get("status") or ""),
+                    severity=str(row.get("risk") or ""),
+                    source=str(row.get("action_type") or ""),
+                    source_id=f"action:{row.get('id')}",
+                    payload={
+                        **row,
+                        "params": parse_json_object(str(row.get("params_json") or "{}")),
+                    },
+                )
+            )
+
+        for row in self.latest_notification_logs(bounded_limit, incident_id=incident_id):
+            entries.append(
+                timeline_entry(
+                    "notification",
+                    row.get("created_at"),
+                    str(row.get("title") or "Notification"),
+                    str(row.get("error") or row.get("suppressed_reason") or row.get("dedupe_key") or ""),
+                    status=str(row.get("status") or ""),
+                    severity=str(row.get("severity") or ""),
+                    source_id=f"notification:{row.get('id')}",
+                    payload={
+                        **row,
+                        "route_names": parse_json_list(str(row.get("route_names_json") or "[]")),
+                        "channels": parse_json_list(str(row.get("channels_json") or "[]")),
+                        "metadata": parse_json_object(str(row.get("metadata_json") or "{}")),
+                    },
+                )
+            )
+
+        change_correlation = self.correlate_incident_changes(incident, hours=bounded_hours, limit=20)
+        for row in change_correlation.get("related_changes", []):
+            entries.append(
+                timeline_entry(
+                    "change_event",
+                    row.get("created_at"),
+                    str(row.get("title") or "Change event"),
+                    str(row.get("summary") or row.get("change_type") or ""),
+                    status=str(row.get("status") or ""),
+                    severity=str(row.get("risk") or ""),
+                    source=str(row.get("source") or ""),
+                    source_id=f"change_event:{row.get('id')}",
+                    payload=row,
+                    extra={
+                        "correlation_score": row.get("correlation_score"),
+                        "correlation_reasons": row.get("correlation_reasons") or [],
+                    },
+                )
+            )
+
+        entries = [entry for entry in entries if entry.get("occurred_at")]
+        entries.sort(key=lambda entry: (str(entry.get("occurred_at") or ""), timeline_kind_rank(str(entry.get("kind") or "")), str(entry.get("source_id") or "")))
+        limited_entries = entries[:bounded_limit]
+        return {
+            "incident_id": incident_id,
+            "window": {
+                "hours": bounded_hours,
+                "since": since_iso,
+                "anchor": occurred_at.isoformat(),
+            },
+            "targets": [{"source": source, "name": name} for source, name in sorted(targets)],
+            "summary": timeline_summary(limited_entries),
+            "change_correlation": change_correlation,
+            "entries": limited_entries,
         }
 
     def save_change_event(self, event: dict) -> dict:
@@ -2988,6 +3178,36 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def recent_results_for_targets(
+        self,
+        since_iso: str,
+        environment: str,
+        run_type: str,
+        targets: set[tuple[str, str]],
+        limit: int = 200,
+    ) -> list[dict]:
+        if not targets:
+            return []
+        with self.lock:
+            where, params = context_where(environment, run_type)
+            where.append("created_at >= ?")
+            params.append(since_iso)
+            target_clauses = []
+            for source, name in sorted(targets):
+                target_clauses.append("(source = ? and name = ?)")
+                params.extend([source, name])
+            where.append(f"({' or '.join(target_clauses)})")
+            rows = self.connection.execute(
+                f"""
+                select * from check_results
+                where {' and '.join(where)}
+                order by created_at asc, id asc
+                limit ?
+                """,
+                (*params, min(max(int(limit or 200), 1), 1000)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def recent_incidents(
         self,
         since_iso: str,
@@ -3702,6 +3922,81 @@ def score_change_event_for_incident(
         score += 0.12
         reasons.append("change_status_not_clean")
     return min(score, 1.0), reasons
+
+
+TIMELINE_KIND_ORDER = {
+    "change_event": 0,
+    "check_result": 1,
+    "incident": 2,
+    "incident_event": 3,
+    "diagnosis": 4,
+    "recommendation": 5,
+    "action": 6,
+    "notification": 7,
+    "comment": 8,
+}
+
+
+def timeline_kind_rank(kind: str) -> int:
+    return TIMELINE_KIND_ORDER.get(kind, 100)
+
+
+def timeline_entry(
+    kind: str,
+    occurred_at: object,
+    title: str,
+    summary: str = "",
+    status: str = "",
+    severity: str = "",
+    source: str = "",
+    source_id: str = "",
+    payload: dict | None = None,
+    extra: dict | None = None,
+) -> dict:
+    entry = {
+        "kind": kind,
+        "occurred_at": str(occurred_at or ""),
+        "title": title,
+        "summary": summary,
+        "status": status,
+        "severity": severity,
+        "source": source,
+        "source_id": source_id,
+        "payload": safe_dict(payload),
+    }
+    entry.update(safe_dict(extra))
+    return entry
+
+
+def timeline_summary(entries: list[dict]) -> dict:
+    return {
+        "total": len(entries),
+        "by_kind": count_by_key(entries, "kind"),
+        "by_status": count_by_key([entry for entry in entries if entry.get("status")], "status", ""),
+        "first_at": str(entries[0].get("occurred_at") or "") if entries else "",
+        "last_at": str(entries[-1].get("occurred_at") or "") if entries else "",
+    }
+
+
+def incident_result_targets(incident: dict) -> set[tuple[str, str]]:
+    targets: set[tuple[str, str]] = set()
+    for result in parse_json_list(str(incident.get("results_json") or "[]")):
+        if not isinstance(result, dict):
+            continue
+        source = str(result.get("source") or "").strip()
+        name = str(result.get("name") or "").strip()
+        if source and name:
+            targets.add((source, name))
+    fingerprint = str(incident.get("fingerprint") or "")
+    for target_key in fingerprint_target_keys(fingerprint):
+        if "/" not in target_key:
+            continue
+        source, name = target_key.split("/", 1)
+        source = source.strip()
+        name = name.strip()
+        if source and name:
+            targets.add((source, name))
+    return targets
 
 
 def count_by_key(rows: list[dict], key: str, default: str = "unknown") -> dict[str, int]:

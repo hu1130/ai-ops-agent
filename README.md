@@ -240,7 +240,11 @@ GET /api/change-events
 GET /api/change-events?project_id=ops-agent&change_type=deployment
 POST /api/change-events
 GET /api/incidents/1/changes
+GET /api/incidents/1/timeline?hours=24
+GET /api/incidents/1/detail
 ```
+
+事件详情会返回 `timeline`，单独时间线接口也可以直接读取。时间线会把同一事件相关的巡检结果、事件状态变更、诊断、推荐动作、执行动作、通知记录和关联变更按时间排序，便于判断问题是否由最近部署、配置修改或 AI 修复引起。
 
 写入示例：
 ```json
