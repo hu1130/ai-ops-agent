@@ -19,6 +19,7 @@ from ops_agent.config_center import (
     delete_project_config,
     list_config_backups,
     project_config_snapshot,
+    project_repair_readiness_snapshot,
     restore_config_backup,
     update_ai_repair_policy,
     upsert_project_config,
@@ -184,6 +185,12 @@ def start_dashboard(
             if path == "/api/projects/summary":
                 hours = query_hours(query)
                 self.send_json(project_summary_payload(config, storage.context_summaries(hours), hours))
+                return
+            if path == "/api/projects/repair-readiness":
+                if config is None:
+                    self.send_json({"error": "config is not configured"}, status=503)
+                    return
+                self.send_json(project_repair_readiness_snapshot(config))
                 return
             if path == "/api/monitor-targets":
                 self.send_json(list_monitor_targets(config.raw if config else {}))

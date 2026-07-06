@@ -3,12 +3,23 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import shutil
 from typing import Any
 
 from ops_agent.config import AppConfig
-from ops_agent.ai.repair import DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_MODEL_ENDPOINT, normalize_ai_repair_policy
+from ops_agent.ai.repair import (
+    DEEPSEEK_DEFAULT_MODEL,
+    DEEPSEEK_MODEL_ENDPOINT,
+    DEFAULT_TEST_COMMANDS,
+    MODEL_PROVIDERS,
+    build_repository_context,
+    is_safe_test_command,
+    normalize_ai_repair_policy,
+    repair_settings,
+    resolve_repair_repo_root,
+)
 from ops_agent.projects import list_projects
 
 
@@ -106,6 +117,107 @@ def project_config_snapshot(config: AppConfig) -> dict[str, Any]:
     return {
         "projects": list_projects(config),
         "raw_projects": redact_secrets(safe_list(config.raw.get("projects"))),
+    }
+
+
+def project_repair_readiness_snapshot(config: AppConfig) -> dict[str, Any]:
+    repair_config = safe_dict(safe_dict(config.raw.get("ai")).get("repair"))
+    settings = repair_settings({"config": {"repair": repair_config}})
+    provider = str(settings.get("provider") or "rules")
+    api_key_env = str(settings.get("api_key_env") or "")
+    needs_api_key = provider in MODEL_PROVIDERS and provider != "rules"
+    api_key_configured = bool(str(settings.get("api_key") or "").strip()) or bool(
+        os.environ.get(api_key_env, "").strip()
+    )
+    rows = []
+    for project in list_projects(config):
+        rows.append(project_repair_readiness(config, project, repair_config, needs_api_key, api_key_configured))
+    status_counts: dict[str, int] = {}
+    for row in rows:
+        status = str(row.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    return {
+        "model": {
+            "provider": provider,
+            "model": str(settings.get("model") or ""),
+            "api_key_env": api_key_env,
+            "api_key_configured": api_key_configured,
+            "needs_api_key": needs_api_key,
+        },
+        "summary": {
+            "total": len(rows),
+            "by_status": status_counts,
+        },
+        "projects": rows,
+    }
+
+
+def project_repair_readiness(
+    config: AppConfig,
+    project: dict[str, Any],
+    repair_config: dict[str, Any],
+    needs_api_key: bool,
+    api_key_configured: bool,
+) -> dict[str, Any]:
+    repo_root = resolve_repair_repo_root(config, project, {"project_id": project.get("id")}, config.base_dir)
+    repo_exists = repo_root.exists() and repo_root.is_dir()
+    commands = string_list(project.get("test_commands")) or DEFAULT_TEST_COMMANDS
+    unsafe_commands = [command for command in commands if not is_safe_test_command(command)]
+    repository_context = build_repository_context(
+        config,
+        repair_config,
+        {},
+        {},
+        [],
+        project,
+        {"project_id": project.get("id")},
+    )
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if not repo_exists:
+        blockers.append("repo_root not found")
+    if needs_api_key and not api_key_configured:
+        blockers.append("model API key is not configured")
+    if unsafe_commands:
+        blockers.append("unsafe test commands are configured")
+    if not repository_context.get("files"):
+        warnings.append("no repository context files were loaded")
+    if not string_list(project.get("test_commands")):
+        warnings.append("project test_commands is empty; default tests will be used")
+    if not string_list(project.get("repair_context_files")):
+        warnings.append("project repair_context_files is empty; inferred files or tree preview will be used")
+    status = "blocked" if blockers else ("warning" if warnings else "ready")
+    return {
+        "id": str(project.get("id") or ""),
+        "name": str(project.get("name") or project.get("id") or ""),
+        "environment": str(project.get("environment") or ""),
+        "run_types": string_list(project.get("run_types")),
+        "status": status,
+        "blockers": blockers,
+        "warnings": warnings,
+        "repo_root": str(repo_root),
+        "repo_exists": repo_exists,
+        "test_commands": commands,
+        "unsafe_test_commands": unsafe_commands,
+        "health_urls": string_list(project.get("health_urls")),
+        "repair_context": {
+            "enabled": bool(repository_context.get("enabled")),
+            "file_count": len(safe_list(repository_context.get("files"))),
+            "files": [
+                str(item.get("path") or "")
+                for item in safe_list(repository_context.get("files"))
+                if isinstance(item, dict)
+            ],
+            "missing_files": string_list(repository_context.get("missing_files")),
+            "skipped_files": [
+                safe_dict(item)
+                for item in safe_list(repository_context.get("skipped_files"))
+                if isinstance(item, dict)
+            ],
+            "tree_preview_count": len(safe_list(repository_context.get("tree"))),
+            "reason": str(repository_context.get("reason") or ""),
+        },
+        "repair_policy": normalize_ai_repair_policy(safe_dict(project.get("repair_policy"))),
     }
 
 
@@ -257,6 +369,10 @@ def safe_dict(value: Any) -> dict:
 
 def safe_list(value: Any) -> list:
     return list(value) if isinstance(value, list) else []
+
+
+def string_list(value: Any) -> list[str]:
+    return [str(item) for item in safe_list(value) if str(item).strip()]
 
 
 def is_secret_key(key_name: str) -> bool:

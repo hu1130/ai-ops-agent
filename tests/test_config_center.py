@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from ops_agent.config_center import (
     delete_project_config,
     list_config_backups,
     project_config_snapshot,
+    project_repair_readiness_snapshot,
     restore_config_backup,
     update_ai_repair_policy,
     upsert_project_config,
@@ -112,6 +114,61 @@ class ConfigCenterTest(unittest.TestCase):
         self.assertEqual("deepseek-v4-flash", saved["ai"]["repair"]["model"])
         self.assertEqual("deleted", deleted["action"])
         self.assertEqual([], saved["projects"])
+
+    def test_project_repair_readiness_reports_context_and_blockers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "app"
+            repo.mkdir()
+            (repo / "app.py").write_text("def health():\n    return 'ok'\n", encoding="utf-8")
+            (repo / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+            config = load_config(write_config(
+                Path(tmp) / "config.json",
+                {
+                    "app": {"interval_seconds": 60},
+                    "projects": [
+                        {
+                            "id": "app",
+                            "repo_root": str(repo),
+                            "repair_context_files": ["app.py", ".env"],
+                            "test_commands": ["python -m py_compile app.py"],
+                        },
+                        {
+                            "id": "unsafe",
+                            "repo_root": str(repo),
+                            "test_commands": ["rm -rf /tmp/nope"],
+                        },
+                    ],
+                    "ai": {
+                        "repair": {
+                            "provider": "deepseek",
+                            "api_key_env": "UNIT_TEST_DEEPSEEK_KEY",
+                            "repository_context": {"enabled": True},
+                        }
+                    },
+                    "http_checks": [],
+                },
+            ))
+            old_key = os.environ.get("UNIT_TEST_DEEPSEEK_KEY")
+            os.environ["UNIT_TEST_DEEPSEEK_KEY"] = "unit-test-key"
+            try:
+                readiness = project_repair_readiness_snapshot(config)
+            finally:
+                if old_key is None:
+                    os.environ.pop("UNIT_TEST_DEEPSEEK_KEY", None)
+                else:
+                    os.environ["UNIT_TEST_DEEPSEEK_KEY"] = old_key
+
+        by_id = {row["id"]: row for row in readiness["projects"]}
+        self.assertTrue(readiness["model"]["api_key_configured"])
+        self.assertEqual("ready", by_id["app"]["status"])
+        self.assertEqual(["app.py"], by_id["app"]["repair_context"]["files"])
+        self.assertTrue(any(item["path"] == ".env" for item in by_id["app"]["repair_context"]["skipped_files"]))
+        self.assertEqual("blocked", by_id["unsafe"]["status"])
+        self.assertIn("unsafe test commands are configured", by_id["unsafe"]["blockers"])
+
+def write_config(path: Path, payload: dict) -> Path:
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
 
 
 if __name__ == "__main__":

@@ -69,6 +69,9 @@ class DashboardTest(unittest.TestCase):
     def test_projects_api_returns_project_summaries_and_context_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            (repo / "app.py").write_text("print('ok')\n", encoding="utf-8")
             prod = CheckResult(
                 source="http",
                 name="Prod Site",
@@ -90,8 +93,23 @@ class DashboardTest(unittest.TestCase):
             config = AppConfig(
                 raw={
                     "app": {"name": "ops", "environment": "prod", "run_type": "normal"},
+                    "ai": {
+                        "repair": {
+                            "provider": "deepseek",
+                            "api_key": "unit-test-key",
+                            "repository_context": {"enabled": True},
+                        }
+                    },
                     "projects": [
-                        {"id": "prod", "name": "Production", "environment": "prod", "run_types": ["normal"]},
+                        {
+                            "id": "prod",
+                            "name": "Production",
+                            "environment": "prod",
+                            "run_types": ["normal"],
+                            "repo_root": str(repo),
+                            "repair_context_files": ["app.py"],
+                            "test_commands": ["python -m py_compile app.py"],
+                        },
                         {
                             "id": "staging",
                             "name": "Staging",
@@ -110,6 +128,8 @@ class DashboardTest(unittest.TestCase):
                     projects = json.loads(response.read().decode("utf-8"))
                 with urllib.request.urlopen(f"http://{host}:{port}/api/projects/summary", timeout=5) as response:
                     summary = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(f"http://{host}:{port}/api/projects/repair-readiness", timeout=5) as response:
+                    readiness = json.loads(response.read().decode("utf-8"))
                 with urllib.request.urlopen(
                     f"http://{host}:{port}/api/results?environment=staging",
                     timeout=5,
@@ -130,6 +150,9 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("ok", summary_by_id["prod"]["summary"]["current_status"])
         self.assertEqual("critical", summary_by_id["staging"]["summary"]["current_status"])
         self.assertEqual(1, summary_by_id["staging"]["summary"]["incident_count"])
+        readiness_by_id = {row["id"]: row for row in readiness["projects"]}
+        self.assertEqual("ready", readiness_by_id["prod"]["status"])
+        self.assertEqual(["app.py"], readiness_by_id["prod"]["repair_context"]["files"])
         self.assertEqual(["Staging Site"], [row["name"] for row in results])
         self.assertEqual(["Staging down"], [row["title"] for row in incidents])
 

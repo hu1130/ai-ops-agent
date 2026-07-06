@@ -627,6 +627,7 @@ POST /api/config/restore
 GET  /api/config/projects
 POST /api/config/projects/upsert
 POST /api/config/projects/delete
+GET  /api/projects/repair-readiness
 GET  /api/config/ai-repair-policy
 POST /api/config/ai-repair-policy
 POST /api/config/deepseek
@@ -647,6 +648,8 @@ POST /api/ai-repairs/1/deploy-merged
 `POST /api/incidents/{id}/ai-repair/run-pipeline` and `POST /api/ai-repairs/{id}/run-pipeline` run the backend AI repair pipeline: proposal, dry-run, sandbox test, optional auto-approval, optional branch preparation, and optional PR creation. It stops at human approval by default. Optional JSON fields: `commands`, `auto_approve`, `auto_approve_risks`, `prepare_branch`, `create_pr`, `remote`, `base`, `draft`.
 
 Incident-based pipeline runs are project-aware. The agent selects the project by `project_id` from the request, or by the incident `environment` and `run_type`. Project `repo_root`, `test_commands`, `git_remote`, `base_branch`, and `repair_policy` override global defaults for that run.
+
+`GET /api/projects/repair-readiness` reports whether each project is ready for AI repair: repository path availability, safe test commands, configured model key, loaded context files, skipped/missing files, and effective repair policy. Use this before allowing DeepSeek to generate patches for a real business project.
 
 Model repair proposals can include bounded repository context so DeepSeek/OpenAI-compatible models can generate concrete reviewable diffs instead of guessing. Configure it globally under `ai.repair.repository_context`, and optionally add project-level `repair_context_files`:
 
