@@ -634,6 +634,8 @@ POST /api/ai-repairs/1/create-pr
 POST /api/ai-repairs/1/deploy-merged
 ```
 
+`POST /api/ai-repairs/{id}/deploy-merged` runs the merged PR deployment, health verification, and automatic rollback on deployment or verification failure. Optional JSON fields: `commands`, `verify_urls`, `rollback_commands`, `rollback_verify_urls`.
+
 Config center behavior:
 
 - `GET /api/config` returns the active config with secrets redacted.

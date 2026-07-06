@@ -256,10 +256,19 @@ def deploy_ai_repair_after_merge(
     base: str = "main",
     commands: list[str] | None = None,
     verify_urls: list[str] | None = None,
+    rollback_commands: list[str] | None = None,
+    rollback_verify_urls: list[str] | None = None,
     assume_merged: bool = False,
 ) -> dict:
     repair = require_ai_repair(storage, repair_id)
-    if str(repair.get("status") or "") not in {"pr_created", "merge_pending", "deploy_failed", "deployed"}:
+    if str(repair.get("status") or "") not in {
+        "pr_created",
+        "merge_pending",
+        "deploy_failed",
+        "rollback_succeeded",
+        "rollback_failed",
+        "deployed",
+    }:
         raise ValueError("AI repair pull request must be created before merged deployment")
     result_payload = safe_dict(repair.get("test_result"))
     pull_request = safe_dict(result_payload.get("pull_request"))
@@ -298,8 +307,18 @@ def deploy_ai_repair_after_merge(
         base=base,
         commands=safe_list(commands) if commands is not None else DEFAULT_DEPLOY_COMMANDS,
         verify_urls=safe_list(verify_urls) if verify_urls is not None else [],
+        rollback_commands=safe_list(rollback_commands) if rollback_commands is not None else None,
+        rollback_verify_urls=safe_list(rollback_verify_urls) if rollback_verify_urls is not None else None,
     )
-    next_status = "deployed" if deploy_result.get("ready") else "deploy_failed"
+    rollback_result = safe_dict(deploy_result.get("rollback"))
+    if deploy_result.get("ready"):
+        next_status = "deployed"
+    elif rollback_result.get("ready"):
+        next_status = "rollback_succeeded"
+    elif rollback_result.get("status") == "failed":
+        next_status = "rollback_failed"
+    else:
+        next_status = "deploy_failed"
     updated_result = {
         **result_payload,
         "status": "passed" if deploy_result.get("ready") else "failed",
@@ -964,15 +983,28 @@ def prepare_patch_branch(
         result["duration_seconds"] = round(time.monotonic() - started, 3)
         return result
     changed_files = git_status_paths(status["stdout"])
-    result["changed_files"] = changed_files
-    if not changed_files:
+    intended_files = [str(path) for path in safe_list(validation.get("checked_files")) if str(path).strip()]
+    result["changed_files"] = intended_files
+    result["worktree_extra_changes"] = sorted(path for path in changed_files if path not in set(intended_files))
+    if not intended_files:
         result["error"] = "patch applied but produced no git changes"
         result["duration_seconds"] = round(time.monotonic() - started, 3)
         return result
 
-    added_files = run_git(["add", "-A"], worktree_dir)
+    added_files = run_git(["add", "--", *intended_files], worktree_dir)
     if added_files["returncode"] != 0:
         result["error"] = f"git add failed: {added_files['stderr'] or added_files['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    staged = run_git(["diff", "--cached", "--name-only"], worktree_dir)
+    if staged["returncode"] != 0:
+        result["error"] = f"git diff --cached failed: {staged['stderr'] or staged['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    staged_files = [line.strip() for line in staged["stdout"].splitlines() if line.strip()]
+    result["changed_files"] = staged_files
+    if not staged_files:
+        result["error"] = "patch applied but no intended files were staged"
         result["duration_seconds"] = round(time.monotonic() - started, 3)
         return result
     committed = run_subprocess(
@@ -1385,6 +1417,8 @@ def deploy_merged_pull_request(
     base: str,
     commands: list[Any],
     verify_urls: list[Any],
+    rollback_commands: list[Any] | None = None,
+    rollback_verify_urls: list[Any] | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     root = repo_root.resolve()
@@ -1394,6 +1428,16 @@ def deploy_merged_pull_request(
     if not requested_commands:
         requested_commands = DEFAULT_DEPLOY_COMMANDS
     verification_targets = [str(item).strip() for item in verify_urls if str(item).strip()]
+    rollback_command_list = (
+        [str(item).strip() for item in rollback_commands if str(item).strip()]
+        if rollback_commands is not None
+        else list(requested_commands)
+    )
+    rollback_targets = (
+        [str(item).strip() for item in rollback_verify_urls if str(item).strip()]
+        if rollback_verify_urls is not None
+        else list(verification_targets)
+    )
     result: dict[str, Any] = {
         "status": "failed",
         "ready": False,
@@ -1405,6 +1449,7 @@ def deploy_merged_pull_request(
         "commands": requested_commands,
         "command_results": [],
         "verification": {"status": "skipped", "targets": []},
+        "rollback": {"status": "not_needed", "ready": False, "reason": ""},
         "output": "",
         "error": "",
     }
@@ -1442,17 +1487,98 @@ def deploy_merged_pull_request(
     command_execution = run_safe_deploy_commands(root, requested_commands)
     result.update(command_execution)
     if command_execution["status"] != "passed":
+        result["rollback"] = rollback_deployment(root, result["before_commit"], rollback_command_list, rollback_targets)
         result["duration_seconds"] = round(time.monotonic() - started, 3)
         return result
 
     verification = verify_deployment_urls(verification_targets)
     result["verification"] = verification
     if verification["status"] != "passed":
+        result["status"] = "failed"
         result["error"] = verification.get("error", "")
+        result["rollback"] = rollback_deployment(root, result["before_commit"], rollback_command_list, rollback_targets)
         result["duration_seconds"] = round(time.monotonic() - started, 3)
         return result
     result.update({"status": "passed", "ready": True, "duration_seconds": round(time.monotonic() - started, 3)})
     return result
+
+
+def rollback_deployment(
+    repo_root: Path,
+    target_commit: str,
+    commands: list[str],
+    verify_urls: list[str],
+) -> dict[str, Any]:
+    started = time.monotonic()
+    result: dict[str, Any] = {
+        "status": "failed",
+        "ready": False,
+        "target_commit": target_commit,
+        "after_commit": "",
+        "commands": commands,
+        "command_results": [],
+        "verification": {"status": "skipped", "targets": []},
+        "output": "",
+        "error": "",
+    }
+    if not target_commit:
+        result["error"] = "rollback target commit is empty"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    blockers = rollback_blockers(repo_root, commands)
+    if blockers:
+        result["error"] = "; ".join(blockers)
+        result["blockers"] = blockers
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    checkout = run_git(["checkout", "--detach", target_commit], repo_root)
+    if checkout["returncode"] != 0:
+        result["error"] = f"git checkout rollback target failed: {checkout['stderr'] or checkout['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    after = run_git(["rev-parse", "HEAD"], repo_root)
+    if after["returncode"] == 0:
+        result["after_commit"] = after["stdout"].strip()
+
+    command_execution = run_safe_deploy_commands(repo_root, commands)
+    result.update(command_execution)
+    if command_execution["status"] != "passed":
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+
+    verification = verify_deployment_urls(verify_urls)
+    result["verification"] = verification
+    if verification["status"] != "passed":
+        result["status"] = "failed"
+        result["error"] = verification.get("error", "")
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+
+    result.update({"status": "passed", "ready": True, "duration_seconds": round(time.monotonic() - started, 3)})
+    return result
+
+
+def rollback_blockers(repo_root: Path, requested_commands: list[str]) -> list[str]:
+    blockers: list[str] = []
+    if not repo_root.exists() or not repo_root.is_dir():
+        blockers.append(f"repo root not found: {repo_root}")
+        return blockers
+    unsafe_command = next((command for command in requested_commands if not is_safe_deploy_command(command)), "")
+    if unsafe_command:
+        blockers.append(f"unsafe rollback command: {unsafe_command}")
+    inside = run_git(["rev-parse", "--is-inside-work-tree"], repo_root)
+    if inside["returncode"] != 0 or inside["stdout"].strip().lower() != "true":
+        blockers.append(f"repo root is not a git work tree: {repo_root}")
+        return blockers
+    tracked_status = run_git(["status", "--porcelain", "--untracked-files=no"], repo_root)
+    if tracked_status["returncode"] != 0:
+        blockers.append(f"git status failed: {tracked_status['stderr'] or tracked_status['stdout']}")
+    elif tracked_status["stdout"].strip():
+        blockers.append("repo has tracked uncommitted changes; rollback requires tracked files to be clean")
+    head = run_git(["rev-parse", "--verify", "HEAD"], repo_root)
+    if head["returncode"] != 0:
+        blockers.append("repo has no HEAD commit for rollback")
+    return blockers
 
 
 def deploy_blockers(repo_root: Path, requested_commands: list[str]) -> list[str]:

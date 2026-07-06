@@ -1626,9 +1626,11 @@ class Storage:
                         when 'pr_created' then 10
                         when 'merge_pending' then 11
                         when 'deploy_failed' then 12
-                        when 'deployed' then 13
-                        when 'rejected' then 14
-                        else 15
+                        when 'rollback_failed' then 13
+                        when 'rollback_succeeded' then 14
+                        when 'deployed' then 15
+                        when 'rejected' then 16
+                        else 17
                     end,
                     updated_at desc,
                     id desc
@@ -1672,6 +1674,8 @@ class Storage:
             "pr_created",
             "merge_pending",
             "deploy_failed",
+            "rollback_failed",
+            "rollback_succeeded",
             "deployed",
             "rejected",
         }

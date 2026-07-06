@@ -568,6 +568,8 @@ def start_dashboard(
                         return
                     commands = body.get("commands")
                     verify_urls = body.get("verify_urls") or body.get("verification_urls")
+                    rollback_commands = body.get("rollback_commands")
+                    rollback_verify_urls = body.get("rollback_verify_urls") or body.get("rollback_verification_urls")
                     updated = deploy_ai_repair_after_merge(
                         storage,
                         repair_id,
@@ -578,8 +580,10 @@ def start_dashboard(
                         base=str(body.get("base") or "main"),
                         commands=commands if isinstance(commands, list) else None,
                         verify_urls=verify_urls if isinstance(verify_urls, list) else None,
+                        rollback_commands=rollback_commands if isinstance(rollback_commands, list) else None,
+                        rollback_verify_urls=rollback_verify_urls if isinstance(rollback_verify_urls, list) else None,
                     )
-                    outcome = "success" if updated.get("status") == "deployed" else "error"
+                    outcome = "success" if updated.get("status") in {"deployed", "rollback_succeeded"} else "error"
                     self.record_audit(path, 200, outcome, "AI repair merged PR deployment checked", actor=actor, auth=auth)
                     self.send_json(updated)
                     return
