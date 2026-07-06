@@ -26,6 +26,9 @@ DEFAULT_MAX_PROMPT_CHARS = 12000
 DEFAULT_MAX_RESPONSE_CHARS = 60000
 DEFAULT_SANDBOX_TEST_TIMEOUT_SECONDS = 120
 DEFAULT_SANDBOX_MAX_OUTPUT_CHARS = 12000
+DEFAULT_GIT_TIMEOUT_SECONDS = 60
+CONTROLLED_BRANCH_PREFIX = "ai-repair"
+CONTROLLED_WORKTREE_SUFFIX = "ai-repair-worktrees"
 MAX_DIFF_CHARS = 80000
 ALLOWED_DIFF_SUFFIXES = {
     ".cfg",
@@ -149,6 +152,46 @@ def sandbox_test_ai_repair_proposal(
         "approval_report": report,
     }
     return record_ai_repair_test_result(storage, repair_id, result=result, actor=actor, note=note)
+
+
+def prepare_ai_repair_branch(
+    storage: Storage,
+    repair_id: int,
+    repo_root: Path | str,
+    actor: str = "operator",
+    note: str = "",
+    commands: list[str] | None = None,
+) -> dict:
+    repair = require_ai_repair(storage, repair_id)
+    if str(repair.get("status") or "") not in {"approved", "branch_prepared", "branch_failed"}:
+        raise ValueError("AI repair must be approved before preparing a controlled branch")
+    approval_report = safe_dict(safe_dict(repair.get("test_result")).get("approval_report"))
+    if not approval_report.get("ready_to_approve"):
+        raise ValueError("approval report is not ready; run sandbox-test before approval")
+    patch = safe_dict(repair.get("patch"))
+    requested_commands = (
+        safe_list(commands) if commands is not None else safe_list(safe_dict(repair.get("test_plan")).get("commands"))
+    )
+    controlled_apply = prepare_patch_branch(Path(repo_root), repair, patch, requested_commands)
+    next_status = "branch_prepared" if controlled_apply.get("ready_for_pr") else "branch_failed"
+    result = {
+        "status": "passed" if controlled_apply.get("ready_for_pr") else "failed",
+        "commands": controlled_apply.get("commands", []),
+        "output": controlled_apply.get("output", ""),
+        "error": controlled_apply.get("error", ""),
+        "note": note or "approved repair branch preparation completed",
+        "validation": safe_dict(controlled_apply.get("validation")),
+        "sandbox": safe_dict(safe_dict(repair.get("test_result")).get("sandbox")),
+        "approval_report": approval_report,
+        "controlled_apply": controlled_apply,
+    }
+    return storage.update_ai_repair_proposal_status(
+        repair_id,
+        next_status,
+        actor=actor,
+        note=note,
+        test_result=result,
+    )
 
 
 def require_ai_repair(storage: Storage, repair_id: int) -> dict:
@@ -643,6 +686,7 @@ def normalize_test_result(result: dict[str, Any], repair: dict[str, Any]) -> dic
         "validation": safe_dict(result.get("validation")),
         "sandbox": safe_dict(result.get("sandbox")),
         "approval_report": safe_dict(result.get("approval_report")),
+        "controlled_apply": safe_dict(result.get("controlled_apply")),
     }
 
 
@@ -703,39 +747,219 @@ def run_patch_in_sandbox(repo_root: Path, patch: dict[str, Any], commands: list[
             sandbox_result["duration_seconds"] = round(time.monotonic() - started, 3)
             return sandbox_result
         sandbox_result["patch_applied"] = True
-        command_results: list[dict[str, Any]] = []
-        combined_output: list[str] = []
-        combined_error: list[str] = []
-        all_passed = True
-        for command in requested_commands:
-            executed_command = runtime_test_command(command)
-            result = run_subprocess(executed_command, sandbox_dir, timeout_seconds=DEFAULT_SANDBOX_TEST_TIMEOUT_SECONDS)
-            command_result = {
-                "command": command,
-                "executed_command": executed_command,
-                "returncode": result["returncode"],
-                "stdout": truncate_text(result["stdout"], DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
-                "stderr": truncate_text(result["stderr"], DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
-                "timed_out": bool(result.get("timed_out")),
-            }
-            command_results.append(command_result)
-            if command_result["stdout"]:
-                combined_output.append(f"$ {command}\n{command_result['stdout']}")
-            if command_result["stderr"]:
-                combined_error.append(f"$ {command}\n{command_result['stderr']}")
-            if result["returncode"] != 0:
-                all_passed = False
-                break
+        test_execution = run_safe_test_commands(sandbox_dir, requested_commands)
         sandbox_result.update(
             {
-                "status": "passed" if all_passed else "failed",
-                "command_results": command_results,
-                "output": truncate_text("\n".join(combined_output), DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
-                "error": truncate_text("\n".join(combined_error), DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
+                **test_execution,
                 "duration_seconds": round(time.monotonic() - started, 3),
             }
         )
     return sandbox_result
+
+
+def prepare_patch_branch(
+    repo_root: Path,
+    repair: dict[str, Any],
+    patch: dict[str, Any],
+    commands: list[Any],
+) -> dict[str, Any]:
+    started = time.monotonic()
+    validation = validate_patch_dry_run(patch)
+    requested_commands = [str(item).strip() for item in commands if str(item).strip()]
+    if not requested_commands:
+        requested_commands = DEFAULT_TEST_COMMANDS
+    repair_id = safe_int(repair.get("id"))
+    result: dict[str, Any] = {
+        "status": "failed",
+        "ready_for_pr": False,
+        "repo_root": str(repo_root),
+        "commands": requested_commands,
+        "branch_name": "",
+        "worktree_path": "",
+        "commit": "",
+        "changed_files": [],
+        "patch_applied": False,
+        "commit_created": False,
+        "output": "",
+        "error": "",
+        "validation": validation,
+        "blockers": [],
+    }
+    blockers = controlled_apply_blockers(repo_root, repair, patch, validation, requested_commands)
+    if blockers:
+        result["blockers"] = blockers
+        result["error"] = "; ".join(blockers)
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+
+    root = repo_root.resolve()
+    timestamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+    branch_name = f"{CONTROLLED_BRANCH_PREFIX}-{repair_id}-{timestamp}"
+    worktree_base = root.parent / f"{root.name}-{CONTROLLED_WORKTREE_SUFFIX}"
+    worktree_base.mkdir(parents=True, exist_ok=True)
+    worktree_dir = worktree_base / f"repair-{repair_id}-{timestamp}"
+    suffix = 1
+    while worktree_dir.exists():
+        branch_name = f"{CONTROLLED_BRANCH_PREFIX}-{repair_id}-{timestamp}-{suffix}"
+        worktree_dir = worktree_base / f"repair-{repair_id}-{timestamp}-{suffix}"
+        suffix += 1
+
+    diff = str(patch.get("diff") or "")
+    patch_path = worktree_base / f"{branch_name}.patch"
+    patch_path.write_text(diff, encoding="utf-8")
+    result.update({"branch_name": branch_name, "worktree_path": str(worktree_dir), "patch_path": str(patch_path)})
+
+    added = run_git(["worktree", "add", "-b", branch_name, str(worktree_dir), "HEAD"], root)
+    if added["returncode"] != 0:
+        result["error"] = f"git worktree add failed: {added['stderr'] or added['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    checked = run_git(["apply", "--check", str(patch_path)], worktree_dir)
+    if checked["returncode"] != 0:
+        result["error"] = f"git apply --check failed: {checked['stderr'] or checked['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    applied = run_git(["apply", str(patch_path)], worktree_dir)
+    if applied["returncode"] != 0:
+        result["error"] = f"git apply failed: {applied['stderr'] or applied['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    result["patch_applied"] = True
+
+    test_execution = run_safe_test_commands(worktree_dir, requested_commands)
+    result.update(test_execution)
+    if test_execution["status"] != "passed":
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+
+    status = run_git(["status", "--porcelain"], worktree_dir)
+    if status["returncode"] != 0:
+        result["error"] = f"git status failed: {status['stderr'] or status['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    changed_files = git_status_paths(status["stdout"])
+    result["changed_files"] = changed_files
+    if not changed_files:
+        result["error"] = "patch applied but produced no git changes"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+
+    added_files = run_git(["add", "-A"], worktree_dir)
+    if added_files["returncode"] != 0:
+        result["error"] = f"git add failed: {added_files['stderr'] or added_files['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    committed = run_subprocess(
+        [
+            "git",
+            "-c",
+            "user.name=Ops Agent",
+            "-c",
+            "user.email=ops-agent@example.local",
+            "commit",
+            "-m",
+            f"Apply AI repair #{repair_id}",
+        ],
+        worktree_dir,
+        timeout_seconds=DEFAULT_GIT_TIMEOUT_SECONDS,
+    )
+    if committed["returncode"] != 0:
+        result["error"] = f"git commit failed: {committed['stderr'] or committed['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    head = run_git(["rev-parse", "HEAD"], worktree_dir)
+    if head["returncode"] != 0:
+        result["error"] = f"git rev-parse failed: {head['stderr'] or head['stdout']}"
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    result.update(
+        {
+            "status": "passed",
+            "ready_for_pr": True,
+            "commit_created": True,
+            "commit": head["stdout"].strip(),
+            "duration_seconds": round(time.monotonic() - started, 3),
+        }
+    )
+    return result
+
+
+def controlled_apply_blockers(
+    repo_root: Path,
+    repair: dict[str, Any],
+    patch: dict[str, Any],
+    validation: dict[str, Any],
+    requested_commands: list[str],
+) -> list[str]:
+    blockers: list[str] = []
+    if str(repair.get("status") or "") not in {"approved", "branch_prepared", "branch_failed"}:
+        blockers.append("AI repair must be approved before preparing a controlled branch")
+    approval_report = safe_dict(safe_dict(repair.get("test_result")).get("approval_report"))
+    if not approval_report.get("ready_to_approve"):
+        blockers.append("approval report is not ready; run sandbox-test before approval")
+    if not validation.get("valid"):
+        blockers.extend(str(error) for error in safe_list(validation.get("errors")))
+    if not str(patch.get("diff") or "").strip():
+        blockers.append("patch has no unified diff to apply")
+    root = repo_root.resolve()
+    if not root.exists() or not root.is_dir():
+        blockers.append(f"repo root not found: {root}")
+        return blockers
+    unsafe_command = next((command for command in requested_commands if not is_safe_test_command(command)), "")
+    if unsafe_command:
+        blockers.append(f"unsafe test command: {unsafe_command}")
+    inside = run_git(["rev-parse", "--is-inside-work-tree"], root)
+    if inside["returncode"] != 0 or inside["stdout"].strip().lower() != "true":
+        blockers.append(f"repo root is not a git work tree: {root}")
+    head = run_git(["rev-parse", "--verify", "HEAD"], root)
+    if head["returncode"] != 0:
+        blockers.append("repo has no HEAD commit for branch preparation")
+    return blockers
+
+
+def run_safe_test_commands(cwd: Path, requested_commands: list[str]) -> dict[str, Any]:
+    command_results: list[dict[str, Any]] = []
+    combined_output: list[str] = []
+    combined_error: list[str] = []
+    all_passed = True
+    for command in requested_commands:
+        executed_command = runtime_test_command(command)
+        result = run_subprocess(executed_command, cwd, timeout_seconds=DEFAULT_SANDBOX_TEST_TIMEOUT_SECONDS)
+        command_result = {
+            "command": command,
+            "executed_command": executed_command,
+            "returncode": result["returncode"],
+            "stdout": truncate_text(result["stdout"], DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
+            "stderr": truncate_text(result["stderr"], DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
+            "timed_out": bool(result.get("timed_out")),
+        }
+        command_results.append(command_result)
+        if command_result["stdout"]:
+            combined_output.append(f"$ {command}\n{command_result['stdout']}")
+        if command_result["stderr"]:
+            combined_error.append(f"$ {command}\n{command_result['stderr']}")
+        if result["returncode"] != 0:
+            all_passed = False
+            break
+    return {
+        "status": "passed" if all_passed else "failed",
+        "command_results": command_results,
+        "output": truncate_text("\n".join(combined_output), DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
+        "error": truncate_text("\n".join(combined_error), DEFAULT_SANDBOX_MAX_OUTPUT_CHARS),
+    }
+
+
+def run_git(args: list[str], cwd: Path, timeout_seconds: int = DEFAULT_GIT_TIMEOUT_SECONDS) -> dict[str, Any]:
+    return run_subprocess(["git", *args], cwd, timeout_seconds=timeout_seconds)
+
+
+def git_status_paths(output: str) -> list[str]:
+    paths: list[str] = []
+    for line in output.splitlines():
+        if len(line) < 4:
+            continue
+        paths.append(line[3:])
+    return paths
 
 
 def copy_repo_to_sandbox(repo_root: Path, sandbox_dir: Path) -> None:
@@ -973,7 +1197,7 @@ def safe_list(value: Any) -> list:
     return list(value) if isinstance(value, list) else []
 
 
-def safe_int(value: Any, default: int) -> int:
+def safe_int(value: Any, default: int = 0) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):

@@ -1620,8 +1620,10 @@ class Storage:
                         when 'test_not_run' then 4
                         when 'test_passed' then 5
                         when 'approved' then 6
-                        when 'rejected' then 7
-                        else 8
+                        when 'branch_failed' then 7
+                        when 'branch_prepared' then 8
+                        when 'rejected' then 9
+                        else 10
                     end,
                     updated_at desc,
                     id desc
@@ -1659,6 +1661,8 @@ class Storage:
             "test_failed",
             "test_not_run",
             "approved",
+            "branch_failed",
+            "branch_prepared",
             "rejected",
         }
         normalized_status = (status or "").strip().lower()

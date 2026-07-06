@@ -28,6 +28,7 @@ from ops_agent.ai.learning_review import build_learning_optimization_draft
 from ops_agent.ai.repair import (
     build_ai_repair_proposal,
     dry_run_ai_repair_proposal,
+    prepare_ai_repair_branch,
     record_ai_repair_test_result,
     sandbox_test_ai_repair_proposal,
 )
@@ -519,6 +520,24 @@ def start_dashboard(
                     )
                     outcome = "success" if updated.get("status") == "test_passed" else "error"
                     self.record_audit(path, 200, outcome, "AI repair sandbox test completed", actor=actor, auth=auth)
+                    self.send_json(updated)
+                    return
+                if action in {"prepare-branch", "apply-approved", "prepare-pr"}:
+                    if config is None:
+                        self.record_audit(path, 503, "error", "config is not configured", actor=actor, auth=auth)
+                        self.send_json({"error": "config is not configured"}, status=503)
+                        return
+                    commands = body.get("commands")
+                    updated = prepare_ai_repair_branch(
+                        storage,
+                        repair_id,
+                        config.base_dir,
+                        actor=actor,
+                        note=note,
+                        commands=commands if isinstance(commands, list) else None,
+                    )
+                    outcome = "success" if updated.get("status") == "branch_prepared" else "error"
+                    self.record_audit(path, 200, outcome, "AI repair controlled branch prepared", actor=actor, auth=auth)
                     self.send_json(updated)
                     return
                 if action == "approve":

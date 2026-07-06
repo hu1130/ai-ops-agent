@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 import urllib.request
@@ -7,6 +8,7 @@ from pathlib import Path
 from ops_agent.ai.repair import (
     build_ai_repair_proposal,
     dry_run_ai_repair_proposal,
+    prepare_ai_repair_branch,
     record_ai_repair_test_result,
     sandbox_test_ai_repair_proposal,
     validate_patch_dry_run,
@@ -254,6 +256,56 @@ class AiRepairTest(unittest.TestCase):
         self.assertTrue(tested["test_result"]["approval_report"]["ready_to_approve"])
         self.assertEqual("old\n", original_content)
 
+    def test_prepare_branch_creates_auditable_worktree_commit_after_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_git_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    }
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+            tested = sandbox_test_ai_repair_proposal(storage, proposal["id"], repo, actor="tester")
+            approved = storage.update_ai_repair_proposal_status(proposal["id"], "approved", actor="tester")
+
+            prepared = prepare_ai_repair_branch(storage, proposal["id"], repo, actor="tester")
+            controlled_apply = prepared["test_result"]["controlled_apply"]
+            worktree = Path(controlled_apply["worktree_path"])
+            original_content = (repo / "sample.txt").read_text(encoding="utf-8")
+            worktree_content = (worktree / "sample.txt").read_text(encoding="utf-8")
+            main_status = run_git_fixture(repo, ["status", "--porcelain"])
+            branch_list = run_git_fixture(repo, ["branch", "--list", controlled_apply["branch_name"]])
+            storage.close()
+
+        self.assertEqual("test_passed", tested["status"])
+        self.assertTrue(tested["test_result"]["approval_report"]["ready_to_approve"])
+        self.assertEqual("approved", approved["status"])
+        self.assertEqual("branch_prepared", prepared["status"])
+        self.assertTrue(controlled_apply["ready_for_pr"])
+        self.assertTrue(controlled_apply["patch_applied"])
+        self.assertTrue(controlled_apply["commit_created"])
+        self.assertTrue(controlled_apply["commit"])
+        self.assertTrue(controlled_apply["branch_name"].startswith("ai-repair-"))
+        self.assertIn("sample.txt", controlled_apply["changed_files"])
+        self.assertEqual("old\n", original_content)
+        self.assertEqual("new\n", worktree_content)
+        self.assertEqual("", main_status)
+        self.assertIn(controlled_apply["branch_name"], branch_list)
+
     def test_ai_repair_dashboard_api_runs_sandbox_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = create_sandbox_repo(Path(tmp) / "repo")
@@ -298,6 +350,60 @@ class AiRepairTest(unittest.TestCase):
         self.assertTrue(tested["test_result"]["approval_report"]["ready_to_approve"])
         self.assertIn("ai_repair.sandbox_test", {row["operation"] for row in audit})
 
+    def test_ai_repair_dashboard_api_prepares_branch_after_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_git_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "app": {"name": "ops"},
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                        }
+                    },
+                },
+                base_dir=repo,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                proposal = post_json(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/ai-repair/propose",
+                    {"actor": "tester"},
+                )
+                tested = post_json(
+                    f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/sandbox-test",
+                    {"actor": "tester"},
+                )
+                approved = post_json(
+                    f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/approve",
+                    {"actor": "tester"},
+                )
+                prepared = post_json(
+                    f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/prepare-branch",
+                    {"actor": "tester"},
+                )
+                audit = storage.latest_api_audit_logs(30)
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("test_passed", tested["status"])
+        self.assertEqual("approved", approved["status"])
+        self.assertEqual("branch_prepared", prepared["status"])
+        self.assertTrue(prepared["test_result"]["controlled_apply"]["ready_for_pr"])
+        self.assertIn("ai_repair.prepare_branch", {row["operation"] for row in audit})
+
 
 def post_json(url: str, payload: dict) -> dict:
     request = urllib.request.Request(
@@ -338,6 +444,36 @@ def create_sandbox_repo(root: Path) -> Path:
         encoding="utf-8",
     )
     return root
+
+
+def create_git_sandbox_repo(root: Path) -> Path:
+    repo = create_sandbox_repo(root)
+    run_git_fixture(repo, ["init"])
+    run_git_fixture(repo, ["add", "."])
+    run_git_fixture(
+        repo,
+        [
+            "-c",
+            "user.name=Tester",
+            "-c",
+            "user.email=tester@example.local",
+            "commit",
+            "-m",
+            "Initial fixture",
+        ],
+    )
+    return repo
+
+
+def run_git_fixture(cwd: Path, args: list[str]) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return completed.stdout.strip()
 
 
 def sandbox_patch_response() -> dict:
