@@ -41,6 +41,7 @@ from ops_agent.ai.repair import (
     record_ai_repair_test_result,
     run_ai_repair_pipeline,
     run_ai_repair_pipeline_for_incident,
+    run_project_ai_repair_drill,
     sandbox_test_ai_repair_proposal,
 )
 from ops_agent.monitor_targets import (
@@ -358,6 +359,11 @@ def start_dashboard(
                 self.handle_incident_ai_repair_post(incident_ai_repair_request, auth)
                 return
 
+            project_ai_repair_request = parse_project_ai_repair_api_path(path)
+            if project_ai_repair_request:
+                self.handle_project_ai_repair_post(project_ai_repair_request, auth)
+                return
+
             monitor_target_request = parse_monitor_target_api_path(path)
             if monitor_target_request:
                 self.handle_monitor_target_post(monitor_target_request, auth)
@@ -530,6 +536,79 @@ def start_dashboard(
                 )
                 self.record_audit(path, 200, "success", "AI repair proposal created", actor=actor, auth=auth)
                 self.send_json(proposal)
+            except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
+
+        def handle_project_ai_repair_post(
+            self,
+            repair_request: tuple[str, str],
+            auth: AuthResult,
+        ) -> None:
+            project_id, action = repair_request
+            path = self.path.split("?", 1)[0]
+            actor = "api"
+            try:
+                body = self.read_json_body()
+                actor = self.actor_from_body(body, auth)
+                if action not in {"drill", "proposal-drill", "repair-drill"}:
+                    self.record_audit(
+                        path,
+                        404,
+                        "not_found",
+                        f"unsupported project AI repair operation: {action}",
+                        actor=actor,
+                        auth=auth,
+                    )
+                    self.send_json({"error": f"unsupported project AI repair operation: {action}"}, status=404)
+                    return
+                if config is None:
+                    self.record_audit(path, 503, "error", "config is not configured", actor=actor, auth=auth)
+                    self.send_json({"error": "config is not configured"}, status=503)
+                    return
+                readiness = project_repair_readiness_snapshot(config)
+                project_ready = next(
+                    (
+                        row
+                        for row in readiness.get("projects", [])
+                        if project_id in {str(row.get("id") or ""), str(row.get("name") or "")}
+                    ),
+                    None,
+                )
+                if not project_ready:
+                    self.record_audit(path, 404, "not_found", f"project not found: {project_id}", actor=actor, auth=auth)
+                    self.send_json({"error": f"project not found: {project_id}"}, status=404)
+                    return
+                if project_ready.get("status") == "blocked" and not bool(body.get("force")):
+                    self.record_audit(
+                        path,
+                        409,
+                        "blocked",
+                        f"project repair readiness blocked: {project_id}",
+                        actor=actor,
+                        auth=auth,
+                    )
+                    self.send_json(
+                        {
+                            "error": "project repair readiness is blocked",
+                            "readiness": project_ready,
+                        },
+                        status=409,
+                    )
+                    return
+                result = run_project_ai_repair_drill(
+                    storage,
+                    config,
+                    project_id,
+                    actor=actor,
+                    request=body,
+                )
+                result["readiness"] = project_ready
+                self.record_audit(path, 200, "success", "project AI repair drill completed", actor=actor, auth=auth)
+                self.send_json(result)
             except ValueError as exc:
                 self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
                 self.send_json({"error": str(exc)}, status=400)
@@ -1767,6 +1846,13 @@ def parse_incident_ai_repair_api_path(path: str) -> tuple[int, str] | None:
     return incident_id, action
 
 
+def parse_project_ai_repair_api_path(path: str) -> tuple[str, str] | None:
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 5 or parts[0] != "api" or parts[1] != "projects" or parts[3] != "ai-repair":
+        return None
+    return parts[2], parts[4]
+
+
 def parse_action_api_path(path: str) -> tuple[int, str] | None:
     parts = [part for part in path.strip("/").split("/") if part]
     if len(parts) < 3 or parts[0] != "api" or parts[1] != "actions":
@@ -1874,6 +1960,12 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         operation = f"ai_repair.{operation_name}"
         return operation, "incident", incident_id
 
+    project_ai_repair_request = parse_project_ai_repair_api_path(path)
+    if project_ai_repair_request:
+        _project_id, action = project_ai_repair_request
+        operation_name = (action or "read").replace("-", "_")
+        return f"ai_repair.project_{operation_name}", "project", None
+
     recommendation_request = parse_recommendation_api_path(path)
     if recommendation_request:
         recommendation_id, action = recommendation_request
@@ -1913,6 +2005,7 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/playbooks/detail": ("playbook.detail", "playbook", None),
         "/api/projects": ("project.list", "project", None),
         "/api/projects/summary": ("project.summary", "project", None),
+        "/api/projects/repair-readiness": ("project.repair_readiness", "project", None),
         "/api/actions/failed": ("action.failed", "action", None),
         "/api/actions/pending": ("action.pending", "action", None),
         "/api/incidents": ("incident.list", "incident", None),

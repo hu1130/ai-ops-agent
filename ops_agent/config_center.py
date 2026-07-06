@@ -125,8 +125,9 @@ def project_repair_readiness_snapshot(config: AppConfig) -> dict[str, Any]:
     settings = repair_settings({"config": {"repair": repair_config}})
     provider = str(settings.get("provider") or "rules")
     api_key_env = str(settings.get("api_key_env") or "")
-    needs_api_key = provider in MODEL_PROVIDERS and provider != "rules"
-    api_key_configured = bool(str(settings.get("api_key") or "").strip()) or bool(
+    has_mock_response = bool(settings.get("mock_response"))
+    needs_api_key = provider in MODEL_PROVIDERS and provider != "rules" and not has_mock_response
+    api_key_configured = has_mock_response or bool(str(settings.get("api_key") or "").strip()) or bool(
         os.environ.get(api_key_env, "").strip()
     )
     rows = []

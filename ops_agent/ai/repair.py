@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 
 from ops_agent.config import AppConfig
+from ops_agent.events import CheckResult
 from ops_agent.projects import list_projects
 from ops_agent.storage import Storage
 
@@ -178,6 +179,124 @@ def run_ai_repair_pipeline_for_incident(
         policy=policy,
         initial_pipeline_stage={"name": "proposal", "status": "passed", "repair_id": proposal["id"]},
     )
+
+
+def run_project_ai_repair_drill(
+    storage: Storage,
+    config: AppConfig | None,
+    project_id: str,
+    actor: str = "operator",
+    request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if config is None:
+        raise ValueError("config is not configured")
+    project = find_repair_project_by_id(config, project_id)
+    if not project:
+        raise ValueError(f"project not found: {project_id}")
+
+    request_payload = safe_dict(request)
+    project_key = str(project.get("id") or project_id)
+    run_types = string_list(project.get("run_types"))
+    environment = str(
+        request_payload.get("environment")
+        or project.get("environment")
+        or config.app.get("environment")
+        or "prod"
+    )
+    run_type = str(
+        request_payload.get("run_type")
+        or (run_types[0] if run_types else "")
+        or config.app.get("run_type")
+        or "normal"
+    )
+    severity = normalize_drill_severity(request_payload.get("severity") or request_payload.get("status"))
+    summary = str(
+        request_payload.get("summary")
+        or request_payload.get("last_summary")
+        or f"Synthetic AI repair drill for project {project_key}"
+    )
+    title = str(
+        request_payload.get("title")
+        or f"AI repair drill for {project.get('name') or project_key}"
+    )
+    details = safe_dict(request_payload.get("details"))
+    details.update(
+        {
+            "drill": True,
+            "project_id": project_key,
+            "mutates_production": False,
+        }
+    )
+    result = CheckResult(
+        source=str(request_payload.get("source") or "ai_repair_drill"),
+        name=str(request_payload.get("name") or project.get("name") or project_key),
+        status=severity,
+        summary=summary,
+        details=details,
+        environment=environment,
+        run_type=run_type,
+    )
+    incident_id = storage.save_incident(
+        severity,
+        title,
+        str(
+            request_payload.get("analysis")
+            or "Project-level AI repair drill. This record is synthetic and does not mutate production."
+        ),
+        [result],
+        status=str(request_payload.get("incident_status") or "resolved"),
+        classification={
+            "category": str(request_payload.get("category") or "ai_repair_drill"),
+            "confidence": request_payload.get("confidence", 0.75),
+            "summary": summary,
+            "evidence": [summary],
+            "next_steps": ["review generated proposal", "run sandbox test if a patch is present"],
+        },
+    )
+    proposal = build_ai_repair_proposal(
+        storage,
+        config,
+        incident_id,
+        request={**request_payload, "actor": actor, "project_id": project_key, "drill": True},
+    )
+    repair = dry_run_ai_repair_proposal(
+        storage,
+        int(proposal["id"]),
+        actor=actor,
+        note=str(request_payload.get("note") or "project AI repair drill dry-run"),
+    )
+    sandbox_result: dict[str, Any] = {}
+    run_sandbox = bool(request_payload.get("run_sandbox") or request_payload.get("sandbox_test"))
+    patch = safe_dict(repair.get("patch"))
+    if run_sandbox and repair.get("status") == "dry_run_passed" and str(patch.get("diff") or "").strip():
+        commands = request_payload.get("commands")
+        repo_root = resolve_repair_repo_root(config, project, request_payload, config.base_dir)
+        repair = sandbox_test_ai_repair_proposal(
+            storage,
+            int(proposal["id"]),
+            repo_root,
+            actor=actor,
+            note=str(request_payload.get("note") or "project AI repair drill sandbox test"),
+            commands=commands if isinstance(commands, list) else string_list(project.get("test_commands")) or None,
+        )
+        sandbox_result = safe_dict(repair.get("test_result"))
+    elif run_sandbox:
+        sandbox_result = {
+            "status": "skipped",
+            "reason": "dry_run_failed_or_no_patch_diff",
+        }
+
+    return {
+        "mode": "project_ai_repair_drill",
+        "status": str(repair.get("status") or "unknown"),
+        "mutates_production": False,
+        "project": public_project_context(project),
+        "incident": storage.get_incident(incident_id),
+        "proposal": repair,
+        "dry_run": safe_dict(repair.get("dry_run")),
+        "sandbox_result": sandbox_result,
+        "next_steps": project_drill_next_steps(repair, run_sandbox),
+    }
 
 
 def run_ai_repair_pipeline(
@@ -2187,6 +2306,46 @@ def normalize_auto_approve_risks(value: list[str] | None) -> list[str]:
     risks = [str(item).strip().lower() for item in safe_list(value) if str(item).strip()]
     valid = [risk for risk in risks if risk in {"low", "medium", "high", "critical"}]
     return valid or ["low"]
+
+
+def find_repair_project_by_id(config: AppConfig | None, project_id: str) -> dict[str, Any]:
+    if config is None:
+        return {}
+    target = str(project_id or "").strip()
+    if not target:
+        return {}
+    for project in list_projects(config):
+        identifiers = {
+            str(project.get("id") or "").strip(),
+            str(project.get("key") or "").strip(),
+            str(project.get("name") or "").strip(),
+        }
+        if target in identifiers:
+            return project
+    return {}
+
+
+def normalize_drill_severity(value: Any) -> str:
+    severity = str(value or "").strip().lower()
+    if severity in {"warning", "critical"}:
+        return severity
+    return "critical"
+
+
+def project_drill_next_steps(repair: dict[str, Any], run_sandbox: bool) -> list[str]:
+    status = str(repair.get("status") or "")
+    patch = safe_dict(repair.get("patch"))
+    if status == "dry_run_failed":
+        return ["review dry_run.errors before allowing sandbox or branch preparation"]
+    if status == "test_failed":
+        return ["review sandbox output and adjust the generated patch or test commands"]
+    if not str(patch.get("diff") or "").strip():
+        return ["review the manual repair guidance; no patch diff was generated"]
+    if status == "test_passed":
+        return ["review approval_report, then approve and prepare a controlled branch if acceptable"]
+    if run_sandbox:
+        return ["review sandbox_result before approval"]
+    return ["run sandbox test before approval", "approve only after human review"]
 
 
 def select_repair_project(

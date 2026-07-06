@@ -18,6 +18,7 @@ from ops_agent.ai.repair import (
     publish_ai_repair_pull_request,
     record_ai_repair_test_result,
     run_ai_repair_pipeline_for_incident,
+    run_project_ai_repair_drill,
     sandbox_test_ai_repair_proposal,
     validate_patch_dry_run,
 )
@@ -349,6 +350,108 @@ class AiRepairTest(unittest.TestCase):
         self.assertTrue(pipeline["policy"]["prepare_branch"])
         self.assertEqual(["python -m py_compile tests/test_sample.py"], controlled_apply["commands"])
         self.assertEqual("", main_status)
+
+    def test_project_ai_repair_drill_creates_safe_dry_run_for_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "projects": [
+                        {
+                            "id": "prod",
+                            "name": "Production",
+                            "environment": "prod",
+                            "run_types": ["normal"],
+                            "repo_root": str(repo),
+                            "repair_context_files": ["sample.txt"],
+                            "test_commands": ["python -m py_compile tests/test_sample.py"],
+                        }
+                    ],
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                            "repository_context": {"enabled": True},
+                        }
+                    },
+                },
+                base_dir=Path(tmp),
+            )
+
+            result = run_project_ai_repair_drill(
+                storage,
+                config,
+                "prod",
+                actor="tester",
+                request={"summary": "Synthetic HTTP 500 for drill"},
+            )
+            prompt_payload = json.loads(result["proposal"]["prompt"]["user"])
+            original_content = (repo / "sample.txt").read_text(encoding="utf-8")
+            storage.close()
+
+        self.assertEqual("project_ai_repair_drill", result["mode"])
+        self.assertFalse(result["mutates_production"])
+        self.assertEqual("resolved", result["incident"]["status"])
+        self.assertEqual("dry_run_passed", result["status"])
+        self.assertEqual("prod", prompt_payload["project"]["id"])
+        self.assertEqual(["sample.txt"], [item["path"] for item in prompt_payload["repository_context"]["files"]])
+        self.assertTrue(result["dry_run"]["mutates_files"])
+        self.assertEqual("old\n", original_content)
+
+    def test_project_ai_repair_drill_dashboard_api_runs_optional_sandbox(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "projects": [
+                        {
+                            "id": "prod",
+                            "name": "Production",
+                            "environment": "prod",
+                            "run_types": ["normal"],
+                            "repo_root": str(repo),
+                            "repair_context_files": ["sample.txt"],
+                            "test_commands": ["python -m unittest discover -s tests"],
+                        }
+                    ],
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                            "repository_context": {"enabled": True},
+                        }
+                    },
+                },
+                base_dir=Path(tmp),
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                result = post_json(
+                    f"http://{host}:{port}/api/projects/prod/ai-repair/drill",
+                    {
+                        "actor": "tester",
+                        "summary": "Synthetic HTTP 500 for project drill",
+                        "run_sandbox": True,
+                    },
+                )
+                audit = storage.latest_api_audit_logs(5)
+                original_content = (repo / "sample.txt").read_text(encoding="utf-8")
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual("ready", result["readiness"]["status"])
+        self.assertEqual("test_passed", result["status"])
+        self.assertEqual("passed", result["sandbox_result"]["status"])
+        self.assertEqual("resolved", result["incident"]["status"])
+        self.assertEqual("old\n", original_content)
+        self.assertIn("ai_repair.project_drill", {row["operation"] for row in audit})
 
     def test_dry_run_blocks_unsafe_model_patch_paths(self) -> None:
         result = validate_patch_dry_run(
