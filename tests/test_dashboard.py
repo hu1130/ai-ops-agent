@@ -1016,6 +1016,26 @@ class DashboardTest(unittest.TestCase):
                 )
                 with urllib.request.urlopen(request, timeout=5) as response:
                     policy = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(f"http://{host}:{port}/api/config/ai-repair-auto-trigger", timeout=5) as response:
+                    auto_trigger_snapshot = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/config/ai-repair-auto-trigger",
+                    data=json.dumps(
+                        {
+                            "actor": "tester",
+                            "auto_trigger": {
+                                "enabled": True,
+                                "severities": ["critical"],
+                                "categories": ["service_unavailable"],
+                                "notify_limit": 3,
+                            },
+                        }
+                    ).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    auto_trigger = json.loads(response.read().decode("utf-8"))
                 request = urllib.request.Request(
                     f"http://{host}:{port}/api/config/projects/delete",
                     data=json.dumps({"actor": "tester", "id": "web"}).encode("utf-8"),
@@ -1024,7 +1044,7 @@ class DashboardTest(unittest.TestCase):
                 )
                 with urllib.request.urlopen(request, timeout=5) as response:
                     deleted = json.loads(response.read().decode("utf-8"))
-                audit = storage.latest_api_audit_logs(4)
+                audit = storage.latest_api_audit_logs(5)
                 saved = json.loads(config_path.read_text(encoding="utf-8"))
             finally:
                 server.shutdown()
@@ -1035,9 +1055,14 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("created", project["action"])
         self.assertEqual(["web"], [row["id"] for row in projects["projects"]])
         self.assertTrue(policy["policy"]["auto_approve"])
+        self.assertFalse(auto_trigger_snapshot["auto_trigger"]["enabled"])
+        self.assertTrue(auto_trigger["auto_trigger"]["enabled"])
+        self.assertEqual(3, auto_trigger["auto_trigger"]["notify_limit"])
         self.assertEqual("deleted", deleted["action"])
         self.assertEqual([], saved["projects"])
+        self.assertTrue(saved["ai"]["repair"]["auto_trigger"]["enabled"])
         self.assertEqual("config.projects.delete", audit[0]["operation"])
+        self.assertEqual("config.ai_repair_auto_trigger", audit[1]["operation"])
 
     def test_action_approval_api_lists_and_rejects_pending_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

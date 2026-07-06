@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ops_agent.config import load_config
 from ops_agent.config_center import (
+    ai_repair_auto_trigger_snapshot,
     ai_repair_policy_snapshot,
     apply_config_update,
     backup_config,
@@ -16,6 +17,7 @@ from ops_agent.config_center import (
     project_config_snapshot,
     project_repair_readiness_snapshot,
     restore_config_backup,
+    update_ai_repair_auto_trigger,
     update_ai_repair_policy,
     upsert_project_config,
     validate_config_candidate,
@@ -97,6 +99,18 @@ class ConfigCenterTest(unittest.TestCase):
                 reason="unit-test-policy",
             )
             policy_snapshot = ai_repair_policy_snapshot(config)
+            auto_trigger = update_ai_repair_auto_trigger(
+                config,
+                {
+                    "enabled": True,
+                    "severities": ["critical"],
+                    "categories": ["service_unavailable"],
+                    "min_classification_confidence": "0.7",
+                    "notify_limit": "5",
+                },
+                reason="unit-test-auto-trigger",
+            )
+            auto_trigger_snapshot = ai_repair_auto_trigger_snapshot(config)
             deepseek = configure_deepseek_repair_model(
                 config,
                 {"api_key_env": "DEEPSEEK_API_KEY", "model": "deepseek-v4-flash"},
@@ -110,7 +124,11 @@ class ConfigCenterTest(unittest.TestCase):
         self.assertEqual("/opt/duanshiping", projects["projects"][0]["repo_root"])
         self.assertTrue(policy["policy"]["auto_approve"])
         self.assertTrue(policy_snapshot["policy"]["prepare_branch"])
+        self.assertTrue(auto_trigger["auto_trigger"]["enabled"])
+        self.assertEqual(0.7, auto_trigger["auto_trigger"]["min_classification_confidence"])
+        self.assertEqual(5, auto_trigger_snapshot["auto_trigger"]["notify_limit"])
         self.assertEqual("deepseek", deepseek["repair"]["provider"])
+        self.assertTrue(saved["ai"]["repair"]["auto_trigger"]["enabled"])
         self.assertEqual("deepseek-v4-flash", saved["ai"]["repair"]["model"])
         self.assertEqual("deleted", deleted["action"])
         self.assertEqual([], saved["projects"])

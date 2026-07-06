@@ -10,6 +10,7 @@ from ops_agent.alerts.notifier import Notifier
 from ops_agent.auth import AuthResult, authenticate_token, configured_api_tokens, has_role
 from ops_agent.config import AppConfig
 from ops_agent.config_center import (
+    ai_repair_auto_trigger_snapshot,
     ai_repair_policy_snapshot,
     apply_config_update,
     backup_config,
@@ -21,6 +22,7 @@ from ops_agent.config_center import (
     project_config_snapshot,
     project_repair_readiness_snapshot,
     restore_config_backup,
+    update_ai_repair_auto_trigger,
     update_ai_repair_policy,
     upsert_project_config,
     validate_config_candidate,
@@ -143,6 +145,12 @@ def start_dashboard(
                     self.send_json({"error": "config is not configured"}, status=503)
                     return
                 self.send_json(ai_repair_policy_snapshot(config))
+                return
+            if path == "/api/config/ai-repair-auto-trigger":
+                if config is None:
+                    self.send_json({"error": "config is not configured"}, status=503)
+                    return
+                self.send_json(ai_repair_auto_trigger_snapshot(config))
                 return
             if path == "/api/config/backups":
                 if config is None:
@@ -908,6 +916,16 @@ def start_dashboard(
                         reason=str(body.get("reason") or "ai-repair-policy"),
                     )
                     self.record_audit(path, 200, "success", "AI repair policy updated", actor=actor, auth=auth)
+                    self.send_json(result)
+                    return
+
+                if path == "/api/config/ai-repair-auto-trigger":
+                    result = update_ai_repair_auto_trigger(
+                        config,
+                        safe_body_dict(body.get("auto_trigger")) or body,
+                        reason=str(body.get("reason") or "ai-repair-auto-trigger"),
+                    )
+                    self.record_audit(path, 200, "success", "AI repair auto-trigger policy updated", actor=actor, auth=auth)
                     self.send_json(result)
                     return
 
@@ -2057,6 +2075,7 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/config/projects/upsert": ("config.projects.upsert", "config", None),
         "/api/config/projects/delete": ("config.projects.delete", "config", None),
         "/api/config/ai-repair-policy": ("config.ai_repair_policy", "config", None),
+        "/api/config/ai-repair-auto-trigger": ("config.ai_repair_auto_trigger", "config", None),
         "/api/monitor-targets": ("monitor_target.list", "monitor_target", None),
         "/api/playbooks": ("playbook.list", "playbook", None),
         "/api/playbooks/detail": ("playbook.detail", "playbook", None),

@@ -23,6 +23,30 @@ from ops_agent.ai.repair import (
 from ops_agent.projects import list_projects
 
 
+DEFAULT_AI_REPAIR_AUTO_TRIGGER_POLICY = {
+    "enabled": False,
+    "severities": ["critical"],
+    "categories": [
+        "service_unavailable",
+        "dependency_failure",
+        "performance_degraded",
+        "probe_config_issue",
+        "route_or_healthcheck_config_mismatch",
+        "synthetic_quality_fail",
+    ],
+    "excluded_categories": ["unknown", "unclassified"],
+    "sources": [],
+    "excluded_sources": [],
+    "environments": [],
+    "run_types": [],
+    "min_classification_confidence": 0.65,
+    "run_dry_run": True,
+    "notify": True,
+    "notify_states": ["needs_dry_run", "needs_sandbox", "ready_for_approval", "blocked", "review_only"],
+    "notify_limit": 20,
+}
+
+
 SECRET_MARKERS = (
     "api_key",
     "apikey",
@@ -273,6 +297,14 @@ def ai_repair_policy_snapshot(config: AppConfig) -> dict[str, Any]:
     }
 
 
+def ai_repair_auto_trigger_snapshot(config: AppConfig) -> dict[str, Any]:
+    repair = safe_dict(safe_dict(config.raw.get("ai")).get("repair"))
+    return {
+        "auto_trigger": normalize_ai_repair_auto_trigger_policy(repair.get("auto_trigger")),
+        "configured_auto_trigger": redact_secrets(safe_dict(repair.get("auto_trigger"))),
+    }
+
+
 def update_ai_repair_policy(config: AppConfig, policy: dict[str, Any], reason: str = "ai-repair-policy") -> dict[str, Any]:
     candidate = deepcopy(config.raw)
     ai = safe_dict(candidate.get("ai"))
@@ -283,6 +315,49 @@ def update_ai_repair_policy(config: AppConfig, policy: dict[str, Any], reason: s
     result = apply_config_update(config, candidate, reason=reason)
     result["policy"] = normalize_ai_repair_policy(safe_dict(safe_dict(config.raw.get("ai")).get("repair")).get("policy"))
     return result
+
+
+def update_ai_repair_auto_trigger(
+    config: AppConfig,
+    policy: dict[str, Any],
+    reason: str = "ai-repair-auto-trigger",
+) -> dict[str, Any]:
+    candidate = deepcopy(config.raw)
+    ai = safe_dict(candidate.get("ai"))
+    repair = safe_dict(ai.get("repair"))
+    repair["auto_trigger"] = normalize_ai_repair_auto_trigger_policy(policy)
+    ai["repair"] = repair
+    candidate["ai"] = ai
+    result = apply_config_update(config, candidate, reason=reason)
+    result["auto_trigger"] = normalize_ai_repair_auto_trigger_policy(
+        safe_dict(safe_dict(config.raw.get("ai")).get("repair")).get("auto_trigger")
+    )
+    return result
+
+
+def normalize_ai_repair_auto_trigger_policy(value: Any) -> dict[str, Any]:
+    raw = safe_dict(value)
+    policy = deepcopy(DEFAULT_AI_REPAIR_AUTO_TRIGGER_POLICY)
+    for key in ("enabled", "run_dry_run", "notify"):
+        if key in raw:
+            policy[key] = bool(raw.get(key))
+    for key in (
+        "severities",
+        "categories",
+        "excluded_categories",
+        "sources",
+        "excluded_sources",
+        "environments",
+        "run_types",
+        "notify_states",
+    ):
+        if key in raw:
+            policy[key] = string_list(raw.get(key))
+    if "min_classification_confidence" in raw:
+        policy["min_classification_confidence"] = safe_float(raw.get("min_classification_confidence"), 0.65)
+    if "notify_limit" in raw:
+        policy["notify_limit"] = max(1, safe_int(raw.get("notify_limit"), 20))
+    return policy
 
 
 def configure_deepseek_repair_model(
@@ -374,6 +449,20 @@ def safe_list(value: Any) -> list:
 
 def string_list(value: Any) -> list[str]:
     return [str(item) for item in safe_list(value) if str(item).strip()]
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def is_secret_key(key_name: str) -> bool:

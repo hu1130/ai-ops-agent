@@ -630,6 +630,8 @@ POST /api/config/projects/delete
 GET  /api/projects/repair-readiness
 GET  /api/config/ai-repair-policy
 POST /api/config/ai-repair-policy
+GET  /api/config/ai-repair-auto-trigger
+POST /api/config/ai-repair-auto-trigger
 POST /api/config/deepseek
 GET  /api/ai-repairs
 GET  /api/ai-repairs/approval-queue
@@ -662,6 +664,8 @@ POST /api/ai-repairs/1/deploy-merged
 Incident-based pipeline runs are project-aware. The agent selects the project by `project_id` from the request, or by the incident `environment` and `run_type`. Project `repo_root`, `test_commands`, `git_remote`, `base_branch`, and `repair_policy` override global defaults for that run.
 
 AI repair auto-trigger can be enabled under `ai.repair.auto_trigger`. When enabled, new incidents are matched against severity, category, source, environment, run type, and classifier confidence before the scheduler creates a repair proposal. The scheduler never mutates production through this path; it creates a proposal, optionally runs dry-run validation, records an incident event, and can notify only the newly created queue item.
+
+Use `GET /api/config/ai-repair-auto-trigger` to inspect the effective policy. Use `POST /api/config/ai-repair-auto-trigger` to update it through the config center with backup, validation, and audit logging. The request body can be either the policy object or `{ "auto_trigger": { ... }, "reason": "..." }`.
 
 ```json
 {
