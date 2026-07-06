@@ -64,7 +64,16 @@
   "log_checks": [],
   "ai": {
     "enabled": true,
-    "max_log_chars": 4000
+    "max_log_chars": 4000,
+    "repair": {
+      "provider": "rules",
+      "model": "rule-based-repair-v1",
+      "endpoint_url": "https://api.openai.com/v1/chat/completions",
+      "api_key_env": "OPS_AGENT_LLM_API_KEY",
+      "timeout_seconds": 45,
+      "max_prompt_chars": 12000,
+      "max_response_chars": 60000
+    }
   },
   "classification_rules": [
     {
