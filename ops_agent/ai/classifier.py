@@ -278,6 +278,22 @@ def classify_docker(result: CheckResult) -> IncidentClassification:
     container_status = str(details.get("container_status") or "").strip().lower()
     health_status = str(details.get("health_status") or "").strip().lower()
     running = details.get("running")
+    classification = str(details.get("classification") or "")
+
+    if classification.endswith("_fallback_reachable"):
+        fallback = safe_dict(details.get("fallback"))
+        if fallback:
+            evidence.append(f"备用入口 {fallback.get('url')} 返回 HTTP {fallback.get('status_code')}，说明业务入口仍可访问。")
+        return IncidentClassification(
+            category="probe_config_issue",
+            confidence=0.88,
+            summary="Docker healthcheck 失败，但备用业务入口可达，更像容器健康检查路径配置问题。",
+            evidence=evidence,
+            next_steps=[
+                "把 Docker healthcheck 改为真实存在的健康接口，或在应用里补充 /healthz。",
+                "继续保留业务入口 HTTP 探针，确保真实用户路径不可访问时仍会 critical 告警。",
+            ],
+        )
 
     if health_status == "unhealthy" or "unhealthy" in summary:
         return IncidentClassification(

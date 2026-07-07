@@ -4,6 +4,8 @@ import json
 import shutil
 import subprocess
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from ops_agent.events import CheckResult
 
@@ -78,6 +80,19 @@ def result_from_state(name: str, container: str, state: dict[str, Any], check: d
         )
 
     if health_status == "unhealthy":
+        fallback = reachable_fallback(check)
+        if fallback:
+            return CheckResult(
+                source="docker",
+                name=name,
+                status=fallback_status_value(check),
+                summary=f"Container {container} health unhealthy; fallback reachable",
+                details={
+                    **details,
+                    "classification": "container_healthcheck_fallback_reachable",
+                    "fallback": fallback,
+                },
+            )
         return CheckResult(
             source="docker",
             name=name,
@@ -136,9 +151,72 @@ def parse_state(output: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def reachable_fallback(check: dict[str, Any]) -> dict[str, Any] | None:
+    urls = fallback_urls(check)
+    if not urls:
+        return None
+    expected_statuses = status_codes(check.get("fallback_expected_statuses"), {200, 204, 301, 302, 401, 403})
+    timeout_seconds = float(check.get("fallback_timeout_seconds", check.get("timeout_seconds", 5)))
+    for url in urls:
+        result = probe_url(url, expected_statuses, timeout_seconds)
+        if result.get("reachable"):
+            return result
+    return None
+
+
+def fallback_urls(check: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    raw_urls = check.get("fallback_urls")
+    if isinstance(raw_urls, list):
+        values.extend(str(item).strip() for item in raw_urls if str(item).strip())
+    raw_url = str(check.get("fallback_url", "")).strip()
+    if raw_url:
+        values.append(raw_url)
+    seen: set[str] = set()
+    urls: list[str] = []
+    for value in values:
+        if value in seen or not value.startswith(("http://", "https://")):
+            continue
+        seen.add(value)
+        urls.append(value)
+    return urls
+
+
+def probe_url(url: str, expected_statuses: set[int], timeout_seconds: float) -> dict[str, Any]:
+    request = Request(url, method="GET", headers={"User-Agent": "ops-agent/0.1"})
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            status_code = int(response.status)
+            return {"url": url, "status_code": status_code, "reachable": status_code in expected_statuses}
+    except HTTPError as exc:
+        status_code = int(exc.code)
+        return {"url": url, "status_code": status_code, "reachable": status_code in expected_statuses}
+    except (URLError, TimeoutError, OSError) as exc:
+        return {"url": url, "error": str(exc), "reachable": False}
+
+
+def status_codes(value: Any, default: set[int]) -> set[int]:
+    if not isinstance(value, list):
+        return set(default)
+    codes: set[int] = set()
+    for item in value:
+        try:
+            code = int(item)
+        except (TypeError, ValueError):
+            continue
+        if 100 <= code <= 599:
+            codes.add(code)
+    return codes or set(default)
+
+
 def status_value(check: dict[str, Any], key: str, default: str) -> str:
     value = str(check.get(key, default)).strip().lower()
     return value if value in {"warning", "critical"} else default
+
+
+def fallback_status_value(check: dict[str, Any]) -> str:
+    value = str(check.get("fallback_success_status", "warning")).strip().lower()
+    return value if value in {"ok", "warning", "critical"} else "warning"
 
 
 def alert_policy_details(check: dict[str, Any]) -> dict[str, Any]:

@@ -34,6 +34,29 @@ class DockerMonitorTest(unittest.TestCase):
         self.assertIn("health unhealthy", result.summary)
         self.assertEqual(1, result.details["alert_after_failures"])
 
+    @patch("ops_agent.monitors.docker_monitor.probe_url")
+    @patch("ops_agent.monitors.docker_monitor.subprocess.run")
+    def test_unhealthy_container_with_reachable_fallback_is_warning(self, run, probe_url) -> None:
+        run.return_value.returncode = 0
+        run.return_value.stdout = json.dumps(
+            {"Status": "running", "Running": True, "Health": {"Status": "unhealthy"}}
+        )
+        run.return_value.stderr = ""
+        probe_url.return_value = {"url": "https://example.com/login", "status_code": 200, "reachable": True}
+
+        result = run_docker_check(
+            {
+                "name": "app",
+                "container": "app-1",
+                "fallback_urls": ["https://example.com/login"],
+                "fallback_success_status": "warning",
+            }
+        )
+
+        self.assertEqual("warning", result.status)
+        self.assertIn("fallback reachable", result.summary)
+        self.assertEqual("container_healthcheck_fallback_reachable", result.details["classification"])
+
     @patch("ops_agent.monitors.docker_monitor.subprocess.run")
     def test_exited_container_is_critical(self, run) -> None:
         run.return_value.returncode = 0

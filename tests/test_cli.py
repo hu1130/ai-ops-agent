@@ -80,6 +80,8 @@ class CliTest(unittest.TestCase):
                         "name": "api",
                         "container": "api-1",
                         "unhealthy_status": "critical",
+                        "fallback_urls": ["https://example.com/login"],
+                        "fallback_success_status": "warning",
                         "alert_after_failures": 1,
                     }
                 ],

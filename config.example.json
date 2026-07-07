@@ -89,6 +89,8 @@
       "timeout_seconds": 5,
       "unhealthy_status": "critical",
       "not_running_status": "critical",
+      "fallback_urls": ["https://example.com/login"],
+      "fallback_success_status": "warning",
       "alert_after_failures": 1
     }
   ],

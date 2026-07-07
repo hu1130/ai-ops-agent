@@ -607,9 +607,29 @@ def validate_config(config: AppConfig) -> list[str]:
         else:
             validate_context_name(container_value, f"docker_checks[{index}].container", errors)
         validate_positive_int(check.get("timeout_seconds", 5), f"docker_checks[{index}].timeout_seconds", errors)
+        validate_optional_positive_int(check.get("fallback_timeout_seconds"), f"docker_checks[{index}].fallback_timeout_seconds", errors)
         validate_optional_positive_int(check.get("interval_seconds"), f"docker_checks[{index}].interval_seconds", errors)
         validate_optional_positive_int(check.get("alert_after_failures"), f"docker_checks[{index}].alert_after_failures", errors)
         validate_optional_positive_int(check.get("consecutive_failures"), f"docker_checks[{index}].consecutive_failures", errors)
+        if "fallback_url" in check:
+            validate_url(str(check.get("fallback_url", "")), f"docker_checks[{index}].fallback_url", errors)
+        if "fallback_urls" in check:
+            validate_string_list(check["fallback_urls"], f"docker_checks[{index}].fallback_urls", errors)
+            if isinstance(check["fallback_urls"], list):
+                for fallback_index, fallback_url in enumerate(check["fallback_urls"]):
+                    fallback_text = str(fallback_url or "").strip()
+                    if fallback_text:
+                        validate_url(fallback_text, f"docker_checks[{index}].fallback_urls[{fallback_index}]", errors)
+        if "fallback_expected_statuses" in check:
+            validate_status_code_list(
+                check["fallback_expected_statuses"],
+                f"docker_checks[{index}].fallback_expected_statuses",
+                errors,
+            )
+        if "fallback_success_status" in check:
+            fallback_status = str(check["fallback_success_status"]).strip().lower()
+            if fallback_status not in {"ok", "warning", "critical"}:
+                errors.append(f"docker_checks[{index}].fallback_success_status 必须是 ok/warning/critical")
         for status_key in (
             "not_running_status",
             "unhealthy_status",

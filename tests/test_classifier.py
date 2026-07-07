@@ -87,6 +87,27 @@ class IncidentClassifierTest(unittest.TestCase):
         self.assertEqual("container_unhealthy", classification.category)
         self.assertGreaterEqual(classification.confidence, 0.85)
 
+    def test_docker_unhealthy_with_fallback_reachable_is_probe_config_issue(self) -> None:
+        result = CheckResult(
+            source="docker",
+            name="App container",
+            status="warning",
+            summary="Container app-1 health unhealthy; fallback reachable",
+            details={
+                "container": "app-1",
+                "container_status": "running",
+                "running": True,
+                "health_status": "unhealthy",
+                "classification": "container_healthcheck_fallback_reachable",
+                "fallback": {"url": "https://example.com/login", "status_code": 200},
+            },
+        )
+
+        classification = classify_incident([result])
+
+        self.assertEqual("probe_config_issue", classification.category)
+        self.assertGreaterEqual(classification.confidence, 0.85)
+
     def test_docker_inspect_failure_is_probe_config_issue(self) -> None:
         result = CheckResult(
             source="docker",
