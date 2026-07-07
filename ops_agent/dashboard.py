@@ -294,6 +294,21 @@ def start_dashboard(
                         return
                     self.send_json(timeline)
                     return
+                if action == "reviews":
+                    self.send_json(storage.latest_incident_reviews(incident_id, limit=query_limit(query, default=10, maximum=100)))
+                    return
+                if action == "review":
+                    reviews = storage.latest_incident_reviews(incident_id, limit=1)
+                    review = reviews[0] if reviews else storage.generate_incident_review(
+                        incident_id,
+                        generated_by=query_text(query, "actor") or "api",
+                        hours=query_hours(query),
+                    )
+                    if not review:
+                        self.send_json({"error": "incident not found"}, status=404)
+                        return
+                    self.send_json(review)
+                    return
                 if action == "changes":
                     incident = storage.get_incident(incident_id)
                     if not incident:
@@ -500,6 +515,17 @@ def start_dashboard(
                         auth=auth,
                     )
                     self.send_json(result)
+                    return
+
+                if action == "review":
+                    hours = body_positive_int(body.get("hours"), default=24, maximum=24 * 365)
+                    review = storage.generate_incident_review(incident_id, generated_by=actor, hours=hours)
+                    if not review:
+                        self.record_audit(path, 404, "error", "incident not found", actor=actor, auth=auth)
+                        self.send_json({"error": "incident not found"}, status=404)
+                        return
+                    self.record_audit(path, 200, "success", "incident review generated", actor=actor, auth=auth)
+                    self.send_json(review)
                     return
 
                 to_status = status_from_incident_action(action, body)
@@ -1721,6 +1747,14 @@ def query_limit(query: dict[str, list[str]], default: int, maximum: int) -> int:
     except ValueError:
         return default
     return min(max(value, 1), maximum)
+
+
+def body_positive_int(value: object, default: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(parsed, 1), maximum)
 
 
 def query_hours(query: dict[str, list[str]], default: int = 24, maximum: int = 24 * 365) -> int:

@@ -242,9 +242,14 @@ POST /api/change-events
 GET /api/incidents/1/changes
 GET /api/incidents/1/timeline?hours=24
 GET /api/incidents/1/detail
+GET /api/incidents/1/reviews
+GET /api/incidents/1/review
+POST /api/incidents/1/review
 ```
 
 事件详情会返回 `timeline`，单独时间线接口也可以直接读取。时间线会把同一事件相关的巡检结果、事件状态变更、诊断、推荐动作、执行动作、通知记录和关联变更按时间排序，便于判断问题是否由最近部署、配置修改或 AI 修复引起。
+
+复盘接口会把事件时间线整理成结构化报告，包含影响范围、根因候选、处置动作、通知记录、关联变更和预防建议。`POST /api/incidents/1/review` 会生成并保存一份新复盘；`GET /api/incidents/1/reviews` 查看历史复盘；`GET /api/incidents/1/review` 返回最近一份，没有历史记录时会生成一份规则模式复盘。
 
 写入示例：
 ```json

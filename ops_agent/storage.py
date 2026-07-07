@@ -116,6 +116,23 @@ class Storage:
                     payload_json text not null default '{}'
                 );
 
+                create table if not exists incident_reviews (
+                    id integer primary key autoincrement,
+                    incident_id integer not null,
+                    created_at text not null,
+                    generated_by text not null default 'ops-agent',
+                    status text not null default '',
+                    severity text not null default '',
+                    title text not null default '',
+                    summary text not null default '',
+                    root_causes_json text not null default '[]',
+                    actions_json text not null default '[]',
+                    related_changes_json text not null default '[]',
+                    prevention_items_json text not null default '[]',
+                    timeline_summary_json text not null default '{}',
+                    payload_json text not null default '{}'
+                );
+
                 create table if not exists incident_recommendations (
                     id integer primary key autoincrement,
                     incident_id integer not null,
@@ -298,6 +315,8 @@ class Storage:
                     on incident_comments (incident_id, id);
                 create index if not exists idx_incident_diagnoses_incident
                     on incident_diagnoses (incident_id, id);
+                create index if not exists idx_incident_reviews_incident
+                    on incident_reviews (incident_id, id);
                 create unique index if not exists idx_learning_recommendations_dedupe
                     on learning_recommendations (dedupe_key);
                 create index if not exists idx_learning_config_patches_status
@@ -1334,6 +1353,75 @@ class Storage:
             "change_correlation": change_correlation,
             "entries": limited_entries,
         }
+
+    def generate_incident_review(
+        self,
+        incident_id: int,
+        generated_by: str = "ops-agent",
+        hours: int = 24,
+    ) -> dict | None:
+        incident = self.get_incident(incident_id)
+        if not incident:
+            return None
+        timeline = self.incident_timeline(incident_id, hours=hours, limit=500) or {}
+        review = build_incident_review_payload(
+            incident=incident,
+            timeline=timeline,
+            diagnoses=self.latest_incident_diagnoses(incident_id, limit=20),
+            recommendations=self.latest_incident_recommendations(incident_id, limit=100),
+            actions=self.latest_action_logs(100, incident_id=incident_id),
+            notifications=self.latest_notification_logs(100, incident_id=incident_id),
+        )
+        return self.save_incident_review(incident_id, generated_by, review)
+
+    def save_incident_review(self, incident_id: int, generated_by: str, review: dict) -> dict:
+        now = utc_now_iso()
+        payload = safe_dict(review)
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                insert into incident_reviews (
+                    incident_id, created_at, generated_by, status, severity, title, summary,
+                    root_causes_json, actions_json, related_changes_json, prevention_items_json,
+                    timeline_summary_json, payload_json
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    incident_id,
+                    now,
+                    str(generated_by or "ops-agent"),
+                    str(payload.get("status") or ""),
+                    str(payload.get("severity") or ""),
+                    str(payload.get("title") or ""),
+                    str(payload.get("summary") or ""),
+                    json.dumps(safe_list(payload.get("root_causes")), ensure_ascii=False),
+                    json.dumps(safe_list(payload.get("actions")), ensure_ascii=False),
+                    json.dumps(safe_list(payload.get("related_changes")), ensure_ascii=False),
+                    json.dumps(safe_list(payload.get("prevention_items")), ensure_ascii=False),
+                    json.dumps(safe_dict(payload.get("timeline_summary")), ensure_ascii=False),
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+            self.connection.commit()
+            row = self.connection.execute(
+                "select * from incident_reviews where id = ?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        return incident_review_payload(row)
+
+    def latest_incident_reviews(self, incident_id: int, limit: int = 10) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                """
+                select * from incident_reviews
+                where incident_id = ?
+                order by id desc
+                limit ?
+                """,
+                (incident_id, min(max(int(limit or 10), 1), 100)),
+            ).fetchall()
+        return [incident_review_payload(row) for row in rows]
 
     def save_change_event(self, event: dict) -> dict:
         payload = normalize_change_event(event)
@@ -3672,6 +3760,17 @@ def diagnosis_record_payload(row: sqlite3.Row) -> dict:
     return payload
 
 
+def incident_review_payload(row: sqlite3.Row) -> dict:
+    payload = dict(row)
+    payload["root_causes"] = parse_json_list(str(payload.get("root_causes_json") or "[]"))
+    payload["actions"] = parse_json_list(str(payload.get("actions_json") or "[]"))
+    payload["related_changes"] = parse_json_list(str(payload.get("related_changes_json") or "[]"))
+    payload["prevention_items"] = parse_json_list(str(payload.get("prevention_items_json") or "[]"))
+    payload["timeline_summary"] = parse_json_object(str(payload.get("timeline_summary_json") or "{}"))
+    payload["payload"] = parse_json_object(str(payload.get("payload_json") or "{}"))
+    return payload
+
+
 def recommendation_dedupe_key(item: dict, source: str) -> str:
     payload = {
         "source": source,
@@ -3997,6 +4096,222 @@ def incident_result_targets(incident: dict) -> set[tuple[str, str]]:
         if source and name:
             targets.add((source, name))
     return targets
+
+
+def build_incident_review_payload(
+    incident: dict,
+    timeline: dict,
+    diagnoses: list[dict],
+    recommendations: list[dict],
+    actions: list[dict],
+    notifications: list[dict],
+) -> dict:
+    incident_id = safe_int(incident.get("id"))
+    severity = str(incident.get("severity") or "")
+    status = str(incident.get("status") or "")
+    title = str(incident.get("title") or f"Incident #{incident_id}")
+    timeline_summary = safe_dict(timeline.get("summary"))
+    change_correlation = safe_dict(timeline.get("change_correlation"))
+    related_changes = [
+        {
+            "id": row.get("id"),
+            "created_at": row.get("created_at"),
+            "title": row.get("title"),
+            "source": row.get("source"),
+            "change_type": row.get("change_type"),
+            "risk": row.get("risk"),
+            "status": row.get("status"),
+            "correlation_score": row.get("correlation_score"),
+            "correlation_reasons": row.get("correlation_reasons") or [],
+        }
+        for row in safe_list(change_correlation.get("related_changes"))
+        if isinstance(row, dict)
+    ]
+    root_causes = incident_review_root_causes(incident, diagnoses, related_changes)
+    action_items = incident_review_actions(actions)
+    notification_items = [
+        {
+            "id": row.get("id"),
+            "created_at": row.get("created_at"),
+            "title": row.get("title"),
+            "status": row.get("status"),
+            "severity": row.get("severity"),
+            "channels": parse_json_list(str(row.get("channels_json") or "[]")),
+        }
+        for row in notifications
+    ]
+    prevention_items = incident_review_prevention_items(incident, recommendations, related_changes, root_causes)
+    summary = (
+        f"{severity or 'unknown'} incident is {status or 'unknown'}; "
+        f"{safe_int(incident.get('occurrence_count'), 1)} occurrence(s); "
+        f"{len(action_items)} action record(s); {len(related_changes)} related change(s)."
+    )
+    return {
+        "incident_id": incident_id,
+        "title": f"Incident #{incident_id} review: {title}",
+        "status": status,
+        "severity": severity,
+        "summary": summary,
+        "impact": {
+            "occurrence_count": safe_int(incident.get("occurrence_count"), 1),
+            "first_seen_at": incident.get("first_seen_at") or incident.get("created_at") or "",
+            "last_seen_at": incident.get("last_seen_at") or incident.get("updated_at") or "",
+            "notification_count": len(notification_items),
+            "timeline_entry_count": safe_int(timeline_summary.get("total")),
+        },
+        "root_causes": root_causes,
+        "actions": action_items,
+        "notifications": notification_items,
+        "related_changes": related_changes,
+        "prevention_items": prevention_items,
+        "timeline_summary": timeline_summary,
+        "generated_mode": "rules",
+    }
+
+
+def incident_review_root_causes(incident: dict, diagnoses: list[dict], related_changes: list[dict]) -> list[dict]:
+    root_causes: list[dict] = []
+    for row in diagnoses[:3]:
+        category = str(row.get("top_category") or "").strip()
+        if not category:
+            continue
+        root_causes.append(
+            {
+                "category": category,
+                "confidence": safe_float(row.get("top_confidence")),
+                "source": "diagnosis",
+                "summary": f"Diagnosis selected {category}.",
+                "evidence": safe_dict(row.get("evidence")),
+            }
+        )
+    classification = str(incident.get("classification_category") or "").strip()
+    if classification and not root_causes:
+        root_causes.append(
+            {
+                "category": classification,
+                "confidence": safe_float(incident.get("classification_confidence")),
+                "source": "classification",
+                "summary": str(incident.get("classification_summary") or ""),
+                "evidence": parse_json_list(str(incident.get("classification_evidence_json") or "[]")),
+            }
+        )
+    if related_changes:
+        best_change = max(related_changes, key=lambda row: safe_float(row.get("correlation_score")))
+        root_causes.append(
+            {
+                "category": "recent_change_correlation",
+                "confidence": safe_float(best_change.get("correlation_score")),
+                "source": "change_events",
+                "summary": f"{len(related_changes)} related change event(s) found near the incident.",
+                "evidence": [best_change.get("title") or best_change.get("change_type") or "change_event"],
+            }
+        )
+    if safe_int(incident.get("false_positive")):
+        root_causes.append(
+            {
+                "category": "false_positive",
+                "confidence": 1.0,
+                "source": "incident_lifecycle",
+                "summary": str(incident.get("false_positive_reason") or "Incident marked false positive."),
+                "evidence": [],
+            }
+        )
+    if not root_causes:
+        root_causes.append(
+            {
+                "category": "unknown",
+                "confidence": 0.0,
+                "source": "rules",
+                "summary": "No diagnosis or related change has enough evidence yet.",
+                "evidence": [],
+            }
+        )
+    return root_causes
+
+
+def incident_review_actions(actions: list[dict]) -> list[dict]:
+    return [
+        {
+            "id": row.get("id"),
+            "created_at": row.get("created_at"),
+            "action_type": row.get("action_type"),
+            "title": row.get("title"),
+            "risk": row.get("risk"),
+            "status": row.get("status"),
+            "verify_status": row.get("verify_status"),
+            "summary": bounded_text(row.get("error") or row.get("output") or row.get("reason"), 500),
+        }
+        for row in actions
+    ]
+
+
+def incident_review_prevention_items(
+    incident: dict,
+    recommendations: list[dict],
+    related_changes: list[dict],
+    root_causes: list[dict],
+) -> list[dict]:
+    items: list[dict] = []
+    for step in parse_json_list(str(incident.get("classification_next_steps_json") or "[]"))[:5]:
+        text = str(step or "").strip()
+        if text:
+            items.append({"source": "classification", "title": text, "priority": "medium"})
+    for row in recommendations[:10]:
+        title = str(row.get("title") or row.get("action_type") or "").strip()
+        if title:
+            items.append(
+                {
+                    "source": "recommendation",
+                    "title": title,
+                    "priority": str(row.get("risk") or "medium"),
+                    "status": str(row.get("status") or ""),
+                }
+            )
+    categories = {str(row.get("category") or "") for row in root_causes}
+    if "recent_change_correlation" in categories:
+        items.append(
+            {
+                "source": "change_events",
+                "title": "Review release, rollback, and config-change gates for this project.",
+                "priority": "high",
+            }
+        )
+    if not related_changes:
+        items.append(
+            {
+                "source": "change_events",
+                "title": "Keep deployment and config changes recorded so future incidents can be correlated.",
+                "priority": "medium",
+            }
+        )
+    if not items:
+        items.append(
+            {
+                "source": "rules",
+                "title": "Collect more evidence and add a specific classifier or playbook if this repeats.",
+                "priority": "medium",
+            }
+        )
+    return dedupe_review_items(items)
+
+
+def dedupe_review_items(items: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for item in items:
+        key = f"{item.get('source')}:{item.get('title')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def bounded_text(value: object, max_length: int = 500) -> str:
+    text = str(value or "")
+    if len(text) <= max_length:
+        return text
+    return text[: max(0, max_length - 3)] + "..."
 
 
 def count_by_key(rows: list[dict], key: str, default: str = "unknown") -> dict[str, int]:

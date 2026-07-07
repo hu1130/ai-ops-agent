@@ -788,6 +788,103 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(1, timeline["change_correlation"]["related_count"])
         self.assertEqual(change["id"], timeline["change_correlation"]["related_changes"][0]["id"])
 
+    def test_incident_review_api_generates_structured_postmortem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            result = CheckResult(source="http", name="Website", status="critical", summary="HTTP 500")
+            storage.save_results([result])
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [result],
+                classification={
+                    "category": "application_or_gateway_error",
+                    "confidence": 0.88,
+                    "summary": "HTTP 5xx",
+                    "evidence": ["http/Website HTTP 500"],
+                    "next_steps": ["Check gateway and application logs"],
+                },
+            )
+            storage.save_incident_diagnosis(
+                incident_id,
+                {
+                    "context": {"environment": "prod", "run_type": "normal"},
+                    "probable_causes": [{"category": "application_or_gateway_error", "confidence": 0.88}],
+                    "next_decision": {"action": "collect_targeted_evidence"},
+                    "evidence": {"signals": ["HTTP 500"]},
+                },
+            )
+            storage.save_action_log(
+                "check_http_status",
+                "Check website",
+                "low",
+                "failed",
+                "confirm outage",
+                {"url": "https://example.com"},
+                error="HTTP 500",
+                incident_id=incident_id,
+            )
+            storage.save_notification_log(
+                "Ops Agent detected 1 issue(s)",
+                "http:Website:critical",
+                "sent",
+                severity="critical",
+                channels=["email"],
+                incident_id=incident_id,
+            )
+            change = storage.save_change_event(
+                {
+                    "title": "Deploy website release",
+                    "source": "deploy",
+                    "change_type": "deployment",
+                    "project_id": "website",
+                    "related_incident_id": incident_id,
+                    "actor": "tester",
+                    "risk": "high",
+                }
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0)
+            host, port = server.server_address
+            try:
+                request = urllib.request.Request(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/review",
+                    data=b'{"actor":"tester","hours":24}',
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    review = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/reviews",
+                    timeout=5,
+                ) as response:
+                    reviews = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://{host}:{port}/api/incidents/{incident_id}/review",
+                    timeout=5,
+                ) as response:
+                    latest_review = json.loads(response.read().decode("utf-8"))
+                audit = storage.latest_api_audit_logs(5)
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertGreater(review["id"], 0)
+        self.assertEqual("tester", review["generated_by"])
+        self.assertEqual("critical", review["severity"])
+        self.assertEqual(incident_id, review["payload"]["incident_id"])
+        self.assertEqual(1, len(review["actions"]))
+        self.assertEqual(change["id"], review["related_changes"][0]["id"])
+        self.assertTrue(review["prevention_items"])
+        root_categories = {item["category"] for item in review["root_causes"]}
+        self.assertIn("application_or_gateway_error", root_categories)
+        self.assertIn("recent_change_correlation", root_categories)
+        self.assertEqual(review["id"], reviews[0]["id"])
+        self.assertEqual(review["id"], latest_review["id"])
+        self.assertEqual("incident.review", audit[0]["operation"])
+
     def test_escalated_and_failed_action_list_apis(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")
