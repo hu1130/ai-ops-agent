@@ -91,6 +91,72 @@ class CliTest(unittest.TestCase):
         )
         self.assertEqual([], validate_config(config))
 
+    def test_validate_config_accepts_business_flow_check(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60},
+                "business_flow_checks": [
+                    {
+                        "name": "project flow",
+                        "variables": {"base_url": "https://example.com", "username": "ops", "password": "secret"},
+                        "steps": [
+                            {
+                                "name": "login",
+                                "url": "{{base_url}}/api/login",
+                                "json": {"username": "{{username}}", "password": "{{password}}"},
+                                "expected_status": 200,
+                                "required_json_paths": ["data.token"],
+                                "extract": {"token": "json:data.token"},
+                            },
+                            {
+                                "name": "project list",
+                                "method": "GET",
+                                "url": "https://example.com/api/projects",
+                                "headers": {"Authorization": "Bearer {{token}}"},
+                                "expected_statuses": [200],
+                                "required_json_paths": ["data.projects.0.id"],
+                            },
+                        ],
+                    }
+                ],
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+            },
+            base_dir=Path("."),
+        )
+        self.assertEqual([], validate_config(config))
+
+    def test_validate_config_rejects_bad_business_flow_check(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60},
+                "business_flow_checks": [
+                    {
+                        "timeout_seconds": 0,
+                        "variables": "bad",
+                        "steps": [
+                            {
+                                "url": "not-a-url",
+                                "method": "BAD",
+                                "expected_statuses": ["bad"],
+                                "headers": "bad",
+                                "extract": "bad",
+                            }
+                        ],
+                    }
+                ],
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+            },
+            base_dir=Path("."),
+        )
+        errors = validate_config(config)
+        self.assertTrue(any("business_flow_checks[0].timeout_seconds" in error for error in errors))
+        self.assertTrue(any("business_flow_checks[0].variables" in error for error in errors))
+        self.assertTrue(any("business_flow_checks[0].steps[0].url" in error for error in errors))
+        self.assertTrue(any("business_flow_checks[0].steps[0].method" in error for error in errors))
+        self.assertTrue(any("business_flow_checks[0].steps[0].expected_statuses" in error for error in errors))
+        self.assertTrue(any("business_flow_checks[0].steps[0].headers" in error for error in errors))
+        self.assertTrue(any("business_flow_checks[0].steps[0].extract" in error for error in errors))
+
     def test_validate_config_rejects_bad_docker_check(self) -> None:
         config = AppConfig(
             raw={

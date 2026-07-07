@@ -26,6 +26,7 @@ from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.diagnostics.suggestions import build_action_suggestions
 from ops_agent.diagnosis import diagnostic_snapshot_evidence, persist_incident_diagnosis
 from ops_agent.events import CheckResult, RunContext, apply_context
+from ops_agent.monitors.business_flow_monitor import run_business_flow_checks
 from ops_agent.monitors.docker_monitor import run_docker_checks
 from ops_agent.monitors.http_monitor import run_http_checks
 from ops_agent.monitors.json_api_monitor import run_json_checks
@@ -55,6 +56,7 @@ DEFAULT_AI_REPAIR_AUTO_TRIGGER_POLICY = {
         "performance_degraded",
         "probe_config_issue",
         "route_or_healthcheck_config_mismatch",
+        "business_flow_failure",
         "synthetic_quality_fail",
     ],
     "excluded_categories": ["unknown", "unclassified"],
@@ -95,6 +97,11 @@ class OpsScheduler:
         results: list[CheckResult] = []
         results.extend(run_http_checks(self.due_checks("http", self.config.http_checks, respect_intervals, cycle_started_at)))
         results.extend(run_json_checks(self.due_checks("json", self.config.json_checks, respect_intervals, cycle_started_at)))
+        results.extend(
+            run_business_flow_checks(
+                self.due_checks("business_flow", self.config.business_flow_checks, respect_intervals, cycle_started_at)
+            )
+        )
         results.extend(run_server_checks(self.config.server_checks, self.config.base_dir))
         results.extend(run_docker_checks(self.due_checks("docker", self.config.docker_checks, respect_intervals, cycle_started_at)))
         results.extend(run_log_checks(self.due_checks("log", self.config.log_checks, respect_intervals, cycle_started_at), self.config.base_dir))

@@ -74,6 +74,60 @@
       "bad_phrases": ["系统异常", "API key", "服务未启用"]
     }
   ],
+  "business_flow_checks": [
+    {
+      "name": "Example authenticated project flow",
+      "enabled": false,
+      "interval_seconds": 300,
+      "timeout_seconds": 15,
+      "max_total_latency_ms": 15000,
+      "alert_after_failures": 1,
+      "variables": {
+        "username": "ops-probe@example.com",
+        "password": "change-me"
+      },
+      "steps": [
+        {
+          "name": "login",
+          "method": "POST",
+          "url": "https://example.com/api/login",
+          "json": {
+            "username": "{{username}}",
+            "password": "{{password}}"
+          },
+          "expected_status": 200,
+          "required_json_paths": ["data.token"],
+          "extract": {
+            "token": "json:data.token"
+          }
+        },
+        {
+          "name": "project list",
+          "method": "GET",
+          "url": "https://example.com/api/projects",
+          "headers": {
+            "Authorization": "Bearer {{token}}"
+          },
+          "expected_status": 200,
+          "required_json_paths": ["data.projects.0.id"],
+          "extract": {
+            "project_id": "json:data.projects.0.id"
+          }
+        },
+        {
+          "name": "project detail",
+          "method": "GET",
+          "url": "https://example.com/api/projects/{{project_id}}",
+          "headers": {
+            "Authorization": "Bearer {{token}}"
+          },
+          "expected_status": 200,
+          "required_json_paths": ["data.id"],
+          "forbidden_texts": ["Unauthorized", "Internal Server Error"]
+        }
+      ]
+    }
+  ],
   "server_checks": {
     "enabled": true,
     "disk_path": ".",
@@ -143,6 +197,7 @@
           "performance_degraded",
           "probe_config_issue",
           "route_or_healthcheck_config_mismatch",
+          "business_flow_failure",
           "synthetic_quality_fail"
         ],
         "excluded_categories": ["unknown", "unclassified"],
@@ -237,9 +292,9 @@
         "enabled": true,
         "on_failure": "halt",
         "match": {
-          "sources": ["http", "json_api"],
+          "sources": ["http", "json_api", "business_flow"],
           "statuses": ["warning", "critical"],
-          "categories": ["service_unavailable", "dependency_failure", "performance_degraded", "synthetic_quality_fail"]
+          "categories": ["service_unavailable", "dependency_failure", "performance_degraded", "business_flow_failure", "synthetic_quality_fail"]
         },
         "steps": [
           {

@@ -95,6 +95,60 @@ HTTP 监控默认会做备用诊断。主检查地址失败时，系统会自动
 - `status_on_content_mismatch`: 内容不匹配时标记为 `warning` 或 `critical`。
 - `alert_after_failures`: 覆盖全局连续失败阈值。关键入口建议设为 `1`，一次失败就生成事件和通知。
 
+## 认证业务流程监控
+
+如果要发现“官网能打开，但登录后项目进不去”，需要配置 `business_flow_checks`。它会按步骤执行真实业务链路，自动保持 Cookie，支持从上一步响应里提取 token、项目 ID 等变量，再传给下一步。
+
+```json
+"business_flow_checks": [
+  {
+    "name": "Project business flow",
+    "interval_seconds": 300,
+    "alert_after_failures": 1,
+    "variables": {
+      "username": "ops-probe@example.com",
+      "password": "change-me"
+    },
+    "steps": [
+      {
+        "name": "login",
+        "url": "https://example.com/api/login",
+        "json": {
+          "username": "{{username}}",
+          "password": "{{password}}"
+        },
+        "required_json_paths": ["data.token"],
+        "extract": {"token": "json:data.token"}
+      },
+      {
+        "name": "project list",
+        "method": "GET",
+        "url": "https://example.com/api/projects",
+        "headers": {"Authorization": "Bearer {{token}}"},
+        "required_json_paths": ["data.projects.0.id"],
+        "extract": {"project_id": "json:data.projects.0.id"}
+      },
+      {
+        "name": "project detail",
+        "method": "GET",
+        "url": "https://example.com/api/projects/{{project_id}}",
+        "headers": {"Authorization": "Bearer {{token}}"},
+        "required_json_paths": ["data.id"],
+        "forbidden_texts": ["Unauthorized", "Internal Server Error"]
+      }
+    ]
+  }
+]
+```
+
+支持字段：
+- `json`、`form`、`body`: 请求体。
+- `required_json_paths`: 必须存在的 JSON 路径，例如 `data.projects.0.id`。
+- `required_texts`、`forbidden_texts`: 页面或接口返回内容断言。
+- `extract`: 从 JSON、响应头、Cookie、正则提取变量，后续步骤用 `{{变量名}}` 引用。
+
+业务流失败会归类为 `business_flow_failure`，并在事件里记录失败步骤、状态码、耗时和脱敏响应样本。token、password、Authorization、Cookie 等敏感字段不会写入事件详情。
+
 ## Docker 日志监控
 
 推荐按容器名配置 Docker 日志，不要写死 `/var/lib/docker/containers/...` 里的容器 ID 路径。容器重建后 ID 会变，容器名通常保持稳定。
@@ -180,6 +234,7 @@ dependency_failure      依赖故障
 performance_degraded    性能下降
 container_unhealthy     容器健康异常
 log_error_spike         日志错误增加
+business_flow_failure   登录、鉴权、项目列表、项目详情等真实业务流程失败
 synthetic_quality_fail  合成测试质量失败
 resource_pressure       服务器资源压力
 unknown                 未知异常
@@ -392,7 +447,7 @@ python -m ops_agent.cli --config .\config.json action-logs
 `remediation.playbooks` 用来把常见故障处理流程配置成剧本。Playbook 只负责编排动作，不绕过策略中心；最终能否自动执行、是否需要人工确认、是否必须执行后验证，仍由 `remediation.policies` 决定。
 
 Playbook 支持按以下条件匹配异常：
-- `sources`: 例如 `http`、`json_api`、`server`、`log`
+- `sources`: 例如 `http`、`json_api`、`business_flow`、`server`、`log`
 - `statuses`: `warning` 或 `critical`
 - `name_contains`、`summary_contains`、`url_contains`、`path_contains`
 

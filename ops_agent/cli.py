@@ -600,6 +600,8 @@ def validate_config(config: AppConfig) -> list[str]:
         validate_optional_positive_int(check.get("alert_after_failures"), f"json_checks[{index}].alert_after_failures", errors)
         validate_optional_positive_int(check.get("consecutive_failures"), f"json_checks[{index}].consecutive_failures", errors)
 
+    validate_business_flow_checks(config, errors)
+
     for index, check in enumerate(config.docker_checks):
         container_value = str(check.get("container", "")).strip()
         if not container_value:
@@ -742,6 +744,78 @@ def validate_config(config: AppConfig) -> list[str]:
                 errors.append(f"alerts.email.{key} 不能为空")
 
     return errors
+
+
+def validate_business_flow_checks(config: AppConfig, errors: list[str]) -> None:
+    allowed_methods = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}
+    for index, check in enumerate(config.business_flow_checks):
+        field = f"business_flow_checks[{index}]"
+        validate_positive_int(check.get("timeout_seconds", 15), f"{field}.timeout_seconds", errors)
+        validate_optional_positive_int(check.get("interval_seconds"), f"{field}.interval_seconds", errors)
+        validate_optional_positive_int(check.get("max_latency_ms"), f"{field}.max_latency_ms", errors)
+        validate_optional_positive_int(check.get("max_total_latency_ms"), f"{field}.max_total_latency_ms", errors)
+        validate_optional_positive_int(check.get("max_response_bytes"), f"{field}.max_response_bytes", errors)
+        validate_optional_positive_int(check.get("alert_after_failures"), f"{field}.alert_after_failures", errors)
+        validate_optional_positive_int(check.get("consecutive_failures"), f"{field}.consecutive_failures", errors)
+        if "failure_status" in check:
+            validate_problem_status(check["failure_status"], f"{field}.failure_status", errors)
+        if "headers" in check and not isinstance(check["headers"], dict):
+            errors.append(f"{field}.headers 必须是对象")
+        if "variables" in check and not isinstance(check["variables"], dict):
+            errors.append(f"{field}.variables 必须是对象")
+
+        steps = check.get("steps", [])
+        if not isinstance(steps, list) or not steps:
+            errors.append(f"{field}.steps 必须是非空数组")
+            continue
+
+        for step_index, step in enumerate(steps):
+            step_field = f"{field}.steps[{step_index}]"
+            if not isinstance(step, dict):
+                errors.append(f"{step_field} 必须是对象")
+                continue
+            url = str(step.get("url", "")).strip()
+            if not url:
+                errors.append(f"{step_field}.url 不能为空")
+            else:
+                validate_business_flow_url(url, f"{step_field}.url", errors)
+            method = str(step.get("method", "POST" if any(key in step for key in ("json", "form", "body")) else "GET")).upper()
+            if method not in allowed_methods:
+                errors.append(f"{step_field}.method 必须是 GET/POST/PUT/PATCH/DELETE/HEAD")
+            validate_optional_positive_int(step.get("timeout_seconds"), f"{step_field}.timeout_seconds", errors)
+            validate_optional_positive_int(step.get("max_latency_ms"), f"{step_field}.max_latency_ms", errors)
+            validate_optional_positive_int(step.get("max_response_bytes"), f"{step_field}.max_response_bytes", errors)
+            validate_optional_positive_int(step.get("min_body_bytes"), f"{step_field}.min_body_bytes", errors)
+            validate_optional_positive_int(step.get("expected_status"), f"{step_field}.expected_status", errors)
+            if "expected_statuses" in step:
+                validate_status_code_list(step["expected_statuses"], f"{step_field}.expected_statuses", errors)
+            if "failure_status" in step:
+                validate_problem_status(step["failure_status"], f"{step_field}.failure_status", errors)
+            validate_string_list(step.get("required_texts", []), f"{step_field}.required_texts", errors)
+            validate_string_list(step.get("forbidden_texts", []), f"{step_field}.forbidden_texts", errors)
+            validate_string_list(step.get("required_json_paths", step.get("required_paths", [])), f"{step_field}.required_json_paths", errors)
+            validate_string_list(step.get("bad_phrases", []), f"{step_field}.bad_phrases", errors)
+            if "headers" in step and not isinstance(step["headers"], dict):
+                errors.append(f"{step_field}.headers 必须是对象")
+            if "json" in step and not isinstance(step["json"], (dict, list)):
+                errors.append(f"{step_field}.json 必须是对象或数组")
+            if "form" in step and not isinstance(step["form"], dict):
+                errors.append(f"{step_field}.form 必须是对象")
+            if "extract" in step and not isinstance(step["extract"], dict):
+                errors.append(f"{step_field}.extract 必须是对象")
+
+
+def validate_problem_status(value: object, field: str, errors: list[str]) -> None:
+    status = str(value).strip().lower()
+    if status not in {"warning", "critical"}:
+        errors.append(f"{field} 必须是 warning/critical")
+
+
+def validate_business_flow_url(value: str, field: str, errors: list[str]) -> None:
+    text = value.strip()
+    if text.startswith("{{") and "}}" in text:
+        return
+    validate_url(text, field, errors)
 
 
 def validate_url(value: str, field: str, errors: list[str]) -> None:

@@ -41,8 +41,8 @@ def plan_for_result(
     actions: list[RemediationAction] = []
     category = classify_signal(result, classification_rules).category
 
-    if result.source in {"http", "json_api"}:
-        url = str(result.details.get("url", ""))
+    if result.source in {"http", "json_api", "business_flow"}:
+        url = related_url(result)
         if category == "probe_config_issue":
             if url:
                 actions.append(
@@ -207,6 +207,21 @@ def dedupe_actions(actions: list[RemediationAction]) -> list[RemediationAction]:
 
 def public_params(params: dict) -> dict:
     return {key: value for key, value in params.items() if not str(key).startswith("_")}
+
+
+def related_url(result: CheckResult) -> str:
+    details = result.details or {}
+    if details.get("url"):
+        return str(details.get("url", ""))
+    failed_step = details.get("failed_step")
+    if isinstance(failed_step, dict) and failed_step.get("url"):
+        return str(failed_step.get("url", ""))
+    steps = details.get("steps")
+    if isinstance(steps, list):
+        for step in reversed(steps):
+            if isinstance(step, dict) and step.get("url"):
+                return str(step.get("url", ""))
+    return ""
 
 
 def host_port_from_url(url: str) -> tuple[str, int | None]:

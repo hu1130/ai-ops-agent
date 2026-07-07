@@ -16,6 +16,7 @@ CATEGORY_LABELS = {
     "resource_pressure": "服务器资源压力",
     "unknown": "未知异常",
 }
+CATEGORY_LABELS["business_flow_failure"] = "Business flow failure"
 
 
 @dataclass
@@ -63,6 +64,8 @@ def classify_signal(
         return classify_http(result)
     if result.source in {"json", "json_api"}:
         return classify_json_api(result)
+    if result.source == "business_flow":
+        return classify_business_flow(result)
     if result.source == "log":
         return classify_log(result)
     if result.source == "docker":
@@ -224,6 +227,84 @@ def classify_json_api(result: CheckResult) -> IncidentClassification:
     return unknown_classification(result)
 
 
+def classify_business_flow(result: CheckResult) -> IncidentClassification:
+    details = result.details or {}
+    failed_step = safe_dict(details.get("failed_step"))
+    status_code = int_or_none(failed_step.get("status_code") or details.get("status_code"))
+    summary = result.summary.lower()
+    evidence = base_evidence(result)
+    if failed_step:
+        evidence.append(
+            f"Business flow failed at step {failed_step.get('index')}: "
+            f"{failed_step.get('name')} {failed_step.get('url')}"
+        )
+    if status_code is not None:
+        evidence.append(f"Failed step HTTP status: {status_code}")
+
+    if status_code in {401, 403} or "login" in summary or "auth" in summary or "unauthorized" in summary:
+        return IncidentClassification(
+            category="business_flow_failure",
+            confidence=0.9,
+            summary="Authenticated business flow failed. The site may open, but login/session/permission path is broken.",
+            evidence=evidence,
+            next_steps=[
+                "Replay the failed synthetic flow step with the same test account and headers.",
+                "Check login/session/token issuance, permission checks, and recently changed auth configuration.",
+                "Inspect application logs around the failed step URL and related user/test account.",
+            ],
+        )
+
+    if status_code is not None and status_code >= 500:
+        return IncidentClassification(
+            category="service_unavailable",
+            confidence=0.88,
+            summary="A real business flow step returned 5xx, so this is likely an application or dependency outage.",
+            evidence=evidence,
+            next_steps=[
+                "Inspect gateway and application logs for the failed business endpoint.",
+                "Check database/cache/model/provider dependencies used by this step.",
+                "Compare the failure with the latest deploy and configuration changes.",
+            ],
+        )
+
+    if "missing required" in summary or "forbidden text" in summary or "suspicious phrase" in summary:
+        return IncidentClassification(
+            category="business_flow_failure",
+            confidence=0.86,
+            summary="Business flow returned HTTP success but content or JSON assertions failed.",
+            evidence=evidence,
+            next_steps=[
+                "Open the failed step response sample and confirm whether the page/API entered the expected business state.",
+                "Check whether the user was redirected to login, fallback, empty data, or an error wrapper.",
+                "Update assertions only after confirming the product behavior intentionally changed.",
+            ],
+        )
+
+    if "slow" in summary:
+        return IncidentClassification(
+            category="performance_degraded",
+            confidence=0.78,
+            summary="Business flow completed but exceeded latency threshold.",
+            evidence=evidence,
+            next_steps=[
+                "Break down latency by step and inspect the slow endpoint.",
+                "Check database queries, queue backlog, upstream APIs, and resource pressure.",
+            ],
+        )
+
+    return IncidentClassification(
+        category="business_flow_failure",
+        confidence=0.78,
+        summary="A configured business flow failed; this should be treated as a user-path problem until proven otherwise.",
+        evidence=evidence,
+        next_steps=[
+            "Replay the flow manually or with curl using the same configured test account.",
+            "Inspect failed step logs and dependency status.",
+            "Add or adjust assertions only after the actual business behavior is confirmed.",
+        ],
+    )
+
+
 def classify_log(result: CheckResult) -> IncidentClassification:
     details = result.details or {}
     match_count = int_or_none(details.get("match_count")) or 0
@@ -377,7 +458,7 @@ def correlate_signals(
     sources = {result.source for result in results}
     evidence = merge_evidence(classifications)
 
-    if "resource_pressure" in categories and ({"http", "json_api"} & sources):
+    if "resource_pressure" in categories and ({"http", "json_api", "business_flow"} & sources):
         return IncidentClassification(
             category="dependency_failure",
             confidence=0.87,
@@ -389,7 +470,7 @@ def correlate_signals(
             ],
         )
 
-    if "log_error_spike" in categories and ({"http", "json_api"} & sources):
+    if "log_error_spike" in categories and ({"http", "json_api", "business_flow"} & sources):
         return IncidentClassification(
             category="service_unavailable",
             confidence=0.86,
