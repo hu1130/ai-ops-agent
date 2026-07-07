@@ -73,6 +73,33 @@ class IncidentClassifierTest(unittest.TestCase):
 
         self.assertEqual(classification.category, "synthetic_quality_fail")
 
+    def test_docker_unhealthy_is_container_unhealthy(self) -> None:
+        result = CheckResult(
+            source="docker",
+            name="App container",
+            status="critical",
+            summary="Container app-1 health unhealthy",
+            details={"container": "app-1", "container_status": "running", "running": True, "health_status": "unhealthy"},
+        )
+
+        classification = classify_incident([result])
+
+        self.assertEqual("container_unhealthy", classification.category)
+        self.assertGreaterEqual(classification.confidence, 0.85)
+
+    def test_docker_inspect_failure_is_probe_config_issue(self) -> None:
+        result = CheckResult(
+            source="docker",
+            name="Missing container",
+            status="critical",
+            summary="Docker inspect failed: old-container",
+            details={"container": "old-container", "error": "No such object"},
+        )
+
+        classification = classify_incident([result])
+
+        self.assertEqual("probe_config_issue", classification.category)
+
     def test_configured_classification_rule_overrides_builtin_rules(self) -> None:
         result = CheckResult(
             source="json_api",

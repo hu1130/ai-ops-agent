@@ -600,6 +600,31 @@ def validate_config(config: AppConfig) -> list[str]:
         validate_optional_positive_int(check.get("alert_after_failures"), f"json_checks[{index}].alert_after_failures", errors)
         validate_optional_positive_int(check.get("consecutive_failures"), f"json_checks[{index}].consecutive_failures", errors)
 
+    for index, check in enumerate(config.docker_checks):
+        container_value = str(check.get("container", "")).strip()
+        if not container_value:
+            errors.append(f"docker_checks[{index}].container 不能为空")
+        else:
+            validate_context_name(container_value, f"docker_checks[{index}].container", errors)
+        validate_positive_int(check.get("timeout_seconds", 5), f"docker_checks[{index}].timeout_seconds", errors)
+        validate_optional_positive_int(check.get("interval_seconds"), f"docker_checks[{index}].interval_seconds", errors)
+        validate_optional_positive_int(check.get("alert_after_failures"), f"docker_checks[{index}].alert_after_failures", errors)
+        validate_optional_positive_int(check.get("consecutive_failures"), f"docker_checks[{index}].consecutive_failures", errors)
+        for status_key in (
+            "not_running_status",
+            "unhealthy_status",
+            "missing_status",
+            "missing_healthcheck_status",
+            "unknown_health_status",
+            "docker_unavailable_status",
+        ):
+            if status_key in check:
+                configured_status = str(check[status_key]).strip().lower()
+                if configured_status not in {"warning", "critical"}:
+                    errors.append(f"docker_checks[{index}].{status_key} 必须是 warning/critical")
+        if "require_healthcheck" in check and not isinstance(check["require_healthcheck"], bool):
+            errors.append(f"docker_checks[{index}].require_healthcheck 必须是 true/false")
+
     for index, check in enumerate(config.log_checks):
         validate_optional_positive_int(check.get("alert_after_failures"), f"log_checks[{index}].alert_after_failures", errors)
         validate_optional_positive_int(check.get("consecutive_failures"), f"log_checks[{index}].consecutive_failures", errors)

@@ -92,6 +92,50 @@ def plan_for_result(
             )
         )
 
+    if result.source == "docker":
+        container = str(result.details.get("container", "")).strip()
+        actions.append(
+            RemediationAction(
+                action_type="run_diagnostic_command",
+                title="查看 Docker 容器状态",
+                reason=f"{result.name} 容器状态异常，先确认容器当前状态和健康检查详情。",
+                params={
+                    "command": (
+                        f"docker inspect {shlex.quote(container)}"
+                        if container
+                        else "docker ps -a --format table {{.Names}}\\t{{.Status}}\\t{{.Ports}}"
+                    )
+                },
+                auto_execute=configured_actions.get("run_diagnostic_command", False),
+            )
+        )
+        actions.append(
+            RemediationAction(
+                action_type="run_diagnostic_command",
+                title="查看 Docker 容器日志",
+                reason=f"{result.name} 容器异常时，需要查看最近日志定位退出或 unhealthy 原因。",
+                params={
+                    "command": (
+                        f"docker logs --tail 160 {shlex.quote(container)}"
+                        if container
+                        else "docker ps -a --format table {{.Names}}\\t{{.Status}}\\t{{.Ports}}"
+                    )
+                },
+                auto_execute=configured_actions.get("run_diagnostic_command", False),
+            )
+        )
+        if container and category == "container_unhealthy":
+            actions.append(
+                RemediationAction(
+                    action_type="restart_docker_container",
+                    title=f"重启容器 {container}",
+                    reason=f"{result.name} 容器异常可考虑重启，但必须经过策略白名单和人工确认。",
+                    risk="medium",
+                    params={"container": container},
+                    auto_execute=configured_actions.get("restart_docker_container", False),
+                )
+            )
+
     if result.source == "server" and "Disk" in result.name:
         actions.append(
             RemediationAction(

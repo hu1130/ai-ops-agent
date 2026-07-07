@@ -81,6 +81,17 @@
     "memory_percent_warn": 85,
     "disk_percent_warn": 90
   },
+  "docker_checks": [
+    {
+      "name": "Example app container",
+      "container": "your-container-name",
+      "interval_seconds": 60,
+      "timeout_seconds": 5,
+      "unhealthy_status": "critical",
+      "not_running_status": "critical",
+      "alert_after_failures": 1
+    }
+  ],
   "log_checks": [
     {
       "name": "Example project log",

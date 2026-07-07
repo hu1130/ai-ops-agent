@@ -29,6 +29,10 @@ class AppConfig:
         return self.raw.get("server_checks", {})
 
     @property
+    def docker_checks(self) -> list[dict[str, Any]]:
+        return list(self.raw.get("docker_checks", []))
+
+    @property
     def log_checks(self) -> list[dict[str, Any]]:
         return list(self.raw.get("log_checks", []))
 

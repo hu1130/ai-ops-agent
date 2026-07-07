@@ -1,0 +1,62 @@
+import json
+import unittest
+from unittest.mock import patch
+
+from ops_agent.monitors.docker_monitor import run_docker_check
+
+
+class DockerMonitorTest(unittest.TestCase):
+    @patch("ops_agent.monitors.docker_monitor.subprocess.run")
+    def test_running_healthy_container_is_ok(self, run) -> None:
+        run.return_value.returncode = 0
+        run.return_value.stdout = json.dumps(
+            {"Status": "running", "Running": True, "Health": {"Status": "healthy"}}
+        )
+        run.return_value.stderr = ""
+
+        result = run_docker_check({"name": "api", "container": "api-1"})
+
+        self.assertEqual("ok", result.status)
+        self.assertIn("health healthy", result.summary)
+        self.assertEqual("api-1", result.details["container"])
+
+    @patch("ops_agent.monitors.docker_monitor.subprocess.run")
+    def test_unhealthy_container_is_critical_with_alert_threshold(self, run) -> None:
+        run.return_value.returncode = 0
+        run.return_value.stdout = json.dumps(
+            {"Status": "running", "Running": True, "Health": {"Status": "unhealthy"}}
+        )
+        run.return_value.stderr = ""
+
+        result = run_docker_check({"name": "api", "container": "api-1", "alert_after_failures": 1})
+
+        self.assertEqual("critical", result.status)
+        self.assertIn("health unhealthy", result.summary)
+        self.assertEqual(1, result.details["alert_after_failures"])
+
+    @patch("ops_agent.monitors.docker_monitor.subprocess.run")
+    def test_exited_container_is_critical(self, run) -> None:
+        run.return_value.returncode = 0
+        run.return_value.stdout = json.dumps({"Status": "exited", "Running": False, "ExitCode": 1})
+        run.return_value.stderr = ""
+
+        result = run_docker_check({"name": "worker", "container": "worker-1"})
+
+        self.assertEqual("critical", result.status)
+        self.assertIn("status exited", result.summary)
+        self.assertEqual(1, result.details["exit_code"])
+
+    @patch("ops_agent.monitors.docker_monitor.subprocess.run")
+    def test_missing_healthcheck_can_be_warning_when_required(self, run) -> None:
+        run.return_value.returncode = 0
+        run.return_value.stdout = json.dumps({"Status": "running", "Running": True})
+        run.return_value.stderr = ""
+
+        result = run_docker_check({"name": "api", "container": "api-1", "require_healthcheck": True})
+
+        self.assertEqual("warning", result.status)
+        self.assertIn("no Docker healthcheck", result.summary)
+
+
+if __name__ == "__main__":
+    unittest.main()

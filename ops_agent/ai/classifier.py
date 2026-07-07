@@ -65,6 +65,8 @@ def classify_signal(
         return classify_json_api(result)
     if result.source == "log":
         return classify_log(result)
+    if result.source == "docker":
+        return classify_docker(result)
     if result.source == "server":
         return classify_server(result)
     return unknown_classification(result)
@@ -263,6 +265,67 @@ def classify_log(result: CheckResult) -> IncidentClassification:
             next_steps=[
                 "确认日志路径、容器名和读取权限。",
                 "容器重建后优先使用稳定容器名，不要写死容器 ID 路径。",
+            ],
+        )
+
+    return unknown_classification(result)
+
+
+def classify_docker(result: CheckResult) -> IncidentClassification:
+    details = result.details or {}
+    evidence = base_evidence(result)
+    summary = result.summary.lower()
+    container_status = str(details.get("container_status") or "").strip().lower()
+    health_status = str(details.get("health_status") or "").strip().lower()
+    running = details.get("running")
+
+    if health_status == "unhealthy" or "unhealthy" in summary:
+        return IncidentClassification(
+            category="container_unhealthy",
+            confidence=0.9,
+            summary="Docker 容器 healthcheck 已经返回 unhealthy，需要优先查看容器健康检查、应用日志和业务入口。",
+            evidence=evidence,
+            next_steps=[
+                "执行 docker inspect 查看 Health 日志和最近失败原因。",
+                "查看容器最新应用日志，定位 healthcheck 失败对应的接口、依赖或进程状态。",
+                "同时复测业务入口，确认是否已经影响用户访问。",
+            ],
+        )
+
+    if running is False or container_status in {"exited", "dead", "restarting", "removing", "paused"}:
+        return IncidentClassification(
+            category="container_unhealthy",
+            confidence=0.88,
+            summary="Docker 容器没有处于稳定运行状态，业务服务可能已经退出、重启循环或被暂停。",
+            evidence=evidence,
+            next_steps=[
+                "查看 docker ps -a 和 docker logs，确认退出码和最后错误。",
+                "对照最近部署、配置和依赖变更。",
+                "重启前先确认数据写入、任务队列和外部依赖状态。",
+            ],
+        )
+
+    if "docker command is not available" in summary or "docker inspect failed" in summary:
+        return IncidentClassification(
+            category="probe_config_issue",
+            confidence=0.72,
+            summary="Docker 探针无法读取容器状态，可能是 Docker 不可用、容器名错误或权限不足。",
+            evidence=evidence,
+            next_steps=[
+                "确认服务器上 docker 命令可用且 ops-agent 有读取 Docker 状态的权限。",
+                "确认 docker_checks.container 是否是稳定容器名，而不是旧容器 ID。",
+            ],
+        )
+
+    if "no docker healthcheck" in summary:
+        return IncidentClassification(
+            category="probe_config_issue",
+            confidence=0.66,
+            summary="容器正在运行，但缺少 Docker healthcheck，监控无法判断容器内部健康状态。",
+            evidence=evidence,
+            next_steps=[
+                "为容器补充 Docker healthcheck 或关闭 require_healthcheck。",
+                "同时配置 HTTP/API 业务入口探针覆盖真实用户路径。",
             ],
         )
 

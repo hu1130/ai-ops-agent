@@ -71,6 +71,44 @@ class CliTest(unittest.TestCase):
         )
         self.assertEqual([], validate_config(config))
 
+    def test_validate_config_accepts_docker_check(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60},
+                "docker_checks": [
+                    {
+                        "name": "api",
+                        "container": "api-1",
+                        "unhealthy_status": "critical",
+                        "alert_after_failures": 1,
+                    }
+                ],
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+            },
+            base_dir=Path("."),
+        )
+        self.assertEqual([], validate_config(config))
+
+    def test_validate_config_rejects_bad_docker_check(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60},
+                "docker_checks": [
+                    {
+                        "container": "",
+                        "unhealthy_status": "bad",
+                        "require_healthcheck": "yes",
+                    }
+                ],
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+            },
+            base_dir=Path("."),
+        )
+        errors = validate_config(config)
+        self.assertTrue(any("docker_checks[0].container" in error for error in errors))
+        self.assertTrue(any("docker_checks[0].unhealthy_status" in error for error in errors))
+        self.assertTrue(any("docker_checks[0].require_healthcheck" in error for error in errors))
+
     def test_validate_config_accepts_remediation_policies(self) -> None:
         config = AppConfig(
             raw={

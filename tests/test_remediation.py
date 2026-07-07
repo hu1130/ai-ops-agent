@@ -37,6 +37,28 @@ class RemediationTest(unittest.TestCase):
         self.assertTrue(any(action.action_type == "check_port" for action in actions))
         self.assertTrue(any(action.params.get("port") == 443 for action in actions))
 
+    def test_plan_for_docker_unhealthy_collects_container_evidence(self) -> None:
+        config = AppConfig(
+            raw={"remediation": {"enabled": True, "actions": {"run_diagnostic_command": {"auto_execute": False}}}},
+            base_dir=Path("."),
+        )
+        issue = CheckResult(
+            source="docker",
+            name="App container",
+            status="critical",
+            summary="Container app-1 health unhealthy",
+            details={"container": "app-1", "container_status": "running", "running": True, "health_status": "unhealthy"},
+        )
+
+        actions = build_remediation_plan([issue], config)
+        commands = [action.params.get("command") for action in actions if action.action_type == "run_diagnostic_command"]
+
+        self.assertIn("docker inspect app-1", commands)
+        self.assertIn("docker logs --tail 160 app-1", commands)
+        restarts = [action for action in actions if action.action_type == "restart_docker_container"]
+        self.assertEqual(1, len(restarts))
+        self.assertFalse(restarts[0].auto_execute)
+
     def test_policy_auto_execute_overrides_plan_defaults(self) -> None:
         config = AppConfig(
             raw={
