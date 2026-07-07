@@ -559,6 +559,16 @@ def validate_config(config: AppConfig) -> list[str]:
         validate_positive_int(check.get("timeout_seconds", 5), f"http_checks[{index}].timeout_seconds", errors)
         validate_positive_int(check.get("expected_status", 200), f"http_checks[{index}].expected_status", errors)
         validate_positive_int(check.get("max_latency_ms", 3000), f"http_checks[{index}].max_latency_ms", errors)
+        validate_optional_positive_int(check.get("max_response_bytes"), f"http_checks[{index}].max_response_bytes", errors)
+        validate_optional_positive_int(check.get("min_body_bytes"), f"http_checks[{index}].min_body_bytes", errors)
+        validate_optional_positive_int(check.get("alert_after_failures"), f"http_checks[{index}].alert_after_failures", errors)
+        validate_optional_positive_int(check.get("consecutive_failures"), f"http_checks[{index}].consecutive_failures", errors)
+        validate_string_list(check.get("required_texts", []), f"http_checks[{index}].required_texts", errors)
+        validate_string_list(check.get("forbidden_texts", []), f"http_checks[{index}].forbidden_texts", errors)
+        if "status_on_content_mismatch" in check:
+            mismatch_status = str(check["status_on_content_mismatch"]).strip().lower()
+            if mismatch_status not in {"warning", "critical"}:
+                errors.append(f"http_checks[{index}].status_on_content_mismatch 必须是 warning/critical")
         if "fallback_enabled" in check and not isinstance(check["fallback_enabled"], bool):
             errors.append(f"http_checks[{index}].fallback_enabled 必须是 true/false")
         if "fallback_urls" in check:
@@ -587,8 +597,16 @@ def validate_config(config: AppConfig) -> list[str]:
             f"json_checks[{index}].interval_seconds",
             errors,
         )
+        validate_optional_positive_int(check.get("alert_after_failures"), f"json_checks[{index}].alert_after_failures", errors)
+        validate_optional_positive_int(check.get("consecutive_failures"), f"json_checks[{index}].consecutive_failures", errors)
 
     for index, check in enumerate(config.log_checks):
+        validate_optional_positive_int(check.get("alert_after_failures"), f"log_checks[{index}].alert_after_failures", errors)
+        validate_optional_positive_int(check.get("consecutive_failures"), f"log_checks[{index}].consecutive_failures", errors)
+        if "status_on_match" in check:
+            match_status = str(check["status_on_match"]).strip().lower()
+            if match_status not in {"warning", "critical"}:
+                errors.append(f"log_checks[{index}].status_on_match 必须是 warning/critical")
         container_value = str(check.get("container", "")).strip()
         if container_value:
             validate_context_name(container_value, f"log_checks[{index}].container", errors)
@@ -695,6 +713,12 @@ def validate_positive_int(value: object, field: str, errors: list[str]) -> None:
         return
     if number <= 0:
         errors.append(f"{field} 必须大于 0")
+
+
+def validate_optional_positive_int(value: object, field: str, errors: list[str]) -> None:
+    if value is None:
+        return
+    validate_positive_int(value, field, errors)
 
 
 def validate_context_name(value: object, field: str, errors: list[str]) -> None:

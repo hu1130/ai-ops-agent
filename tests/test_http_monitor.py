@@ -141,6 +141,35 @@ class HttpMonitorTest(unittest.TestCase):
         self.assertEqual(result.status, "critical")
         self.assertEqual(result.details["fallback_attempts"], [])
 
+    def test_required_text_detects_broken_business_page_even_with_http_200(self) -> None:
+        with LocalHttpServer({"/project": (200, "login ok")}) as server:
+            result = run_http_check(
+                {
+                    "name": "project entry",
+                    "url": server.url("/project"),
+                    "required_texts": ["Project Dashboard"],
+                    "alert_after_failures": 1,
+                }
+            )
+
+        self.assertEqual(result.status, "critical")
+        self.assertIn("Missing required response text", result.summary)
+        self.assertEqual(1, result.details["alert_after_failures"])
+
+    def test_forbidden_text_detects_error_page_even_with_http_200(self) -> None:
+        with LocalHttpServer({"/project": (200, "系统繁忙，请稍后再试")}) as server:
+            result = run_http_check(
+                {
+                    "name": "project entry",
+                    "url": server.url("/project"),
+                    "forbidden_texts": ["系统繁忙"],
+                    "status_on_content_mismatch": "warning",
+                }
+            )
+
+        self.assertEqual(result.status, "warning")
+        self.assertIn("forbidden text", result.summary)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,7 +40,7 @@ def run_json_check(check: dict[str, Any]) -> CheckResult:
             name=name,
             status="critical",
             summary=f"HTTP {exc.code} from {url}",
-            details={"url": url, "status_code": exc.code, "latency_ms": latency_ms, "error": error_body},
+            details={"url": url, "status_code": exc.code, "latency_ms": latency_ms, "error": error_body, **alert_policy_details(check)},
         )
     except Exception as exc:
         latency_ms = int((time.perf_counter() - start) * 1000)
@@ -49,7 +49,7 @@ def run_json_check(check: dict[str, Any]) -> CheckResult:
             name=name,
             status="critical",
             summary=f"Request failed for {url}: {exc}",
-            details={"url": url, "latency_ms": latency_ms, "error": repr(exc)},
+            details={"url": url, "latency_ms": latency_ms, "error": repr(exc), **alert_policy_details(check)},
         )
 
     latency_ms = int((time.perf_counter() - start) * 1000)
@@ -62,7 +62,14 @@ def run_json_check(check: dict[str, Any]) -> CheckResult:
             name=name,
             status="critical",
             summary="Response is not valid JSON",
-            details={"url": url, "status_code": status_code, "latency_ms": latency_ms, "error": str(exc), "sample": text[:500]},
+            details={
+                "url": url,
+                "status_code": status_code,
+                "latency_ms": latency_ms,
+                "error": str(exc),
+                "sample": text[:500],
+                **alert_policy_details(check),
+            },
         )
 
     validation_error = validate_json_response(parsed, check)
@@ -94,6 +101,7 @@ def run_json_check(check: dict[str, Any]) -> CheckResult:
             "status_code": status_code,
             "latency_ms": latency_ms,
             "response_sample": text[:800],
+            **alert_policy_details(check),
         },
     )
 
@@ -147,3 +155,12 @@ def expand_dynamic_values(value: Any) -> Any:
             .replace("{{timestamp}}", str(int(time.time())))
         )
     return value
+
+
+def alert_policy_details(check: dict[str, Any]) -> dict[str, Any]:
+    value = check.get("alert_after_failures", check.get("consecutive_failures"))
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return {}
+    return {"alert_after_failures": parsed} if parsed > 0 else {}

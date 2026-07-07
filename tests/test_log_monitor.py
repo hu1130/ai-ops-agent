@@ -16,6 +16,25 @@ class LogMonitorTest(unittest.TestCase):
             self.assertEqual(result.status, "warning")
             self.assertEqual(result.details["match_count"], 1)
 
+    def test_run_log_check_can_mark_business_log_match_critical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            log_path = tmp_path / "app.log"
+            log_path.write_text("GET /project 500\n", encoding="utf-8")
+            result = run_log_check(
+                {
+                    "name": "project entry log",
+                    "path": str(log_path),
+                    "keywords": ["GET /project 500"],
+                    "status_on_match": "critical",
+                    "alert_after_failures": 1,
+                },
+                tmp_path,
+            )
+
+        self.assertEqual(result.status, "critical")
+        self.assertEqual(1, result.details["alert_after_failures"])
+
     def test_run_log_check_reads_docker_logs_by_container_name(self) -> None:
         completed = Mock(returncode=0, stdout="ok\nERROR api timeout\n", stderr="")
         with tempfile.TemporaryDirectory() as tmp:

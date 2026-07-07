@@ -46,6 +46,10 @@
       "timeout_seconds": 5,
       "expected_status": 200,
       "max_latency_ms": 3000,
+      "required_texts": ["Example"],
+      "forbidden_texts": ["系统繁忙", "Internal Server Error"],
+      "status_on_content_mismatch": "critical",
+      "alert_after_failures": 1,
       "fallback_enabled": true,
       "fallback_urls": ["/login", "/"],
       "fallback_expected_statuses": [200, 204, 301, 302, 401, 403],
@@ -60,6 +64,7 @@
       "timeout_seconds": 20,
       "expected_status": 200,
       "max_latency_ms": 10000,
+      "alert_after_failures": 1,
       "json": {
         "session_id": "ops-agent-probe-{{uuid}}",
         "message": "hello",
@@ -76,7 +81,17 @@
     "memory_percent_warn": 85,
     "disk_percent_warn": 90
   },
-  "log_checks": [],
+  "log_checks": [
+    {
+      "name": "Example project log",
+      "path": "logs/app.log",
+      "tail_lines": 200,
+      "only_new": true,
+      "keywords": ["ERROR", "Traceback", "GET /project 500"],
+      "status_on_match": "critical",
+      "alert_after_failures": 1
+    }
+  ],
   "ai": {
     "enabled": true,
     "max_log_chars": 4000,

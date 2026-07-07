@@ -54,6 +54,37 @@ class SchedulerAlertsTest(unittest.TestCase):
 
         self.assertEqual(["Enabled"], [check["name"] for check in due])
 
+    def test_per_check_alert_after_failures_overrides_global_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 3},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            scheduler.process_alert_states(
+                [
+                    CheckResult(
+                        source="http",
+                        name="Business entry",
+                        status="critical",
+                        summary="Missing required response text: Project Dashboard",
+                        details={"url": "https://example.com/project", "alert_after_failures": 1},
+                    )
+                ]
+            )
+            incidents = storage.latest_incidents(1)
+            storage.close()
+
+        self.assertEqual(1, len(incidents))
+        self.assertEqual("critical", incidents[0]["severity"])
+        self.assertEqual(1, len(notifier.sent))
+
     def test_alert_creates_remediation_action_logs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AppConfig(

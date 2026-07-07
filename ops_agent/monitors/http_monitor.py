@@ -30,9 +30,10 @@ def run_http_check(check: dict[str, Any]) -> CheckResult:
 
     request = urllib.request.Request(url=url, method=method, headers={"User-Agent": "ops-agent/0.1"})
     start = time.perf_counter()
+    max_response_bytes = int(check.get("max_response_bytes", 4096))
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read(512)
+            body = response.read(max_response_bytes)
             status_code = int(response.status)
     except urllib.error.HTTPError as exc:
         latency_ms = int((time.perf_counter() - start) * 1000)
@@ -51,6 +52,7 @@ def run_http_check(check: dict[str, Any]) -> CheckResult:
                 "latency_ms": latency_ms,
                 "error": str(exc),
                 "fallback_attempts": attempts,
+                **alert_policy_details(check),
             },
         )
     except Exception as exc:
@@ -60,10 +62,12 @@ def run_http_check(check: dict[str, Any]) -> CheckResult:
             name=name,
             status="critical",
             summary=f"Request failed for {url}: {exc}",
-            details={"url": url, "latency_ms": latency_ms, "error": repr(exc)},
+            details={"url": url, "latency_ms": latency_ms, "error": repr(exc), **alert_policy_details(check)},
         )
 
     latency_ms = int((time.perf_counter() - start) * 1000)
+    text = body.decode("utf-8", errors="replace")
+    content_error = validate_http_content(text, check)
     if status_code != expected_status:
         attempts = fallback_attempts(check, url, timeout) if should_try_fallback(status_code, expected_status) else []
         fallback = first_reachable(attempts)
@@ -74,6 +78,9 @@ def run_http_check(check: dict[str, Any]) -> CheckResult:
     elif latency_ms > max_latency_ms:
         status = "warning"
         summary = f"Slow response: {latency_ms} ms"
+    elif content_error:
+        status = content_mismatch_status(check)
+        summary = content_error
     else:
         status = "ok"
         summary = f"HTTP {status_code} in {latency_ms} ms"
@@ -88,7 +95,9 @@ def run_http_check(check: dict[str, Any]) -> CheckResult:
             "status_code": status_code,
             "expected_status": expected_status,
             "latency_ms": latency_ms,
-            "sample": body.decode("utf-8", errors="replace")[:200],
+            "sample": text[:500],
+            "content_validation": content_validation_details(check, content_error),
+            **alert_policy_details(check),
             "fallback_attempts": attempts if status_code != expected_status else [],
         },
     )
@@ -221,6 +230,7 @@ def fallback_reachable_result(
             "classification": classification,
             "fallback": fallback,
             "fallback_success_status": status,
+            **alert_policy_details(check),
         },
     )
 
@@ -250,3 +260,50 @@ def fallback_success_status(check: dict[str, Any]) -> str:
     if value in {"ok", "warning", "critical"}:
         return value
     return "warning"
+
+
+def validate_http_content(text: str, check: dict[str, Any]) -> str:
+    required_texts = clean_string_list(check.get("required_texts"))
+    for required in required_texts:
+        if required not in text:
+            return f"Missing required response text: {required}"
+    forbidden_texts = clean_string_list(check.get("forbidden_texts"))
+    lower_text = text.lower()
+    for forbidden in forbidden_texts:
+        if forbidden.lower() in lower_text:
+            return f"Response contains forbidden text: {forbidden}"
+    min_body_bytes = int(check.get("min_body_bytes", 0) or 0)
+    if min_body_bytes > 0 and len(text.encode("utf-8")) < min_body_bytes:
+        return f"Response body too small: {len(text.encode('utf-8'))} bytes, expected at least {min_body_bytes}"
+    return ""
+
+
+def content_mismatch_status(check: dict[str, Any]) -> str:
+    value = str(check.get("status_on_content_mismatch", "critical")).strip().lower()
+    if value in {"warning", "critical"}:
+        return value
+    return "critical"
+
+
+def content_validation_details(check: dict[str, Any], error: str) -> dict[str, Any]:
+    return {
+        "required_texts": clean_string_list(check.get("required_texts")),
+        "forbidden_texts": clean_string_list(check.get("forbidden_texts")),
+        "min_body_bytes": int(check.get("min_body_bytes", 0) or 0),
+        "error": error,
+    }
+
+
+def alert_policy_details(check: dict[str, Any]) -> dict[str, Any]:
+    value = check.get("alert_after_failures", check.get("consecutive_failures"))
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return {}
+    return {"alert_after_failures": parsed} if parsed > 0 else {}
+
+
+def clean_string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item)]

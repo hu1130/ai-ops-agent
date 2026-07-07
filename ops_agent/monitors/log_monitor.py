@@ -47,7 +47,14 @@ def run_log_check(check: dict[str, Any], base_dir: Path) -> CheckResult:
     else:
         lines = tail_file(path, tail_lines)
 
-    return build_log_result("log", name, lines, keywords, {"path": str(path)})
+    return build_log_result(
+        "log",
+        name,
+        lines,
+        keywords,
+        {"path": str(path), **alert_policy_details(check)},
+        status_on_match(check),
+    )
 
 
 def run_docker_log_check(check: dict[str, Any], base_dir: Path) -> CheckResult:
@@ -78,7 +85,14 @@ def run_docker_log_check(check: dict[str, Any], base_dir: Path) -> CheckResult:
             summary="No new docker log lines",
             details={"container": container, "match_count": 0, "matches": []},
         )
-    return build_log_result("log", name, lines, keywords, {"container": container})
+    return build_log_result(
+        "log",
+        name,
+        lines,
+        keywords,
+        {"container": container, **alert_policy_details(check)},
+        status_on_match(check),
+    )
 
 
 def build_log_result(
@@ -87,9 +101,10 @@ def build_log_result(
     lines: list[str],
     keywords: list[str],
     base_details: dict[str, Any],
+    match_status: str = "warning",
 ) -> CheckResult:
     matches = [line for line in lines if any(keyword.lower() in line.lower() for keyword in keywords)]
-    status = "warning" if matches else "ok"
+    status = match_status if matches else "ok"
     summary = f"Found {len(matches)} suspicious log lines" if matches else "No suspicious log lines"
     details = dict(base_details)
     details.update({"match_count": len(matches), "matches": matches[-20:]})
@@ -141,6 +156,22 @@ def read_container_log_lines(
     if completed.returncode != 0:
         return [], (completed.stderr or completed.stdout or "").strip() or f"docker logs exited {completed.returncode}"
     return (completed.stdout or "").splitlines()[-tail_lines:], ""
+
+
+def status_on_match(check: dict[str, Any]) -> str:
+    value = str(check.get("status_on_match", "warning")).strip().lower()
+    if value in {"warning", "critical"}:
+        return value
+    return "warning"
+
+
+def alert_policy_details(check: dict[str, Any]) -> dict[str, Any]:
+    value = check.get("alert_after_failures", check.get("consecutive_failures"))
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return {}
+    return {"alert_after_failures": parsed} if parsed > 0 else {}
 
 
 def tail_file(path: Path, max_lines: int) -> list[str]:

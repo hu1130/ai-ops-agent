@@ -119,7 +119,8 @@ class OpsScheduler:
             if result.is_problem:
                 state.failure_count += 1
                 state.last_summary = result.summary
-                if not state.is_open and state.failure_count >= threshold:
+                result_threshold = alert_threshold_for_result(result, threshold)
+                if not state.is_open and state.failure_count >= result_threshold:
                     state.is_open = True
                     new_alerts.append(result)
                 elif state.is_open and state.incident_id:
@@ -1109,6 +1110,17 @@ def incident_status_from_action_results(action_results) -> str:
     ):
         return "remediating"
     return ""
+
+
+def alert_threshold_for_result(result: CheckResult, default_threshold: int) -> int:
+    for key in ("alert_after_failures", "consecutive_failures"):
+        try:
+            value = int(result.details.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return max(1, int(default_threshold or 1))
 
 
 def action_failed(result: ActionResult) -> bool:

@@ -74,6 +74,27 @@ HTTP 监控默认会做备用诊断。主检查地址失败时，系统会自动
 
 注意：主探针返回 5xx 时不会因为首页能打开就降级。5xx 通常代表应用或依赖真的异常，仍然按 critical 处理。
 
+## 业务入口内容监控
+
+只检查 HTTP 200 不够。登录页、兜底页、错误页也可能返回 200，所以关键项目入口建议配置页面内容断言：
+
+```json
+{
+  "name": "Project entry",
+  "url": "https://example.com/project",
+  "expected_status": 200,
+  "required_texts": ["Project Dashboard"],
+  "forbidden_texts": ["系统繁忙", "Internal Server Error", "登录过期"],
+  "status_on_content_mismatch": "critical",
+  "alert_after_failures": 1
+}
+```
+
+- `required_texts`: 响应里必须出现的文字，缺失就判异常。
+- `forbidden_texts`: 响应里不能出现的文字，出现就判异常。
+- `status_on_content_mismatch`: 内容不匹配时标记为 `warning` 或 `critical`。
+- `alert_after_failures`: 覆盖全局连续失败阈值。关键入口建议设为 `1`，一次失败就生成事件和通知。
+
 ## Docker 日志监控
 
 推荐按容器名配置 Docker 日志，不要写死 `/var/lib/docker/containers/...` 里的容器 ID 路径。容器重建后 ID 会变，容器名通常保持稳定。
@@ -85,7 +106,9 @@ HTTP 监控默认会做备用诊断。主检查地址失败时，系统会自动
     "container": "ai-customer-service-api-1",
     "tail_lines": 120,
     "only_new": true,
-    "keywords": ["ERROR", "Exception", "Traceback", "timeout", "failed", "CRITICAL"]
+    "keywords": ["ERROR", "Exception", "Traceback", "timeout", "failed", "CRITICAL"],
+    "status_on_match": "critical",
+    "alert_after_failures": 1
   }
 ]
 ```
