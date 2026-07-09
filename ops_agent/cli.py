@@ -9,6 +9,7 @@ from ops_agent.alerts.notifier import Notifier
 from ops_agent.auth import ROLE_ORDER
 from ops_agent.config import AppConfig, load_config
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
+from ops_agent.enterprise import enterprise_readiness_snapshot, format_enterprise_readiness
 from ops_agent.events import CheckResult, RunContext
 from ops_agent.incident_lifecycle import INCIDENT_STATUSES
 from ops_agent.remediation import approval
@@ -28,6 +29,8 @@ def parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("diagnose", help="Print a local diagnostic snapshot")
     subparsers.add_parser("validate-config", help="Validate config structure and common mistakes")
+    enterprise_parser = subparsers.add_parser("enterprise-readiness", help="Assess enterprise readiness")
+    enterprise_parser.add_argument("--json", action="store_true", help="Print JSON payload")
 
     plan_parser = subparsers.add_parser("remediation-plan", help="Build a remediation plan for a synthetic issue")
     plan_parser.add_argument("--source", default="json_api", help="Issue source, for example http/json_api/log/server")
@@ -104,6 +107,14 @@ def main() -> int:
             return 1
         print("配置校验通过。")
         return 0
+
+    if args.command == "enterprise-readiness":
+        snapshot = enterprise_readiness_snapshot(config)
+        if args.json:
+            print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        else:
+            print(format_enterprise_readiness(snapshot))
+        return 1 if snapshot.get("summary", {}).get("blockers", 0) else 0
 
     if args.command == "remediation-plan":
         details = {}

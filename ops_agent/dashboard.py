@@ -28,6 +28,7 @@ from ops_agent.config_center import (
     validate_config_candidate,
 )
 from ops_agent.diagnosis import persist_incident_diagnosis
+from ops_agent.enterprise import enterprise_readiness_snapshot
 from ops_agent.ai.config_patches import (
     apply_config_patch,
     build_config_patch_from_recommendation,
@@ -102,6 +103,12 @@ def start_dashboard(
             if path == "/api/ops/report":
                 metrics = storage.ops_metrics(query_hours(query))
                 self.send_json(ops_report_payload(metrics))
+                return
+            if path == "/api/enterprise/readiness":
+                if config is None:
+                    self.send_json({"error": "config is not configured"}, status=503)
+                    return
+                self.send_json(enterprise_readiness_snapshot(config))
                 return
             if path == "/api/remediation/audit":
                 self.send_json(
