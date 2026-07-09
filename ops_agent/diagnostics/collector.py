@@ -31,7 +31,10 @@ def collect_diagnostics(results: list[CheckResult], config: AppConfig) -> Diagno
     snapshot = DiagnosticSnapshot()
     snapshot.resource_lines = collect_resource_snapshot(config)
     if options.get("include_docker", True):
-        snapshot.docker_lines = collect_docker_snapshot(int(options.get("command_timeout_seconds", 5)))
+        snapshot.docker_lines = collect_docker_snapshot(
+            int(options.get("command_timeout_seconds", 5)),
+            disabled_diagnostic_containers(config, options),
+        )
     if options.get("include_logs", True):
         snapshot.log_lines = collect_relevant_logs(results, config, options)
     snapshot.command_lines = build_command_hints(results)
@@ -65,7 +68,7 @@ def collect_resource_snapshot(config: AppConfig) -> list[str]:
     return lines
 
 
-def collect_docker_snapshot(timeout_seconds: int) -> list[str]:
+def collect_docker_snapshot(timeout_seconds: int, excluded_containers: set[str] | None = None) -> list[str]:
     if shutil.which("docker") is None:
         return ["未发现 docker 命令，跳过容器快照。"]
 
@@ -75,14 +78,16 @@ def collect_docker_snapshot(timeout_seconds: int) -> list[str]:
         timeout_seconds,
     )
     if ps_output:
-        lines.extend(["docker ps:", *indent_lines(ps_output.splitlines()[:12])])
+        ps_lines = filter_docker_table_lines(ps_output.splitlines(), excluded_containers or set())
+        lines.extend(["docker ps:", *indent_lines(ps_lines[:12])])
 
     stats_output = run_command(
         ["docker", "stats", "--no-stream", "--format", "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"],
         timeout_seconds,
     )
     if stats_output:
-        lines.extend(["docker stats:", *indent_lines(stats_output.splitlines()[:12])])
+        stats_lines = filter_docker_table_lines(stats_output.splitlines(), excluded_containers or set())
+        lines.extend(["docker stats:", *indent_lines(stats_lines[:12])])
     return lines
 
 
@@ -93,6 +98,8 @@ def collect_relevant_logs(results: list[CheckResult], config: AppConfig, options
     lines: list[str] = []
 
     for check in config.log_checks:
+        if not check.get("enabled", True):
+            continue
         name = str(check.get("name", "log"))
         if log_names and name not in log_names:
             continue
@@ -127,6 +134,31 @@ def collect_relevant_logs(results: list[CheckResult], config: AppConfig, options
     if len(text) <= max_chars:
         return lines
     return text[:max_chars].splitlines() + ["...日志内容已截断..."]
+
+
+def disabled_diagnostic_containers(config: AppConfig, options: dict[str, Any]) -> set[str]:
+    containers = {
+        str(check.get("container") or "").strip()
+        for check in [*config.docker_checks, *config.log_checks]
+        if not check.get("enabled", True)
+    }
+    containers.update(str(item or "").strip() for item in options.get("exclude_containers", []))
+    return {container for container in containers if container}
+
+
+def filter_docker_table_lines(lines: list[str], excluded_containers: set[str]) -> list[str]:
+    if not excluded_containers:
+        return lines
+
+    filtered: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        first = stripped.split()[0]
+        if first in {"NAMES", "NAME"} or first not in excluded_containers:
+            filtered.append(line)
+    return filtered
 
 
 def build_command_hints(results: list[CheckResult]) -> list[str]:

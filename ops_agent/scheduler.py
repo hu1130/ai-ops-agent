@@ -728,6 +728,7 @@ class OpsScheduler:
 
         since = datetime.now(timezone.utc) - timedelta(hours=24)
         rows = self.storage.recent_results(since.isoformat())
+        rows = filter_report_rows(rows, enabled_report_target_keys(self.config))
         title = str(report_config.get("title", "Ops Agent daily report"))
         self.notifier.send(title, build_daily_report(rows), dedupe_key=f"daily-report:{today}")
         self._last_daily_report_date = today
@@ -1281,6 +1282,69 @@ def build_recovery_message(results: list[CheckResult]) -> str:
     for result in results:
         lines.append(f"- {result.source}/{result.name}: {result.summary}")
     return "\n".join(lines)
+
+
+def enabled_report_target_keys(config: AppConfig) -> set[tuple[str, str]]:
+    targets: set[tuple[str, str]] = set()
+    add_check_targets(targets, "http", config.http_checks, ("name", "url"), "HTTP check")
+    add_check_targets(targets, "json_api", config.json_checks, ("name", "url"), "JSON API check")
+    add_check_targets(targets, "business_flow", config.business_flow_checks, ("name",), "Business flow")
+    add_check_targets(targets, "docker", config.docker_checks, ("name", "container"), "Docker container")
+    add_log_targets(targets, config.log_checks)
+
+    if config.server_checks.get("enabled", True):
+        targets.update(
+            {
+                ("server", "Disk usage"),
+                ("server", "Memory usage"),
+                ("server", "CPU usage"),
+                ("server", "Load average"),
+            }
+        )
+
+    return targets
+
+
+def add_check_targets(
+    targets: set[tuple[str, str]],
+    source: str,
+    checks: list[dict[str, Any]],
+    name_keys: tuple[str, ...],
+    fallback: str,
+) -> None:
+    for check in checks:
+        if not check.get("enabled", True):
+            continue
+        targets.add((source, configured_check_name(check, name_keys, fallback)))
+
+
+def add_log_targets(targets: set[tuple[str, str]], checks: list[dict[str, Any]]) -> None:
+    for check in checks:
+        if not check.get("enabled", True):
+            continue
+        if check.get("container"):
+            name = configured_check_name(check, ("name", "container"), "Docker log check")
+        else:
+            name = configured_check_name(check, ("name", "path"), "Log check")
+        targets.add(("log", name))
+
+
+def configured_check_name(check: dict[str, Any], keys: tuple[str, ...], fallback: str) -> str:
+    for key in keys:
+        value = str(check.get(key) or "").strip()
+        if value:
+            return value
+    return fallback
+
+
+def filter_report_rows(rows: list[dict], target_keys: set[tuple[str, str]]) -> list[dict]:
+    if not target_keys:
+        return []
+    return [
+        row
+        for row in rows
+        if (str(row.get("source") or ""), str(row.get("name") or "")) in target_keys
+    ]
 
 
 def build_daily_report(rows: list[dict]) -> str:

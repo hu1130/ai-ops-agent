@@ -8,7 +8,13 @@ from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import AppConfig
 from ops_agent.events import CheckResult
 from ops_agent.remediation.actions import RemediationAction
-from ops_agent.scheduler import OpsScheduler, build_daily_report, build_recovery_message
+from ops_agent.scheduler import (
+    OpsScheduler,
+    build_daily_report,
+    build_recovery_message,
+    enabled_report_target_keys,
+    filter_report_rows,
+)
 from ops_agent.storage import Storage
 
 
@@ -36,6 +42,39 @@ class SchedulerAlertsTest(unittest.TestCase):
         report = build_daily_report(rows)
         self.assertIn("过去 24 小时巡检记录: 2 条", report)
         self.assertIn("警告: 1 条", report)
+
+    def test_daily_report_filters_disabled_targets(self) -> None:
+        config = AppConfig(
+            raw={
+                "http_checks": [
+                    {"name": "Active site", "url": "https://active.example.com"},
+                    {"name": "Disabled site", "url": "https://disabled.example.com", "enabled": False},
+                ],
+                "docker_checks": [
+                    {"name": "Active container", "container": "active-app"},
+                    {"name": "Disabled container", "container": "disabled-app", "enabled": False},
+                ],
+                "server_checks": {"enabled": False},
+            },
+            base_dir=Path("."),
+        )
+        rows = [
+            {"source": "http", "name": "Active site", "status": "ok", "summary": "HTTP 200"},
+            {"source": "http", "name": "Disabled site", "status": "warning", "summary": "Still historical"},
+            {"source": "docker", "name": "Active container", "status": "ok", "summary": "Running"},
+            {"source": "docker", "name": "Disabled container", "status": "warning", "summary": "Historical"},
+            {"source": "server", "name": "Disk usage", "status": "ok", "summary": "Disk OK"},
+        ]
+
+        filtered = filter_report_rows(rows, enabled_report_target_keys(config))
+        report = build_daily_report(filtered)
+
+        self.assertEqual(["Active site", "Active container"], [row["name"] for row in filtered])
+        self.assertIn("Active site", report)
+        self.assertIn("Active container", report)
+        self.assertNotIn("Disabled site", report)
+        self.assertNotIn("Disabled container", report)
+        self.assertNotIn("Disk usage", report)
 
     def test_due_checks_skips_disabled_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -3,7 +3,12 @@ import unittest
 from pathlib import Path
 
 from ops_agent.config import AppConfig
-from ops_agent.diagnostics.collector import DiagnosticSnapshot, collect_relevant_logs, format_snapshot
+from ops_agent.diagnostics.collector import (
+    DiagnosticSnapshot,
+    collect_relevant_logs,
+    filter_docker_table_lines,
+    format_snapshot,
+)
 from ops_agent.diagnostics.suggestions import build_action_suggestions
 from ops_agent.events import CheckResult
 
@@ -46,6 +51,40 @@ class DiagnosticsTest(unittest.TestCase):
                 {"max_log_lines": 10, "max_log_chars": 1000},
             )
         self.assertTrue(any("ERROR boom" in line for line in lines))
+
+    def test_collect_relevant_logs_skips_disabled_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "disabled.log").write_text("ERROR hidden\n", encoding="utf-8")
+            config = AppConfig(
+                raw={
+                    "alerts": {"diagnostics": {"max_log_lines": 10}},
+                    "log_checks": [{"name": "Disabled log", "path": "disabled.log", "enabled": False}],
+                },
+                base_dir=base,
+            )
+            lines = collect_relevant_logs(
+                [CheckResult(source="http", name="Site", status="warning", summary="Slow")],
+                config,
+                {"max_log_lines": 10, "max_log_chars": 1000},
+            )
+        self.assertEqual([], lines)
+
+    def test_filter_docker_table_lines_removes_excluded_container(self) -> None:
+        lines = [
+            "NAMES                           STATUS",
+            "sales-ai-web                    Up 6 days",
+            "duanshipingagent-app-1          Up 7 days (unhealthy)",
+        ]
+        filtered = filter_docker_table_lines(lines, {"duanshipingagent-app-1"})
+
+        self.assertEqual(
+            [
+                "NAMES                           STATUS",
+                "sales-ai-web                    Up 6 days",
+            ],
+            filtered,
+        )
 
 
 if __name__ == "__main__":
