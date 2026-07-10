@@ -10,6 +10,7 @@ from ops_agent.ai.classifier import IncidentClassification, classify_incident
 from ops_agent.ai.analyzer import analyze_incident
 from ops_agent.ai.learning import build_learning_recommendations, format_learning_recommendations
 from ops_agent.ai.repair import (
+    AI_REPAIR_QUEUE_ACTIVE_STATUSES,
     build_ai_repair_proposal,
     dry_run_ai_repair_proposal,
     notify_ai_repair_approval_queue,
@@ -69,6 +70,9 @@ DEFAULT_AI_REPAIR_AUTO_TRIGGER_POLICY = {
     "notify": True,
     "notify_states": ["needs_dry_run", "needs_sandbox", "ready_for_approval", "blocked", "review_only"],
     "notify_limit": 20,
+    "max_active_proposals": 10,
+    "max_triggers_per_window": 5,
+    "trigger_window_minutes": 60,
 }
 
 
@@ -474,6 +478,23 @@ class OpsScheduler:
                 "policy": policy,
             }
 
+        rate_limit = ai_repair_auto_trigger_rate_limit_decision(self.storage, policy)
+        if rate_limit["status"] != "allowed":
+            current_status = str(incident.get("status") or "open")
+            self.storage.record_incident_event(
+                incident_id,
+                current_status,
+                current_status,
+                "scheduler",
+                "AI repair auto-trigger rate-limited",
+                metadata={"rate_limit": rate_limit, "decision": decision},
+            )
+            return {
+                **rate_limit,
+                "decision": decision,
+                "policy": policy,
+            }
+
         try:
             repair = build_ai_repair_proposal(
                 self.storage,
@@ -835,6 +856,12 @@ def ai_repair_auto_trigger_policy(config: AppConfig) -> dict[str, Any]:
         policy["min_classification_confidence"] = safe_float(raw.get("min_classification_confidence"), 0.65)
     if "notify_limit" in raw:
         policy["notify_limit"] = max(1, safe_int(raw.get("notify_limit"), 20))
+    if "max_active_proposals" in raw:
+        policy["max_active_proposals"] = max(1, safe_int(raw.get("max_active_proposals"), 10))
+    if "max_triggers_per_window" in raw:
+        policy["max_triggers_per_window"] = max(1, safe_int(raw.get("max_triggers_per_window"), 5))
+    if "trigger_window_minutes" in raw:
+        policy["trigger_window_minutes"] = max(1, safe_int(raw.get("trigger_window_minutes"), 60))
     return policy
 
 
@@ -902,6 +929,52 @@ def ai_repair_auto_trigger_decision(
         "sources": sorted(sources),
         "policy": policy,
     }
+
+
+def ai_repair_auto_trigger_rate_limit_decision(storage: Storage, policy: dict[str, Any]) -> dict[str, Any]:
+    max_active = safe_int(policy.get("max_active_proposals"), 10)
+    if max_active > 0:
+        active = storage.latest_ai_repair_proposals(
+            limit=max_active + 20,
+            statuses=AI_REPAIR_QUEUE_ACTIVE_STATUSES,
+        )
+        active_auto = [repair for repair in active if ai_repair_auto_triggered(repair)]
+        if len(active_auto) >= max_active:
+            return {
+                "status": "rate_limited",
+                "reason": f"active auto-triggered AI repair proposals reached limit: {len(active_auto)}/{max_active}",
+                "limit_type": "max_active_proposals",
+                "active_auto_triggered": len(active_auto),
+                "limit": max_active,
+            }
+
+    max_window = safe_int(policy.get("max_triggers_per_window"), 5)
+    window_minutes = safe_int(policy.get("trigger_window_minutes"), 60)
+    if max_window > 0 and window_minutes > 0:
+        since = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+        recent = storage.latest_ai_repair_proposals(limit=max(max_window + 50, 100))
+        recent_auto = [
+            repair
+            for repair in recent
+            if ai_repair_auto_triggered(repair)
+            and (parse_datetime(str(repair.get("created_at") or "")) or datetime.min.replace(tzinfo=timezone.utc)) >= since
+        ]
+        if len(recent_auto) >= max_window:
+            return {
+                "status": "rate_limited",
+                "reason": f"auto-triggered AI repair proposals reached window limit: {len(recent_auto)}/{max_window} in {window_minutes} minutes",
+                "limit_type": "max_triggers_per_window",
+                "recent_auto_triggered": len(recent_auto),
+                "limit": max_window,
+                "window_minutes": window_minutes,
+            }
+
+    return {"status": "allowed", "reason": "AI repair auto trigger rate limits allow creation"}
+
+
+def ai_repair_auto_triggered(repair: dict[str, Any]) -> bool:
+    prompt = safe_dict(repair.get("prompt"))
+    return str(prompt.get("source") or "").strip() == "auto_trigger" or str(prompt.get("requested_by") or "") == "scheduler"
 
 
 def format_ai_repair_auto_trigger_result(result: dict[str, Any]) -> str:

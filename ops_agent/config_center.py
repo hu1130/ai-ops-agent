@@ -44,6 +44,9 @@ DEFAULT_AI_REPAIR_AUTO_TRIGGER_POLICY = {
     "notify": True,
     "notify_states": ["needs_dry_run", "needs_sandbox", "ready_for_approval", "blocked", "review_only"],
     "notify_limit": 20,
+    "max_active_proposals": 10,
+    "max_triggers_per_window": 5,
+    "trigger_window_minutes": 60,
 }
 
 
@@ -357,6 +360,12 @@ def normalize_ai_repair_auto_trigger_policy(value: Any) -> dict[str, Any]:
         policy["min_classification_confidence"] = safe_float(raw.get("min_classification_confidence"), 0.65)
     if "notify_limit" in raw:
         policy["notify_limit"] = max(1, safe_int(raw.get("notify_limit"), 20))
+    if "max_active_proposals" in raw:
+        policy["max_active_proposals"] = max(1, safe_int(raw.get("max_active_proposals"), 10))
+    if "max_triggers_per_window" in raw:
+        policy["max_triggers_per_window"] = max(1, safe_int(raw.get("max_triggers_per_window"), 5))
+    if "trigger_window_minutes" in raw:
+        policy["trigger_window_minutes"] = max(1, safe_int(raw.get("trigger_window_minutes"), 60))
     return policy
 
 

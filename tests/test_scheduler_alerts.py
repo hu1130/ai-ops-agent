@@ -295,6 +295,67 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertEqual([], repairs)
         self.assertEqual(1, len(notifier.sent))
 
+    def test_ai_repair_auto_trigger_rate_limits_recent_proposals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 1},
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "ai": {
+                        "enabled": True,
+                        "repair": {
+                            "provider": "rules",
+                            "auto_trigger": {
+                                "enabled": True,
+                                "severities": ["critical"],
+                                "categories": ["service_unavailable"],
+                                "min_classification_confidence": 0.65,
+                                "run_dry_run": True,
+                                "notify": False,
+                                "max_triggers_per_window": 1,
+                                "trigger_window_minutes": 60,
+                            },
+                        },
+                    },
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            scheduler = OpsScheduler(config, storage, RecordingNotifier())
+            scheduler.process_alert_states(
+                [
+                    CheckResult(
+                        source="http",
+                        name="Site A",
+                        status="critical",
+                        summary="HTTP 500",
+                        details={"url": "https://a.example.com", "status_code": 500},
+                    )
+                ]
+            )
+            scheduler.process_alert_states(
+                [
+                    CheckResult(
+                        source="http",
+                        name="Site B",
+                        status="critical",
+                        summary="HTTP 500",
+                        details={"url": "https://b.example.com", "status_code": 500},
+                    )
+                ]
+            )
+            incidents = storage.latest_incidents(10)
+            repairs = storage.latest_ai_repair_proposals()
+            second = next(row for row in incidents if "Site B" in row["last_summary"])
+            events = storage.latest_incident_events(second["id"])
+            storage.close()
+
+        self.assertEqual(1, len(repairs))
+        self.assertEqual("auto_trigger", repairs[0]["prompt"]["source"])
+        self.assertIn("rate_limited", second["analysis"])
+        self.assertTrue(any(event["note"] == "AI repair auto-trigger rate-limited" for event in events))
+
     def test_recovery_resolves_open_incident(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AppConfig(

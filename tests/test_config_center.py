@@ -107,6 +107,9 @@ class ConfigCenterTest(unittest.TestCase):
                     "categories": ["service_unavailable"],
                     "min_classification_confidence": "0.7",
                     "notify_limit": "5",
+                    "max_active_proposals": "2",
+                    "max_triggers_per_window": "3",
+                    "trigger_window_minutes": "30",
                 },
                 reason="unit-test-auto-trigger",
             )
@@ -127,6 +130,9 @@ class ConfigCenterTest(unittest.TestCase):
         self.assertTrue(auto_trigger["auto_trigger"]["enabled"])
         self.assertEqual(0.7, auto_trigger["auto_trigger"]["min_classification_confidence"])
         self.assertEqual(5, auto_trigger_snapshot["auto_trigger"]["notify_limit"])
+        self.assertEqual(2, auto_trigger_snapshot["auto_trigger"]["max_active_proposals"])
+        self.assertEqual(3, auto_trigger_snapshot["auto_trigger"]["max_triggers_per_window"])
+        self.assertEqual(30, auto_trigger_snapshot["auto_trigger"]["trigger_window_minutes"])
         self.assertEqual("deepseek", deepseek["repair"]["provider"])
         self.assertTrue(saved["ai"]["repair"]["auto_trigger"]["enabled"])
         self.assertEqual("deepseek-v4-flash", saved["ai"]["repair"]["model"])

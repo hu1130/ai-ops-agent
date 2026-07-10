@@ -1629,6 +1629,7 @@ def normalize_model_repair_payload(
             "user": prompt.get("user"),
             "validation": validation,
             "requested_by": safe_dict(context.get("request")).get("actor") or "",
+            "source": safe_dict(context.get("request")).get("source") or "",
         },
         "proposal": {
             "root_cause": str(payload.get("root_cause") or fallback.get("root_cause") or ""),
@@ -1806,6 +1807,7 @@ def base_repair(
         "prompt": {
             "mode": "rules_until_model_configured",
             "requested_by": request.get("actor") or "",
+            "source": request.get("source") or "",
             "incident": safe_dict(context.get("incident")),
             "diagnosis": safe_dict(context.get("diagnosis")),
             "recommendation_count": len(safe_list(context.get("recommendations"))),
