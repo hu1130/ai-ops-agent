@@ -503,6 +503,7 @@ def ai_repair_approval_queue_item(storage: Storage, repair: dict[str, Any]) -> d
     controlled_apply = safe_dict(test_result.get("controlled_apply"))
     pull_request = safe_dict(test_result.get("pull_request"))
     deploy_result = safe_dict(test_result.get("deploy_result"))
+    proposal = safe_dict(repair.get("proposal"))
     return {
         "id": repair_id,
         "incident_id": incident_id,
@@ -527,6 +528,7 @@ def ai_repair_approval_queue_item(storage: Storage, repair: dict[str, Any]) -> d
                 if str(safe_dict(item).get("path") or "")
             ],
         },
+        "evidence": ai_repair_queue_evidence_summary(safe_dict(proposal.get("evidence_package"))),
         "dry_run": {
             "valid": bool(dry_run.get("valid")),
             "mutates_files": bool(dry_run.get("mutates_files")),
@@ -554,6 +556,31 @@ def ai_repair_approval_queue_item(storage: Storage, repair: dict[str, Any]) -> d
         "can_create_pr": state["can_create_pr"],
         "can_deploy": state["can_deploy"],
         "next_action": state["next_action"],
+    }
+
+
+def ai_repair_queue_evidence_summary(evidence: dict[str, Any]) -> dict[str, Any]:
+    code_locator = safe_dict(evidence.get("code_locator"))
+    suspected_files = safe_list(code_locator.get("suspected_files"))
+    return {
+        "mode": str(evidence.get("mode") or ""),
+        "repository_context_enabled": bool(safe_dict(evidence.get("repository_context")).get("enabled")),
+        "included_files": [
+            str(item)
+            for item in safe_list(safe_dict(evidence.get("repository_context")).get("included_files"))
+            if str(item)
+        ],
+        "suspected_file_count": len(suspected_files),
+        "top_suspected_files": [
+            {
+                "path": str(safe_dict(item).get("path") or ""),
+                "confidence": str(safe_dict(item).get("confidence") or ""),
+                "score": safe_int(safe_dict(item).get("score")),
+                "reasons": [str(reason) for reason in safe_list(safe_dict(item).get("reasons"))],
+            }
+            for item in suspected_files[:5]
+            if str(safe_dict(item).get("path") or "")
+        ],
     }
 
 
@@ -1608,6 +1635,7 @@ def normalize_model_repair_payload(
             "repair_plan": [str(item) for item in repair_plan],
             "review_required": True,
             "limitations": limitations,
+            "evidence_package": build_ai_repair_evidence_package(context, validation),
         },
         "patch": patch,
         "test_plan": normalize_test_plan(payload.get("test_plan") or fallback.get("test_plan")),
@@ -1791,6 +1819,7 @@ def base_repair(
                 "No production code is changed by this proposal.",
                 "A configured model provider is required for concrete source-code diffs.",
             ],
+            "evidence_package": build_ai_repair_evidence_package(context, validate_patch_dry_run(patch)),
         },
         "patch": patch,
         "test_plan": {
@@ -3951,6 +3980,112 @@ def public_action_context(item: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def build_ai_repair_evidence_package(
+    context: dict[str, Any],
+    patch_validation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    incident = safe_dict(context.get("incident"))
+    diagnosis = safe_dict(context.get("diagnosis"))
+    project = safe_dict(context.get("project"))
+    repository_context = safe_dict(context.get("repository_context"))
+    code_locator = safe_dict(repository_context.get("code_locator"))
+    files = safe_list(repository_context.get("files"))
+    validation = safe_dict(patch_validation)
+    return {
+        "mode": "ai_repair_evidence_package_v1",
+        "incident": {
+            "id": safe_int(incident.get("id")),
+            "severity": str(incident.get("severity") or ""),
+            "title": redact_sensitive_text(incident.get("title") or ""),
+            "last_summary": redact_sensitive_text(incident.get("last_summary") or ""),
+            "classification_category": str(incident.get("classification_category") or ""),
+            "classification_confidence": incident.get("classification_confidence"),
+        },
+        "project": {
+            "id": str(project.get("id") or ""),
+            "name": str(project.get("name") or ""),
+            "environment": str(project.get("environment") or ""),
+            "run_types": [str(item) for item in safe_list(project.get("run_types"))],
+        },
+        "signals": repair_evidence_signals(incident, diagnosis, context),
+        "repository_context": {
+            "enabled": bool(repository_context.get("enabled")),
+            "reason": str(repository_context.get("reason") or ""),
+            "project_id": str(repository_context.get("project_id") or ""),
+            "included_files": [str(safe_dict(item).get("path") or "") for item in files if str(safe_dict(item).get("path") or "")],
+            "missing_files": [str(item) for item in safe_list(repository_context.get("missing_files"))],
+            "skipped_file_count": len(safe_list(repository_context.get("skipped_files"))),
+            "total_chars": safe_int(repository_context.get("total_chars")),
+            "limits": safe_dict(repository_context.get("limits")),
+        },
+        "code_locator": {
+            "enabled": bool(code_locator.get("enabled")),
+            "strategy": str(code_locator.get("strategy") or ""),
+            "searched_files": safe_int(code_locator.get("searched_files")),
+            "evidence_terms": [str(item) for item in safe_list(code_locator.get("evidence_terms"))[:25]],
+            "direct_paths": [str(item) for item in safe_list(code_locator.get("direct_paths"))[:20]],
+            "suspected_files": [
+                {
+                    "path": str(safe_dict(item).get("path") or ""),
+                    "score": safe_int(safe_dict(item).get("score")),
+                    "confidence": str(safe_dict(item).get("confidence") or ""),
+                    "reasons": [str(reason) for reason in safe_list(safe_dict(item).get("reasons"))],
+                }
+                for item in safe_list(code_locator.get("suspected_files"))[:10]
+                if str(safe_dict(item).get("path") or "")
+            ],
+        },
+        "patch_validation": {
+            "valid": bool(validation.get("valid")),
+            "mutates_files": bool(validation.get("mutates_files")),
+            "checked_files": [str(item) for item in safe_list(validation.get("checked_files"))],
+            "errors": [str(item) for item in safe_list(validation.get("errors"))],
+            "warnings": [str(item) for item in safe_list(validation.get("warnings"))],
+        },
+    }
+
+
+def repair_evidence_signals(
+    incident: dict[str, Any],
+    diagnosis: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    results = parse_json_list(str(incident.get("results_json") or "[]"))
+    recommendations = safe_list(context.get("recommendations"))
+    actions = safe_list(context.get("actions"))
+    return {
+        "check_results": [
+            {
+                "source": str(safe_dict(item).get("source") or ""),
+                "name": str(safe_dict(item).get("name") or ""),
+                "status": str(safe_dict(item).get("status") or ""),
+                "summary": truncate_text(str(redact_sensitive_text(safe_dict(item).get("summary") or "")), 500),
+                "details": repair_signal_details(safe_dict(item).get("details")),
+            }
+            for item in results[:10]
+        ],
+        "diagnosis": {
+            "top_category": str(diagnosis.get("top_category") or ""),
+            "probable_causes": [
+                {
+                    "category": str(safe_dict(item).get("category") or ""),
+                    "confidence": safe_dict(item).get("confidence"),
+                }
+                for item in safe_list(diagnosis.get("probable_causes"))[:5]
+            ],
+            "next_decision": safe_dict(diagnosis.get("next_decision")),
+        },
+        "recommendation_count": len(recommendations),
+        "action_count": len(actions),
+    }
+
+
+def repair_signal_details(value: Any) -> dict[str, Any]:
+    details = safe_dict(value)
+    allowed_keys = ["url", "path", "container", "service", "http_status", "status_code", "method"]
+    return {key: redact_sensitive_text(details.get(key)) for key in allowed_keys if key in details}
+
+
 def redact_sensitive_text(value: Any) -> Any:
     if value is None or isinstance(value, (int, float, bool)):
         return value
@@ -4042,6 +4177,14 @@ def parse_json_object(value: str) -> dict:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def parse_json_list(value: str) -> list:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 def safe_dict(value: Any) -> dict:

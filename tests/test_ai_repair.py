@@ -198,6 +198,8 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual("ready_for_approval", queue["items"][0]["queue_state"])
         self.assertEqual("approve", queue["items"][0]["next_action"]["type"])
         self.assertEqual(incident_id, queue["items"][0]["incident"]["id"])
+        self.assertEqual("ai_repair_evidence_package_v1", queue["items"][0]["evidence"]["mode"])
+        self.assertTrue(queue["items"][0]["evidence"]["repository_context_enabled"])
 
     def test_ai_repair_dashboard_api_notifies_and_advances_queue_item(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -465,9 +467,14 @@ class AiRepairTest(unittest.TestCase):
 
         file_paths = [item["path"] for item in repository_context["files"]]
         suspected_paths = [item["path"] for item in repository_context["code_locator"]["suspected_files"]]
+        evidence = proposal["proposal"]["evidence_package"]
         self.assertIn("app/routes/orders.py", file_paths)
         self.assertEqual("app/routes/orders.py", suspected_paths[0])
         self.assertEqual("high", repository_context["code_locator"]["suspected_files"][0]["confidence"])
+        self.assertEqual("ai_repair_evidence_package_v1", evidence["mode"])
+        self.assertEqual("app/routes/orders.py", evidence["code_locator"]["suspected_files"][0]["path"])
+        self.assertEqual(["app/routes/orders.py"], evidence["repository_context"]["included_files"][:1])
+        self.assertEqual("log", evidence["signals"]["check_results"][0]["source"])
 
     def test_model_repair_context_locates_code_from_route_terms(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -519,8 +526,11 @@ class AiRepairTest(unittest.TestCase):
 
         file_paths = [item["path"] for item in repository_context["files"]]
         suspected_paths = [item["path"] for item in repository_context["code_locator"]["suspected_files"]]
+        evidence = proposal["proposal"]["evidence_package"]
         self.assertIn("src/api/orders.ts", file_paths)
         self.assertEqual("src/api/orders.ts", suspected_paths[0])
+        self.assertEqual("src/api/orders.ts", evidence["code_locator"]["suspected_files"][0]["path"])
+        self.assertEqual("http", evidence["signals"]["check_results"][0]["source"])
 
     def test_incident_pipeline_uses_project_repo_commands_and_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
