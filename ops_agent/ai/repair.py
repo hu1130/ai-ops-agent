@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -56,6 +57,33 @@ ALLOWED_DIFF_SUFFIXES = {
     ".yml",
 }
 ALLOWED_DIFF_FILENAMES = {"Dockerfile", "Makefile", "Procfile"}
+ALLOWED_CONTEXT_SUFFIXES = ALLOWED_DIFF_SUFFIXES | {
+    ".cjs",
+    ".cs",
+    ".go",
+    ".java",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".mjs",
+    ".php",
+    ".rb",
+    ".rs",
+    ".sh",
+    ".sql",
+    ".svelte",
+    ".vue",
+    ".xml",
+}
+ALLOWED_CONTEXT_FILENAMES = ALLOWED_DIFF_FILENAMES | {
+    "docker-compose.yaml",
+    "docker-compose.yml",
+    "package-lock.json",
+    "package.json",
+    "pom.xml",
+    "pyproject.toml",
+    "requirements.txt",
+}
 SAFE_TEST_COMMAND_PREFIXES = (
     "python -m unittest",
     "python3 -m unittest",
@@ -97,8 +125,43 @@ DEFAULT_REPOSITORY_CONTEXT_SETTINGS = {
     "max_file_chars": 4000,
     "max_total_chars": 16000,
     "max_tree_files": 80,
+    "max_code_search_files": 800,
+    "max_suspected_files": 8,
     "max_file_bytes": 262144,
 }
+CODE_LOCATOR_STOP_WORDS = {
+    "agent",
+    "analysis",
+    "check",
+    "container",
+    "critical",
+    "detected",
+    "docker",
+    "error",
+    "failed",
+    "from",
+    "health",
+    "http",
+    "https",
+    "issue",
+    "json",
+    "line",
+    "monitor",
+    "normal",
+    "ops",
+    "prod",
+    "production",
+    "response",
+    "service",
+    "status",
+    "summary",
+    "warning",
+}
+CODE_LOCATOR_PATH_RE = re.compile(
+    r"((?:[A-Za-z]:)?[/\\A-Za-z0-9_.-]+\.(?:"
+    + "|".join(sorted(re.escape(suffix.lstrip(".")) for suffix in ALLOWED_CONTEXT_SUFFIXES))
+    + r"))(?::\d+)?"
+)
 DEFAULT_AI_REPAIR_POLICY = {
     "enabled": True,
     "auto_approve": False,
@@ -3399,10 +3462,13 @@ def build_repository_context(
         "tree": [],
         "missing_files": [],
         "skipped_files": [],
+        "code_locator": {"enabled": False, "reason": "not_run"},
         "limits": {
             "max_files": settings["max_files"],
             "max_file_chars": settings["max_file_chars"],
             "max_total_chars": settings["max_total_chars"],
+            "max_code_search_files": settings["max_code_search_files"],
+            "max_suspected_files": settings["max_suspected_files"],
             "max_file_bytes": settings["max_file_bytes"],
         },
     }
@@ -3412,6 +3478,19 @@ def build_repository_context(
         return context
 
     candidates = repository_context_candidate_paths(repair_config, incident, diagnosis, recommendations, project, request)
+    code_locator = locate_problem_code_files(
+        repo_root,
+        incident,
+        diagnosis,
+        recommendations,
+        project,
+        request,
+        settings,
+    )
+    context["code_locator"] = code_locator
+    candidates = unique_strings(
+        candidates + [str(item.get("path") or "") for item in safe_list(code_locator.get("suspected_files"))]
+    )
     files: list[dict[str, Any]] = []
     total_chars = 0
     for relative_path in candidates:
@@ -3464,7 +3543,15 @@ def repository_context_settings(repair_config: dict[str, Any], request: dict[str
         return {**DEFAULT_REPOSITORY_CONTEXT_SETTINGS, "enabled": False, "reason": "model_provider_disabled"}
     raw = safe_dict(repair_config.get("repository_context"))
     settings = dict(DEFAULT_REPOSITORY_CONTEXT_SETTINGS)
-    for key in ("max_files", "max_file_chars", "max_total_chars", "max_tree_files", "max_file_bytes"):
+    for key in (
+        "max_files",
+        "max_file_chars",
+        "max_total_chars",
+        "max_tree_files",
+        "max_code_search_files",
+        "max_suspected_files",
+        "max_file_bytes",
+    ):
         if key in raw:
             settings[key] = safe_int(raw.get(key), settings[key])
     if "enabled" in raw:
@@ -3512,6 +3599,147 @@ def repository_context_candidate_paths(
     return unique_strings(paths)
 
 
+def locate_problem_code_files(
+    repo_root: Path,
+    incident: dict[str, Any],
+    diagnosis: dict[str, Any],
+    recommendations: list[dict],
+    project: dict[str, Any],
+    request: dict[str, Any],
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    evidence = problem_code_evidence_text(incident, diagnosis, recommendations, project, request)
+    terms = problem_code_terms(evidence)
+    direct_paths = extract_problem_code_paths(evidence)
+    search_limit = safe_int(settings.get("max_code_search_files"), DEFAULT_REPOSITORY_CONTEXT_SETTINGS["max_code_search_files"])
+    suspected_limit = safe_int(settings.get("max_suspected_files"), DEFAULT_REPOSITORY_CONTEXT_SETTINGS["max_suspected_files"])
+    tree = repository_file_tree(repo_root, search_limit)
+    if not tree:
+        return {
+            "enabled": True,
+            "strategy": "evidence_path_scoring_v1",
+            "searched_files": 0,
+            "evidence_terms": sorted(terms)[:25],
+            "direct_paths": direct_paths[:20],
+            "suspected_files": [],
+            "reason": "no_repository_files",
+        }
+
+    scores: dict[str, int] = {}
+    reasons: dict[str, list[str]] = {}
+    tree_lower = {path.lower(): path for path in tree}
+    for raw_path in direct_paths:
+        normalized = normalize_context_relative_path(raw_path)
+        if normalized and normalized.lower() in tree_lower:
+            candidate = tree_lower[normalized.lower()]
+            add_code_locator_score(scores, reasons, candidate, 120, f"explicit evidence path: {raw_path}")
+            continue
+        direct_lower = raw_path.replace("\\", "/").strip("/").lower()
+        direct_name = Path(direct_lower).name
+        for candidate in tree:
+            candidate_lower = candidate.lower()
+            if direct_lower and (candidate_lower.endswith(direct_lower) or direct_lower.endswith(candidate_lower)):
+                add_code_locator_score(scores, reasons, candidate, 100, f"path tail match: {raw_path}")
+            elif direct_name and Path(candidate_lower).name == direct_name:
+                add_code_locator_score(scores, reasons, candidate, 70, f"filename match: {direct_name}")
+
+    for candidate in tree:
+        candidate_terms = problem_code_terms(candidate)
+        overlap = sorted((candidate_terms & terms) - CODE_LOCATOR_STOP_WORDS)
+        if not overlap:
+            continue
+        score = 12 * min(len(overlap), 5)
+        stem_terms = problem_code_terms(Path(candidate).stem)
+        if stem_terms & terms:
+            score += 15
+        add_code_locator_score(scores, reasons, candidate, score, "evidence terms: " + ", ".join(overlap[:6]))
+
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:suspected_limit]
+    return {
+        "enabled": True,
+        "strategy": "evidence_path_scoring_v1",
+        "searched_files": len(tree),
+        "evidence_terms": sorted(terms)[:25],
+        "direct_paths": direct_paths[:20],
+        "suspected_files": [
+            {
+                "path": path,
+                "score": score,
+                "confidence": code_locator_confidence(score),
+                "reasons": reasons.get(path, [])[:4],
+            }
+            for path, score in ranked
+        ],
+    }
+
+
+def problem_code_evidence_text(
+    incident: dict[str, Any],
+    diagnosis: dict[str, Any],
+    recommendations: list[dict],
+    project: dict[str, Any],
+    request: dict[str, Any],
+) -> str:
+    parts = [
+        str(incident.get("title") or ""),
+        str(incident.get("last_summary") or ""),
+        str(incident.get("analysis") or ""),
+        str(incident.get("classification_category") or ""),
+        str(incident.get("classification_summary") or ""),
+        str(incident.get("results_json") or ""),
+        json.dumps(diagnosis, ensure_ascii=False, sort_keys=True),
+        json.dumps(recommendations, ensure_ascii=False, sort_keys=True),
+        json.dumps(project_code_evidence_context(project), ensure_ascii=False, sort_keys=True),
+        json.dumps(request, ensure_ascii=False, sort_keys=True),
+    ]
+    return "\n".join(parts)
+
+
+def project_code_evidence_context(project: dict[str, Any]) -> dict[str, Any]:
+    keys = ["id", "name", "environment", "run_types", "tags", "health_urls"]
+    return {key: redact_sensitive_text(project.get(key)) for key in keys if key in project}
+
+
+def extract_problem_code_paths(text: str) -> list[str]:
+    paths: list[str] = []
+    for match in CODE_LOCATOR_PATH_RE.finditer(text):
+        value = match.group(1).strip().strip("\"'`),;]")
+        if value:
+            paths.append(value.replace("\\", "/"))
+    return unique_strings(paths)
+
+
+def problem_code_terms(text: str) -> set[str]:
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(text or ""))
+    raw_terms = re.findall(r"[A-Za-z][A-Za-z0-9]{1,}|[0-9]{3,}", spaced.lower())
+    return {
+        term
+        for term in raw_terms
+        if len(term) >= 3 and term not in CODE_LOCATOR_STOP_WORDS and not term.isdigit()
+    }
+
+
+def add_code_locator_score(
+    scores: dict[str, int],
+    reasons: dict[str, list[str]],
+    path: str,
+    score: int,
+    reason: str,
+) -> None:
+    scores[path] = scores.get(path, 0) + score
+    bucket = reasons.setdefault(path, [])
+    if reason not in bucket:
+        bucket.append(reason)
+
+
+def code_locator_confidence(score: int) -> str:
+    if score >= 90:
+        return "high"
+    if score >= 35:
+        return "medium"
+    return "low"
+
+
 def repository_file_tree(repo_root: Path, limit: int) -> list[str]:
     files: list[str] = []
     for path in repo_root.rglob("*"):
@@ -3530,12 +3758,21 @@ def repository_file_tree(repo_root: Path, limit: int) -> list[str]:
 
 def normalize_context_relative_path(value: Any) -> str:
     path_text = str(value or "").strip().replace("\\", "/")
-    if not is_safe_patch_path(path_text):
+    if not is_safe_context_path(path_text):
         return ""
     parts = {part.lower() for part in Path(path_text).parts}
     if parts & REPOSITORY_CONTEXT_EXCLUDED_PARTS:
         return ""
     return path_text
+
+
+def is_safe_context_path(value: str) -> bool:
+    if patch_path_guardrail_reason(value):
+        return False
+    path = Path(str(value or "").strip().replace("\\", "/"))
+    if path.name in ALLOWED_CONTEXT_FILENAMES:
+        return True
+    return path.suffix.lower() in ALLOWED_CONTEXT_SUFFIXES
 
 
 def path_is_within(path: Path, root: Path) -> bool:

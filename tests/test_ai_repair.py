@@ -415,6 +415,113 @@ class AiRepairTest(unittest.TestCase):
         self.assertIn("[redacted sensitive line]", combined_content)
         self.assertNotIn("super-secret", combined_content)
 
+    def test_model_repair_context_locates_code_from_stack_trace_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            target = repo / "app" / "routes"
+            target.mkdir(parents=True)
+            (target / "orders.py").write_text("def create_order():\n    raise ValueError('bad order')\n", encoding="utf-8")
+            (target / "users.py").write_text("def create_user():\n    return 'ok'\n", encoding="utf-8")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "projects": [
+                        {
+                            "id": "sales",
+                            "environment": "prod",
+                            "run_types": ["normal"],
+                            "repo_root": str(repo),
+                        }
+                    ],
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                            "repository_context": {"enabled": True},
+                        }
+                    },
+                },
+                base_dir=Path(tmp),
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [
+                    CheckResult(
+                        source="log",
+                        name="sales api docker log",
+                        status="critical",
+                        summary='Traceback: File "/srv/app/app/routes/orders.py", line 42, in create_order',
+                    )
+                ],
+            )
+
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+            prompt_payload = json.loads(proposal["prompt"]["user"])
+            repository_context = prompt_payload["repository_context"]
+            storage.close()
+
+        file_paths = [item["path"] for item in repository_context["files"]]
+        suspected_paths = [item["path"] for item in repository_context["code_locator"]["suspected_files"]]
+        self.assertIn("app/routes/orders.py", file_paths)
+        self.assertEqual("app/routes/orders.py", suspected_paths[0])
+        self.assertEqual("high", repository_context["code_locator"]["suspected_files"][0]["confidence"])
+
+    def test_model_repair_context_locates_code_from_route_terms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = create_sandbox_repo(Path(tmp) / "repo")
+            api = repo / "src" / "api"
+            api.mkdir(parents=True)
+            (api / "orders.ts").write_text("export function listOrders() { return []; }\n", encoding="utf-8")
+            (api / "customers.ts").write_text("export function listCustomers() { return []; }\n", encoding="utf-8")
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "projects": [
+                        {
+                            "id": "sales",
+                            "environment": "prod",
+                            "run_types": ["normal"],
+                            "repo_root": str(repo),
+                        }
+                    ],
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                            "repository_context": {"enabled": True},
+                        }
+                    },
+                },
+                base_dir=Path(tmp),
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [
+                    CheckResult(
+                        source="http",
+                        name="sales api",
+                        status="critical",
+                        summary="HTTP 500 from https://sales.example.com/api/orders",
+                    )
+                ],
+            )
+
+            proposal = build_ai_repair_proposal(storage, config, incident_id, request={"actor": "tester"})
+            prompt_payload = json.loads(proposal["prompt"]["user"])
+            repository_context = prompt_payload["repository_context"]
+            storage.close()
+
+        file_paths = [item["path"] for item in repository_context["files"]]
+        suspected_paths = [item["path"] for item in repository_context["code_locator"]["suspected_files"]]
+        self.assertIn("src/api/orders.ts", file_paths)
+        self.assertEqual("src/api/orders.ts", suspected_paths[0])
+
     def test_incident_pipeline_uses_project_repo_commands_and_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = create_git_sandbox_repo(Path(tmp) / "repo")
