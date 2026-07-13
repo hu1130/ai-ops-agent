@@ -1082,3 +1082,32 @@ ops-agent/
 - 登录、权限和审计日志
 - 私有化部署包
 - 人工确认后的低风险自动修复动作
+## SQLite to MySQL export
+
+The current runtime still uses SQLite. For a safe MySQL migration, first export
+the existing SQLite database into a reviewable MySQL SQL file:
+
+```bash
+python -m ops_agent.cli --config config.json mysql-export \
+  --database-name ops_agent \
+  --output data/mysql_migration.sql
+```
+
+The command creates MySQL-compatible `CREATE TABLE`, indexes, and batched
+`INSERT` statements, then prints table row counts. Review and back up before
+importing:
+
+```bash
+mysql -u <user> -p < data/mysql_migration.sql
+```
+
+Useful validation commands:
+
+```bash
+python -m ops_agent.cli --config config.json mysql-export --schema-only --output data/mysql_schema.sql
+python -m ops_agent.cli --config config.json mysql-export --data-only --output data/mysql_data.sql
+```
+
+This is the first migration phase: data export/import readiness. Runtime MySQL
+storage should be enabled only after the imported data is verified and a
+rollback plan is prepared.

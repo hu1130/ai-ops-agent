@@ -12,6 +12,7 @@ from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.enterprise import enterprise_readiness_snapshot, format_enterprise_readiness
 from ops_agent.events import CheckResult, RunContext
 from ops_agent.incident_lifecycle import INCIDENT_STATUSES
+from ops_agent.mysql_migration import MysqlExportOptions, export_sqlite_to_mysql, format_mysql_export_result
 from ops_agent.remediation import approval
 from ops_agent.remediation.actions import ActionResult, RemediationAction
 from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action, format_action_plan
@@ -31,6 +32,13 @@ def parse_args() -> argparse.Namespace:
     subparsers.add_parser("validate-config", help="Validate config structure and common mistakes")
     enterprise_parser = subparsers.add_parser("enterprise-readiness", help="Assess enterprise readiness")
     enterprise_parser.add_argument("--json", action="store_true", help="Print JSON payload")
+    mysql_export_parser = subparsers.add_parser("mysql-export", help="Export the SQLite database as MySQL SQL")
+    mysql_export_parser.add_argument("--sqlite", default="", help="SQLite database path; default uses app.database_path")
+    mysql_export_parser.add_argument("--output", default="", help="Output SQL path; default data/mysql_migration.sql")
+    mysql_export_parser.add_argument("--database-name", default="", help="Optional MySQL database name to create/use")
+    mysql_export_parser.add_argument("--schema-only", action="store_true", help="Export schema without data")
+    mysql_export_parser.add_argument("--data-only", action="store_true", help="Export data without schema")
+    mysql_export_parser.add_argument("--batch-size", type=int, default=200, help="INSERT batch size")
 
     plan_parser = subparsers.add_parser("remediation-plan", help="Build a remediation plan for a synthetic issue")
     plan_parser.add_argument("--source", default="json_api", help="Issue source, for example http/json_api/log/server")
@@ -115,6 +123,25 @@ def main() -> int:
         else:
             print(format_enterprise_readiness(snapshot))
         return 1 if snapshot.get("summary", {}).get("blockers", 0) else 0
+
+    if args.command == "mysql-export":
+        if args.schema_only and args.data_only:
+            print("--schema-only and --data-only cannot be used together", file=sys.stderr)
+            return 2
+        sqlite_path = config.resolve_path(args.sqlite) if args.sqlite else database_path_from_config(config)
+        output_path = config.resolve_path(args.output) if args.output else config.resolve_path("data/mysql_migration.sql")
+        result = export_sqlite_to_mysql(
+            MysqlExportOptions(
+                sqlite_path=sqlite_path,
+                output_path=output_path,
+                database_name=str(args.database_name or ""),
+                schema_only=bool(args.schema_only),
+                data_only=bool(args.data_only),
+                batch_size=max(1, int(args.batch_size or 200)),
+            )
+        )
+        print(format_mysql_export_result(result))
+        return 0
 
     if args.command == "remediation-plan":
         details = {}
@@ -465,8 +492,11 @@ def format_verification(verification: VerificationResult | None) -> str:
 
 
 def open_storage(config: AppConfig) -> Storage:
-    database_path = config.resolve_path(str(config.app.get("database_path", "data/ops_agent.db")))
-    return Storage(database_path)
+    return Storage(database_path_from_config(config))
+
+
+def database_path_from_config(config: AppConfig) -> Path:
+    return config.resolve_path(str(config.app.get("database_path", "data/ops_agent.db")))
 
 
 def build_cli_context(config: AppConfig) -> RunContext:
