@@ -158,9 +158,19 @@ def expand_dynamic_values(value: Any) -> Any:
 
 
 def alert_policy_details(check: dict[str, Any]) -> dict[str, Any]:
+    details: dict[str, Any] = {}
     value = check.get("alert_after_failures", check.get("consecutive_failures"))
     try:
         parsed = int(value)
     except (TypeError, ValueError):
-        return {}
-    return {"alert_after_failures": parsed} if parsed > 0 else {}
+        parsed = 0
+    if parsed > 0:
+        details["alert_after_failures"] = parsed
+    recovery_value = check.get("recovery_after_successes", check.get("consecutive_successes"))
+    try:
+        recovery_parsed = int(recovery_value)
+    except (TypeError, ValueError):
+        recovery_parsed = 0
+    if recovery_parsed > 0:
+        details["recovery_after_successes"] = recovery_parsed
+    return details

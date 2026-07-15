@@ -382,6 +382,40 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertEqual("resolved", resolved["status"])
         self.assertIn("resolved", [event["to_status"] for event in events])
 
+    def test_recovery_requires_configured_consecutive_successes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {
+                        "consecutive_failures": 1,
+                        "recovery_enabled": True,
+                        "recovery_after_successes": 2,
+                    },
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            scheduler.process_alert_states(
+                [CheckResult(source="json_api", name="Chat", status="warning", summary="Bad phrase")]
+            )
+            open_incident = storage.latest_incidents(1)[0]
+            ok = CheckResult(source="json_api", name="Chat", status="ok", summary="JSON API OK")
+            scheduler.process_alert_states([ok])
+            still_open = storage.get_incident(open_incident["id"])
+            scheduler.process_alert_states([ok])
+            resolved = storage.get_incident(open_incident["id"])
+            events = storage.latest_incident_events(open_incident["id"])
+            storage.close()
+
+        self.assertEqual("open", still_open["status"])
+        self.assertEqual("resolved", resolved["status"])
+        self.assertEqual(["Ops Agent detected 1 issue(s)", "Ops Agent recovered 1 issue(s)"], [row[0] for row in notifier.sent])
+        self.assertIn("resolved", [event["to_status"] for event in events])
+
     def test_repeated_problem_updates_existing_incident_without_new_alert(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AppConfig(

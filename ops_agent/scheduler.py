@@ -79,6 +79,7 @@ DEFAULT_AI_REPAIR_AUTO_TRIGGER_POLICY = {
 @dataclass
 class IssueState:
     failure_count: int = 0
+    recovery_count: int = 0
     is_open: bool = False
     last_summary: str = ""
     incident_id: int | None = None
@@ -119,10 +120,12 @@ class OpsScheduler:
 
     def process_alert_states(self, results: list[CheckResult]) -> None:
         threshold = int(self.config.alerts.get("consecutive_failures", 2))
+        recovery_threshold = int(self.config.alerts.get("recovery_after_successes", 1))
         recovery_enabled = bool(self.config.alerts.get("recovery_enabled", True))
         new_alerts: list[CheckResult] = []
         recoveries: list[CheckResult] = []
         recovery_incident_ids: set[int] = set()
+        recovery_counted_keys: set[str] = set()
         repeated_by_incident: dict[int, list[CheckResult]] = {}
         ok_results_by_context: dict[tuple[str, str], dict[str, CheckResult]] = {}
 
@@ -131,6 +134,7 @@ class OpsScheduler:
             state = self._issues.setdefault(key, IssueState())
             if result.is_problem:
                 state.failure_count += 1
+                state.recovery_count = 0
                 state.last_summary = result.summary
                 result_threshold = alert_threshold_for_result(result, threshold)
                 if not state.is_open and state.failure_count >= result_threshold:
@@ -140,13 +144,30 @@ class OpsScheduler:
                     repeated_by_incident.setdefault(state.incident_id, []).append(result)
             else:
                 if state.is_open and recovery_enabled:
-                    recoveries.append(result)
-                    if state.incident_id:
-                        recovery_incident_ids.add(state.incident_id)
-                state.failure_count = 0
-                state.is_open = False
-                state.last_summary = result.summary
-                state.incident_id = None
+                    state.recovery_count += 1
+                    recovery_counted_keys.add(key)
+                    result_recovery_threshold = recovery_threshold_for_result(result, recovery_threshold)
+                    if state.recovery_count >= result_recovery_threshold:
+                        recoveries.append(result)
+                        if state.incident_id:
+                            recovery_incident_ids.add(state.incident_id)
+                        state.failure_count = 0
+                        state.recovery_count = 0
+                        state.is_open = False
+                        state.last_summary = result.summary
+                        state.incident_id = None
+                    else:
+                        state.failure_count = 0
+                        state.last_summary = result.summary
+                        context_key = (result.environment or "prod", result.run_type or "normal")
+                        ok_results_by_context.setdefault(context_key, {})[key] = result
+                        continue
+                else:
+                    state.failure_count = 0
+                    state.recovery_count = 0
+                    state.is_open = False
+                    state.last_summary = result.summary
+                    state.incident_id = None
                 context_key = (result.environment or "prod", result.run_type or "normal")
                 ok_results_by_context.setdefault(context_key, {})[key] = result
 
@@ -159,12 +180,40 @@ class OpsScheduler:
                     ok_results_by_key.keys(),
                 )
                 for incident in recovered_incidents:
-                    recovery_incident_ids.add(int(incident["id"]))
+                    incident_id = int(incident["id"])
+                    stable_targets: list[CheckResult] = []
+                    all_targets_stable = True
                     for target_key in fingerprint_target_keys(str(incident.get("fingerprint", ""))):
                         result = ok_results_by_key.get(target_key)
-                        if result and target_key not in existing_recovery_keys:
+                        if not result:
+                            all_targets_stable = False
+                            continue
+                        state = self._issues.setdefault(target_key, IssueState())
+                        if not state.is_open or state.incident_id != incident_id:
+                            state.is_open = True
+                            state.incident_id = incident_id
+                            state.failure_count = 0
+                        if target_key not in existing_recovery_keys and target_key not in recovery_counted_keys:
+                            state.recovery_count += 1
+                        result_recovery_threshold = recovery_threshold_for_result(result, recovery_threshold)
+                        if state.recovery_count >= result_recovery_threshold:
+                            stable_targets.append(result)
+                        else:
+                            all_targets_stable = False
+                    if not all_targets_stable:
+                        continue
+                    recovery_incident_ids.add(incident_id)
+                    for result in stable_targets:
+                        target_key = check_key(result)
+                        if target_key not in existing_recovery_keys:
                             recoveries.append(result)
                             existing_recovery_keys.add(target_key)
+                        state = self._issues.setdefault(target_key, IssueState())
+                        state.failure_count = 0
+                        state.recovery_count = 0
+                        state.is_open = False
+                        state.last_summary = result.summary
+                        state.incident_id = None
 
         for incident_id, repeated_results in repeated_by_incident.items():
             updated = self.update_existing_incident(incident_id, repeated_results)
@@ -1197,6 +1246,17 @@ def incident_status_from_action_results(action_results) -> str:
 
 def alert_threshold_for_result(result: CheckResult, default_threshold: int) -> int:
     for key in ("alert_after_failures", "consecutive_failures"):
+        try:
+            value = int(result.details.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return max(1, int(default_threshold or 1))
+
+
+def recovery_threshold_for_result(result: CheckResult, default_threshold: int) -> int:
+    for key in ("recovery_after_successes", "consecutive_successes"):
         try:
             value = int(result.details.get(key))
         except (TypeError, ValueError):

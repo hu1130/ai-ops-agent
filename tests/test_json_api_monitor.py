@@ -1,6 +1,7 @@
 import unittest
 
 from ops_agent.monitors.json_api_monitor import (
+    alert_policy_details,
     expand_dynamic_values,
     find_bad_phrase,
     get_path,
@@ -25,6 +26,11 @@ class JsonApiMonitorTest(unittest.TestCase):
         payload = expand_dynamic_values({"session_id": "ops-agent-{{uuid}}"})
         self.assertTrue(str(payload["session_id"]).startswith("ops-agent-"))
         self.assertNotIn("{{uuid}}", payload["session_id"])
+
+    def test_alert_policy_details_include_recovery_success_threshold(self) -> None:
+        details = alert_policy_details({"alert_after_failures": 2, "recovery_after_successes": 3})
+        self.assertEqual(2, details["alert_after_failures"])
+        self.assertEqual(3, details["recovery_after_successes"])
 
 
 if __name__ == "__main__":
