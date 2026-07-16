@@ -128,6 +128,33 @@ class EnterpriseReadinessTest(unittest.TestCase):
         self.assertIn("Enterprise readiness:", text)
         self.assertEqual("pass", check_by_name(snapshot, "api_authentication")["status"])
 
+    def test_resilience_features_are_in_enterprise_readiness(self) -> None:
+        config = AppConfig(
+            raw={
+                "database_checks": [{"name": "DB", "engine": "mysql_docker", "container": "mysql"}],
+                "asset_discovery": {"enabled": True},
+                "backups": {
+                    "enabled": True,
+                    "targets": [
+                        {
+                            "id": "db",
+                            "engine": "mysql_docker",
+                            "container": "mysql",
+                            "restore_drill": {"enabled": True},
+                        }
+                    ],
+                },
+            },
+            base_dir=Path("."),
+        )
+
+        snapshot = enterprise_readiness_snapshot(config)
+
+        self.assertEqual("pass", check_by_name(snapshot, "database_monitoring")["status"])
+        self.assertEqual("pass", check_by_name(snapshot, "runtime_asset_discovery")["status"])
+        self.assertEqual("pass", check_by_name(snapshot, "backup_policy")["status"])
+        self.assertEqual("pass", check_by_name(snapshot, "restore_drill_policy")["status"])
+
 
 def check_by_name(snapshot: dict, name: str) -> dict:
     return next(check for check in snapshot["checks"] if check["name"] == name)

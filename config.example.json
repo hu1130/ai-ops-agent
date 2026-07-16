@@ -149,6 +149,76 @@
       "alert_after_failures": 1
     }
   ],
+  "database_checks": [
+    {
+      "name": "Example MySQL",
+      "enabled": false,
+      "engine": "mysql_docker",
+      "container": "your-mysql-container",
+      "interval_seconds": 60,
+      "timeout_seconds": 10,
+      "max_query_latency_ms": 3000,
+      "max_connection_usage_percent": 80,
+      "max_running_threads": 20,
+      "alert_after_failures": 2,
+      "recovery_after_successes": 2
+    }
+  ],
+  "asset_discovery": {
+    "enabled": false,
+    "name": "Runtime asset coverage",
+    "interval_seconds": 900,
+    "timeout_seconds": 8,
+    "ignored_containers": [],
+    "candidate_patterns": [],
+    "alert_after_failures": 2,
+    "recovery_after_successes": 2,
+    "unmonitored_status": "warning"
+  },
+  "backups": {
+    "enabled": false,
+    "base_dir": "data/backups",
+    "targets": [
+      {
+        "id": "ops-agent-sqlite",
+        "name": "Ops Agent database backup",
+        "enabled": true,
+        "engine": "sqlite",
+        "path": "data/ops_agent.db",
+        "interval_hours": 24,
+        "max_age_hours": 48,
+        "retention_days": 14,
+        "minimum_backups": 3,
+        "alert_after_failures": 2,
+        "recovery_after_successes": 2,
+        "restore_drill": {
+          "enabled": true,
+          "interval_days": 7,
+          "max_age_days": 14,
+          "minimum_tables": 1
+        }
+      },
+      {
+        "id": "app-mysql",
+        "name": "Application MySQL backup",
+        "enabled": false,
+        "engine": "mysql_docker",
+        "container": "your-mysql-container",
+        "interval_hours": 24,
+        "max_age_hours": 48,
+        "retention_days": 14,
+        "minimum_backups": 3,
+        "minimum_backup_bytes": 100,
+        "restore_drill": {
+          "enabled": true,
+          "interval_days": 7,
+          "max_age_days": 14,
+          "minimum_tables": 1,
+          "timeout_seconds": 1200
+        }
+      }
+    ]
+  },
   "log_checks": [
     {
       "name": "Example project log",

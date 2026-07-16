@@ -22,12 +22,15 @@ from ops_agent.alerts.routing import (
     route_alert,
     routed_dedupe_key,
 )
+from ops_agent.backups import run_backup_health_checks, run_due_backups
 from ops_agent.config import AppConfig
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.diagnostics.suggestions import build_action_suggestions
 from ops_agent.diagnosis import diagnostic_snapshot_evidence, persist_incident_diagnosis
+from ops_agent.discovery import run_asset_discovery_check
 from ops_agent.events import CheckResult, RunContext, apply_context
 from ops_agent.monitors.business_flow_monitor import run_business_flow_checks
+from ops_agent.monitors.database_monitor import run_database_checks
 from ops_agent.monitors.docker_monitor import run_docker_checks
 from ops_agent.monitors.http_monitor import run_http_checks
 from ops_agent.monitors.json_api_monitor import run_json_checks
@@ -110,7 +113,21 @@ class OpsScheduler:
         )
         results.extend(run_server_checks(self.config.server_checks, self.config.base_dir))
         results.extend(run_docker_checks(self.due_checks("docker", self.config.docker_checks, respect_intervals, cycle_started_at)))
+        results.extend(
+            run_database_checks(
+                self.due_checks("database", self.config.database_checks, respect_intervals, cycle_started_at)
+            )
+        )
         results.extend(run_log_checks(self.due_checks("log", self.config.log_checks, respect_intervals, cycle_started_at), self.config.base_dir))
+        discovery_config = dict(self.config.asset_discovery)
+        if discovery_config.get("enabled", False) and self.due_checks(
+            "discovery",
+            [discovery_config],
+            respect_intervals,
+            cycle_started_at,
+        ):
+            results.append(run_asset_discovery_check(self.config.raw))
+        results.extend(run_backup_health_checks(self.storage, self.config))
         apply_context(results, context)
         if results:
             self.storage.save_results(results)
@@ -833,6 +850,15 @@ class OpsScheduler:
         print(format_retention_result(result))
         self._last_retention_cleanup_date = today
 
+    def run_backups_if_due(self) -> list[dict[str, Any]]:
+        results = run_due_backups(self.storage, self.config)
+        for result in results:
+            print(
+                "Backup run: "
+                f"target={result.get('target_id')} kind={result.get('kind')} status={result.get('status')}"
+            )
+        return results
+
     def run_learning_optimization_if_due(self, force: bool = False) -> list[dict]:
         learning = dict(self.config.raw.get("learning", {}))
         if not learning.get("enabled", True):
@@ -882,6 +908,7 @@ class OpsScheduler:
         while True:
             started = time.perf_counter()
             try:
+                self.run_backups_if_due()
                 results = self.run_once(respect_intervals=True)
                 self.send_daily_report_if_due()
                 self.run_retention_cleanup_if_due()
@@ -1220,6 +1247,10 @@ def safe_dict(value: Any) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def safe_list(value: Any) -> list:
+    return list(value) if isinstance(value, list) else []
+
+
 def clean_string_list(value: Any) -> list[str]:
     if isinstance(value, str):
         return [value.strip()] if value.strip() else []
@@ -1447,6 +1478,7 @@ def enabled_report_target_keys(config: AppConfig) -> set[tuple[str, str]]:
     add_check_targets(targets, "json_api", config.json_checks, ("name", "url"), "JSON API check")
     add_check_targets(targets, "business_flow", config.business_flow_checks, ("name",), "Business flow")
     add_check_targets(targets, "docker", config.docker_checks, ("name", "container"), "Docker container")
+    add_check_targets(targets, "database", config.database_checks, ("name", "container", "host"), "Database")
     add_log_targets(targets, config.log_checks)
 
     if config.server_checks.get("enabled", True):
@@ -1458,6 +1490,16 @@ def enabled_report_target_keys(config: AppConfig) -> set[tuple[str, str]]:
                 ("server", "Load average"),
             }
         )
+
+    if config.asset_discovery.get("enabled", False):
+        targets.add(("discovery", str(config.asset_discovery.get("name") or "Runtime asset coverage")))
+
+    backups = safe_dict(config.raw.get("backups"))
+    if backups.get("enabled", False):
+        for target in safe_list(backups.get("targets")):
+            payload = safe_dict(target)
+            if payload.get("enabled", True) and payload.get("id"):
+                targets.add(("backup", str(payload.get("name") or payload.get("id"))))
 
     return targets
 

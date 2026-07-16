@@ -18,6 +18,10 @@ def build_action_suggestions(results: list[CheckResult]) -> str:
         suggestions.append("内存告警时，先查占用最高的进程、容器内存和是否存在请求堆积。")
     if any(result.source == "server" and "CPU" in result.name for result in results):
         suggestions.append("CPU 告警时，先确认是否有批处理任务、异常循环、爬虫流量或模型请求堆积。")
+    if any(result.source == "database" for result in results):
+        suggestions.append("数据库告警时，先确认真实查询、连接使用率、运行线程、磁盘空间和最近表结构变更。")
+    if any(result.source == "backup" for result in results):
+        suggestions.append("备份告警时，先保留现有备份，再检查备份文件、校验和、空间和隔离恢复演练结果。")
 
     if not suggestions:
         suggestions.append("先确认异常是否连续出现，再对照最近发布、外部依赖和服务器资源逐项排查。")

@@ -14,13 +14,19 @@ TARGET_LIST_KEYS = {
     "json_api": "json_checks",
     "json": "json_checks",
     "log": "log_checks",
+    "database": "database_checks",
 }
 SECRET_MARKERS = ("password", "token", "secret", "api_key", "authorization")
 
 
 def list_monitor_targets(raw: dict[str, Any]) -> dict[str, Any]:
     targets: list[dict[str, Any]] = []
-    for target_type, key in (("http", "http_checks"), ("json_api", "json_checks"), ("log", "log_checks")):
+    for target_type, key in (
+        ("http", "http_checks"),
+        ("json_api", "json_checks"),
+        ("log", "log_checks"),
+        ("database", "database_checks"),
+    ):
         values = raw.get(key, [])
         if not isinstance(values, list):
             continue

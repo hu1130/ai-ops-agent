@@ -37,6 +37,10 @@ class AppConfig:
         return list(self.raw.get("docker_checks", []))
 
     @property
+    def database_checks(self) -> list[dict[str, Any]]:
+        return list(self.raw.get("database_checks", []))
+
+    @property
     def log_checks(self) -> list[dict[str, Any]]:
         return list(self.raw.get("log_checks", []))
 
@@ -47,6 +51,10 @@ class AppConfig:
     @property
     def alerts(self) -> dict[str, Any]:
         return self.raw.get("alerts", {})
+
+    @property
+    def asset_discovery(self) -> dict[str, Any]:
+        return self.raw.get("asset_discovery", {})
 
     @property
     def classification_rules(self) -> list[dict[str, Any]]:

@@ -14,6 +14,9 @@ CATEGORY_LABELS = {
     "log_error_spike": "日志错误增加",
     "synthetic_quality_fail": "合成测试质量失败",
     "resource_pressure": "服务器资源压力",
+    "database_failure": "数据库故障",
+    "monitor_coverage_gap": "监控覆盖缺口",
+    "backup_failure": "备份或恢复演练失败",
     "unknown": "未知异常",
 }
 CATEGORY_LABELS["business_flow_failure"] = "业务流程失败"
@@ -72,6 +75,12 @@ def classify_signal(
         return classify_docker(result)
     if result.source == "server":
         return classify_server(result)
+    if result.source == "database":
+        return classify_database(result)
+    if result.source == "discovery":
+        return classify_discovery(result)
+    if result.source == "backup":
+        return classify_backup(result)
     return unknown_classification(result)
 
 
@@ -446,6 +455,88 @@ def classify_server(result: CheckResult) -> IncidentClassification:
             "先定位占用最高的进程、容器或目录。",
             "确认是否存在日志暴涨、批处理任务、异常循环或连接堆积。",
             "清理或重启前先保留关键诊断信息。",
+        ],
+    )
+
+
+def classify_database(result: CheckResult) -> IncidentClassification:
+    details = result.details or {}
+    evidence = base_evidence(result)
+    classification = str(details.get("classification") or "")
+    if details.get("container"):
+        evidence.append(f"数据库容器: {details.get('container')}")
+    if details.get("database"):
+        evidence.append(f"数据库名: {details.get('database')}")
+    if classification == "database_unavailable" or result.status == "critical":
+        return IncidentClassification(
+            category="database_failure",
+            confidence=0.92,
+            summary="数据库真实查询失败，可能已经影响依赖它的接口和业务流程。",
+            evidence=evidence,
+            next_steps=[
+                "检查 MySQL 容器状态和数据库错误日志。",
+                "确认磁盘空间、连接数、账号权限和最近数据库变更。",
+                "恢复前先确认备份状态，避免直接执行高风险数据库操作。",
+            ],
+        )
+    return IncidentClassification(
+        category="resource_pressure" if classification == "database_pressure" else "database_failure",
+        confidence=0.84,
+        summary="数据库查询仍可完成，但连接、线程、容量或响应耗时达到警告阈值。",
+        evidence=evidence,
+        next_steps=[
+            "查看连接使用率、运行线程和慢查询。",
+            "检查应用连接池、长事务和数据库容量趋势。",
+        ],
+    )
+
+
+def classify_discovery(result: CheckResult) -> IncidentClassification:
+    details = result.details or {}
+    evidence = base_evidence(result)
+    candidates = safe_list(details.get("unmonitored_applications"))
+    for item in candidates[:5]:
+        payload = safe_dict(item)
+        evidence.append(f"未监控容器: {payload.get('name')} image={payload.get('image')}")
+    if str(details.get("classification") or "") == "asset_discovery_unavailable":
+        return IncidentClassification(
+            category="probe_config_issue",
+            confidence=0.76,
+            summary="自动发现无法读取 Docker 运行资产，需要检查 Docker 权限或命令状态。",
+            evidence=evidence,
+            next_steps=["确认 ops-agent 可以执行 docker ps。", "检查 Docker 服务和运行权限。"],
+        )
+    return IncidentClassification(
+        category="monitor_coverage_gap",
+        confidence=0.9,
+        summary="发现正在运行的业务容器没有任何容器、日志、数据库或备份监控。",
+        evidence=evidence,
+        next_steps=[
+            "确认容器属于需要维护的启用项目。",
+            "为业务入口、容器状态和关键日志至少补充一种监控。",
+            "如果容器属于停用项目或基础设施，将其加入忽略规则。",
+        ],
+    )
+
+
+def classify_backup(result: CheckResult) -> IncidentClassification:
+    evidence = base_evidence(result)
+    details = result.details or {}
+    latest = safe_dict(details.get("latest_backup"))
+    drill = safe_dict(details.get("latest_restore_drill"))
+    if latest:
+        evidence.append(f"最近备份: {latest.get('completed_at')} status={latest.get('status')}")
+    if drill:
+        evidence.append(f"最近恢复演练: {drill.get('completed_at')} status={drill.get('status')}")
+    return IncidentClassification(
+        category="backup_failure",
+        confidence=0.92,
+        summary="备份缺失、过期、执行失败或隔离恢复演练未通过，发生故障时可能无法可靠恢复数据。",
+        evidence=evidence,
+        next_steps=[
+            "先修复备份失败原因，不要删除现有可用备份。",
+            "重新执行备份并在隔离目标中完成恢复演练。",
+            "确认备份文件大小、校验和和恢复后的表数量。",
         ],
     )
 

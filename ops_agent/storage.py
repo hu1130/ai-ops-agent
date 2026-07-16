@@ -221,6 +221,21 @@ class Storage:
                     metadata_json text not null default '{}'
                 );
 
+                create table if not exists backup_runs (
+                    id integer primary key autoincrement,
+                    target_id text not null,
+                    engine text not null,
+                    kind text not null default 'backup',
+                    status text not null default 'running',
+                    started_at text not null,
+                    completed_at text,
+                    path text not null default '',
+                    size_bytes integer not null default 0,
+                    checksum text not null default '',
+                    error text not null default '',
+                    metadata_json text not null default '{}'
+                );
+
                 create table if not exists change_events (
                     id integer primary key autoincrement,
                     created_at text not null,
@@ -3266,6 +3281,97 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def start_backup_run(
+        self,
+        target_id: str,
+        engine: str,
+        kind: str = "backup",
+        metadata: dict | None = None,
+    ) -> int:
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                insert into backup_runs (
+                    target_id, engine, kind, status, started_at, metadata_json
+                )
+                values (?, ?, ?, 'running', ?, ?)
+                """,
+                (
+                    target_id,
+                    engine,
+                    kind,
+                    utc_now_iso(),
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+            self.connection.commit()
+            return int(cursor.lastrowid)
+
+    def finish_backup_run(
+        self,
+        run_id: int,
+        status: str,
+        path: str = "",
+        size_bytes: int = 0,
+        checksum: str = "",
+        error: str = "",
+        metadata: dict | None = None,
+    ) -> dict:
+        with self.lock:
+            self.connection.execute(
+                """
+                update backup_runs
+                set status = ?, completed_at = ?, path = ?, size_bytes = ?,
+                    checksum = ?, error = ?, metadata_json = ?
+                where id = ?
+                """,
+                (
+                    status,
+                    utc_now_iso(),
+                    path,
+                    max(0, int(size_bytes or 0)),
+                    checksum,
+                    error,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    run_id,
+                ),
+            )
+            self.connection.commit()
+            row = self.connection.execute("select * from backup_runs where id = ?", (run_id,)).fetchone()
+        if not row:
+            raise ValueError(f"backup run not found: {run_id}")
+        return backup_run_payload(row)
+
+    def latest_backup_runs(
+        self,
+        limit: int = 50,
+        target_id: str = "",
+        kind: str = "",
+        status: str = "",
+    ) -> list[dict]:
+        with self.lock:
+            where: list[str] = []
+            params: list[object] = []
+            for column, value in (("target_id", target_id), ("kind", kind), ("status", status)):
+                if value:
+                    where.append(f"{column} = ?")
+                    params.append(value)
+            where_sql = f"where {' and '.join(where)}" if where else ""
+            rows = self.connection.execute(
+                f"""
+                select * from backup_runs
+                {where_sql}
+                order by id desc
+                limit ?
+                """,
+                (*params, max(1, min(int(limit or 50), 500))),
+            ).fetchall()
+        return [backup_run_payload(row) for row in rows]
+
+    def latest_successful_backup_run(self, target_id: str, kind: str = "backup") -> dict | None:
+        rows = self.latest_backup_runs(1, target_id=target_id, kind=kind, status="success")
+        return rows[0] if rows else None
+
     def recent_results_for_targets(
         self,
         since_iso: str,
@@ -4328,6 +4434,15 @@ READINESS_BLOCK_PREFIX = "readiness blocked:"
 
 def is_mutating_action(action_type: str) -> bool:
     return action_type in MUTATING_ACTION_TYPES
+
+
+def backup_run_payload(row: sqlite3.Row | dict) -> dict:
+    payload = dict(row)
+    try:
+        payload["metadata"] = json.loads(payload.get("metadata_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        payload["metadata"] = {}
+    return payload
 
 
 def action_was_readiness_blocked(row: dict) -> bool:

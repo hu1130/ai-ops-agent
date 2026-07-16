@@ -19,14 +19,24 @@ class MonitorTargetsTest(unittest.TestCase):
                 }
             ],
             "server_checks": {"enabled": True},
+            "database_checks": [
+                {
+                    "name": "MySQL",
+                    "engine": "mysql",
+                    "host": "db.example.com",
+                    "username": "ops",
+                    "password": "db-secret",
+                }
+            ],
         }
 
         result = list_monitor_targets(raw)
 
-        self.assertEqual(2, len(result["targets"]))
+        self.assertEqual(3, len(result["targets"]))
         self.assertEqual("Site", result["targets"][0]["name"])
         self.assertEqual("***", result["targets"][1]["target"]["json"]["api_key"])
         self.assertTrue(result["server"]["enabled"])
+        self.assertEqual("***", result["targets"][2]["target"]["password"])
 
     def test_apply_monitor_target_change_persists_and_updates_in_memory_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

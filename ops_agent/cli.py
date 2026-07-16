@@ -688,6 +688,32 @@ def validate_config(config: AppConfig) -> list[str]:
         if "require_healthcheck" in check and not isinstance(check["require_healthcheck"], bool):
             errors.append(f"docker_checks[{index}].require_healthcheck 必须是 true/false")
 
+    for index, check in enumerate(config.database_checks):
+        field = f"database_checks[{index}]"
+        engine = str(check.get("engine") or "mysql_docker").strip().lower()
+        if engine not in {"mysql_docker", "mysql"}:
+            errors.append(f"{field}.engine 必须是 mysql_docker/mysql")
+        if engine == "mysql_docker":
+            container = str(check.get("container") or "").strip()
+            if not container:
+                errors.append(f"{field}.container 不能为空")
+            else:
+                validate_context_name(container, f"{field}.container", errors)
+        if engine == "mysql":
+            if not str(check.get("host") or "").strip():
+                errors.append(f"{field}.host 不能为空")
+            if not str(check.get("username") or check.get("user") or "").strip():
+                errors.append(f"{field}.username 不能为空")
+            if not str(check.get("password") or check.get("password_env") or "").strip():
+                errors.append(f"{field}.password 或 password_env 不能为空")
+            validate_positive_int(check.get("port", 3306), f"{field}.port", errors)
+        validate_positive_int(check.get("timeout_seconds", 10), f"{field}.timeout_seconds", errors)
+        validate_optional_positive_int(check.get("interval_seconds"), f"{field}.interval_seconds", errors)
+        validate_optional_positive_int(check.get("alert_after_failures"), f"{field}.alert_after_failures", errors)
+        validate_optional_positive_int(check.get("recovery_after_successes"), f"{field}.recovery_after_successes", errors)
+        validate_positive_int(check.get("max_query_latency_ms", 3000), f"{field}.max_query_latency_ms", errors)
+        validate_positive_int(check.get("max_running_threads", 20), f"{field}.max_running_threads", errors)
+
     for index, check in enumerate(config.log_checks):
         validate_optional_positive_int(check.get("alert_after_failures"), f"log_checks[{index}].alert_after_failures", errors)
         validate_optional_positive_int(check.get("consecutive_failures"), f"log_checks[{index}].consecutive_failures", errors)
@@ -775,7 +801,70 @@ def validate_config(config: AppConfig) -> list[str]:
             errors.append("retention.cleanup_hour 必须是数字")
         else:
             if cleanup_hour < 0 or cleanup_hour > 23:
-                errors.append("retention.cleanup_hour 必须在 0-23 之间")
+                    errors.append("retention.cleanup_hour 必须在 0-23 之间")
+
+    discovery = dict(config.raw.get("asset_discovery", {}))
+    if discovery:
+        validate_optional_positive_int(discovery.get("interval_seconds"), "asset_discovery.interval_seconds", errors)
+        validate_positive_int(discovery.get("timeout_seconds", 8), "asset_discovery.timeout_seconds", errors)
+        validate_optional_positive_int(discovery.get("alert_after_failures"), "asset_discovery.alert_after_failures", errors)
+        validate_optional_positive_int(
+            discovery.get("recovery_after_successes"),
+            "asset_discovery.recovery_after_successes",
+            errors,
+        )
+        validate_string_list(discovery.get("ignored_containers", []), "asset_discovery.ignored_containers", errors)
+        validate_string_list(discovery.get("candidate_patterns", []), "asset_discovery.candidate_patterns", errors)
+        validate_string_list(
+            discovery.get("infrastructure_patterns", []),
+            "asset_discovery.infrastructure_patterns",
+            errors,
+        )
+
+    backups = dict(config.raw.get("backups", {}))
+    if backups:
+        if "enabled" in backups and not isinstance(backups["enabled"], bool):
+            errors.append("backups.enabled 必须是 true/false")
+        targets = backups.get("targets", [])
+        if not isinstance(targets, list):
+            errors.append("backups.targets 必须是数组")
+        else:
+            seen_target_ids: set[str] = set()
+            for index, target in enumerate(targets):
+                field = f"backups.targets[{index}]"
+                if not isinstance(target, dict):
+                    errors.append(f"{field} 必须是对象")
+                    continue
+                target_id = str(target.get("id") or "").strip()
+                if not target_id:
+                    errors.append(f"{field}.id 不能为空")
+                elif target_id in seen_target_ids:
+                    errors.append(f"{field}.id 重复: {target_id}")
+                else:
+                    seen_target_ids.add(target_id)
+                    validate_context_name(target_id, f"{field}.id", errors)
+                engine = str(target.get("engine") or "sqlite")
+                if engine not in {"sqlite", "mysql_docker"}:
+                    errors.append(f"{field}.engine 必须是 sqlite/mysql_docker")
+                if engine == "sqlite" and not str(target.get("path") or config.app.get("database_path") or "").strip():
+                    errors.append(f"{field}.path 不能为空")
+                if engine == "mysql_docker":
+                    container = str(target.get("container") or "").strip()
+                    if not container:
+                        errors.append(f"{field}.container 不能为空")
+                    else:
+                        validate_context_name(container, f"{field}.container", errors)
+                validate_positive_number(target.get("interval_hours", 24), f"{field}.interval_hours", errors)
+                validate_positive_int(target.get("retention_days", 14), f"{field}.retention_days", errors)
+                validate_positive_int(target.get("minimum_backups", 3), f"{field}.minimum_backups", errors)
+                validate_optional_positive_int(target.get("alert_after_failures"), f"{field}.alert_after_failures", errors)
+                validate_optional_positive_int(target.get("recovery_after_successes"), f"{field}.recovery_after_successes", errors)
+                drill = target.get("restore_drill", {})
+                if drill and not isinstance(drill, dict):
+                    errors.append(f"{field}.restore_drill 必须是对象")
+                elif isinstance(drill, dict):
+                    validate_positive_number(drill.get("interval_days", 7), f"{field}.restore_drill.interval_days", errors)
+                    validate_positive_int(drill.get("minimum_tables", 1), f"{field}.restore_drill.minimum_tables", errors)
 
     email = dict(alerts.get("email", {}))
     if email.get("enabled", False):
@@ -868,6 +957,16 @@ def validate_url(value: str, field: str, errors: list[str]) -> None:
 def validate_positive_int(value: object, field: str, errors: list[str]) -> None:
     try:
         number = int(value)
+    except (TypeError, ValueError):
+        errors.append(f"{field} 必须是数字")
+        return
+    if number <= 0:
+        errors.append(f"{field} 必须大于 0")
+
+
+def validate_positive_number(value: object, field: str, errors: list[str]) -> None:
+    try:
+        number = float(value)
     except (TypeError, ValueError):
         errors.append(f"{field} 必须是数字")
         return

@@ -25,6 +25,7 @@ def enterprise_readiness_snapshot(config: AppConfig) -> dict[str, Any]:
     checks.extend(alert_governance_checks(config))
     checks.extend(remediation_governance_checks(config))
     checks.extend(ai_repair_governance_checks(config))
+    checks.extend(resilience_governance_checks(config))
     checks.extend(storage_and_audit_checks(config))
     checks.extend(security_governance_checks(config))
 
@@ -152,6 +153,62 @@ def alert_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
     ]
 
 
+def resilience_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
+    database_checks = [
+        item
+        for item in safe_list(config.raw.get("database_checks"))
+        if isinstance(item, dict) and item.get("enabled", True)
+    ]
+    discovery = safe_dict(config.raw.get("asset_discovery"))
+    backups = safe_dict(config.raw.get("backups"))
+    backup_targets = [
+        item
+        for item in safe_list(backups.get("targets"))
+        if isinstance(item, dict) and item.get("enabled", True)
+    ]
+    targets_without_drill = [
+        str(target.get("id") or "")
+        for target in backup_targets
+        if not safe_dict(target.get("restore_drill")).get("enabled", False)
+    ]
+    return [
+        ReadinessCheck(
+            "resilience",
+            "database_monitoring",
+            "pass" if database_checks else "warning",
+            f"{len(database_checks)} database monitor(s) configured."
+            if database_checks
+            else "No database query monitor is configured.",
+            {"database_monitors": [str(item.get("name") or item.get("container") or "") for item in database_checks]},
+        ),
+        ReadinessCheck(
+            "resilience",
+            "runtime_asset_discovery",
+            "pass" if discovery.get("enabled", False) else "warning",
+            "Runtime asset discovery is enabled."
+            if discovery.get("enabled", False)
+            else "Runtime asset discovery is disabled.",
+            {"enabled": bool(discovery.get("enabled", False))},
+        ),
+        ReadinessCheck(
+            "resilience",
+            "backup_policy",
+            "pass" if backups.get("enabled", False) and backup_targets else "warning",
+            f"{len(backup_targets)} backup target(s) configured."
+            if backups.get("enabled", False) and backup_targets
+            else "Automated backups are not fully configured.",
+            {"enabled": bool(backups.get("enabled", False)), "target_ids": [str(item.get("id") or "") for item in backup_targets]},
+        ),
+        ReadinessCheck(
+            "resilience",
+            "restore_drill_policy",
+            "pass" if backup_targets and not targets_without_drill else "warning",
+            "All backup targets have isolated restore drills enabled."
+            if backup_targets and not targets_without_drill
+            else "Some backup targets do not have restore drills enabled.",
+            {"targets_without_restore_drill": targets_without_drill},
+        ),
+    ]
 def remediation_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
     remediation = safe_dict(config.raw.get("remediation"))
     policies = [policy for policy in safe_list(remediation.get("policies")) if isinstance(policy, dict)]

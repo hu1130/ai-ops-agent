@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.auth import AuthResult, authenticate_token, configured_api_tokens, has_role
+from ops_agent.backups import backup_status_payload, run_backup_now, run_restore_drill_now
 from ops_agent.config import AppConfig
 from ops_agent.config_center import (
     ai_repair_auto_trigger_snapshot,
@@ -28,6 +29,7 @@ from ops_agent.config_center import (
     validate_config_candidate,
 )
 from ops_agent.diagnosis import persist_incident_diagnosis
+from ops_agent.discovery import discover_runtime_assets
 from ops_agent.enterprise import enterprise_readiness_snapshot
 from ops_agent.ai.config_patches import (
     apply_config_patch,
@@ -131,6 +133,18 @@ def start_dashboard(
                         limit=query_limit(query, default=50, maximum=200),
                     )
                 )
+                return
+            if path == "/api/discovery":
+                if config is None:
+                    self.send_json({"error": "config is not configured"}, status=503)
+                    return
+                self.send_json(discover_runtime_assets(config.raw))
+                return
+            if path == "/api/backups":
+                if config is None:
+                    self.send_json({"error": "config is not configured"}, status=503)
+                    return
+                self.send_json(backup_status_payload(storage, config, limit=query_limit(query, default=100, maximum=500)))
                 return
             if path == "/api/classifications/summary":
                 self.send_json(storage.classification_summary(query_hours(query)))
@@ -422,6 +436,10 @@ def start_dashboard(
                 self.handle_config_center_post(path, auth)
                 return
 
+            if path in {"/api/backups/run", "/api/backups/drill"}:
+                self.handle_backup_post(path, auth)
+                return
+
             learning_request = parse_learning_recommendation_api_path(path)
             if learning_request:
                 self.handle_learning_recommendation_post(learning_request, auth)
@@ -626,6 +644,34 @@ def start_dashboard(
                 return
             self.record_audit(path, 200, "success", f"change event created #{created.get('id')}", actor=actor, auth=auth)
             self.send_json(created)
+
+        def handle_backup_post(self, path: str, auth: AuthResult) -> None:
+            actor = "api"
+            try:
+                body = self.read_json_body()
+                actor = self.actor_from_body(body, auth)
+                if config is None:
+                    self.record_audit(path, 503, "error", "backup workflow is not configured", actor=actor, auth=auth)
+                    self.send_json({"error": "backup workflow is not configured"}, status=503)
+                    return
+                target_id = str(body.get("target_id") or body.get("id") or "")
+                if path == "/api/backups/run":
+                    runs = run_backup_now(storage, config, target_id=target_id)
+                    failed = [run for run in runs if run.get("status") != "success"]
+                    outcome = "error" if failed else "success"
+                    self.record_audit(path, 200, outcome, f"backup runs={len(runs)} failed={len(failed)}", actor=actor, auth=auth)
+                    self.send_json({"status": outcome, "runs": runs})
+                    return
+                run = run_restore_drill_now(storage, config, target_id=target_id)
+                outcome = "success" if run.get("status") == "success" else "error"
+                self.record_audit(path, 200, outcome, f"restore drill target={target_id}", actor=actor, auth=auth)
+                self.send_json({"status": outcome, "run": run})
+            except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
 
         def handle_incident_ai_repair_post(
             self,
@@ -2316,6 +2362,10 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/ops/report": ("ops.report", "ops", None),
         "/api/remediation/audit": ("remediation.audit", "remediation", None),
         "/api/operator/inbox": ("operator.inbox", "operator", None),
+        "/api/discovery": ("discovery.read", "discovery", None),
+        "/api/backups": ("backup.list", "backup", None),
+        "/api/backups/run": ("backup.run", "backup", None),
+        "/api/backups/drill": ("backup.drill", "backup", None),
         "/api/recommendations": ("recommendation.list", "recommendation", None),
         "/api/recommendations/actionable": ("recommendation.actionable", "recommendation", None),
         "/api/recommendations/pending": ("recommendation.pending", "recommendation", None),
