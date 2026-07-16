@@ -56,6 +56,11 @@ from ops_agent.monitor_targets import (
     get_monitor_target,
     list_monitor_targets,
 )
+from ops_agent.operator_workflow import (
+    build_operator_guide,
+    build_operator_inbox,
+    execute_primary_operator_action,
+)
 from ops_agent.projects import list_projects, project_summary_payload
 from ops_agent.remediation.approval import approval_expiry_from_config, approve_action_log, reject_action_log
 from ops_agent.remediation.playbook_center import (
@@ -115,6 +120,15 @@ def start_dashboard(
                     storage.remediation_audit(
                         query_hours(query),
                         query_limit(query, default=50, maximum=500),
+                    )
+                )
+                return
+            if path == "/api/operator/inbox":
+                self.send_json(
+                    build_operator_inbox(
+                        storage,
+                        config,
+                        limit=query_limit(query, default=50, maximum=200),
                     )
                 )
                 return
@@ -268,6 +282,12 @@ def start_dashboard(
                         self.send_json({"error": "incident not found"}, status=404)
                         return
                     self.send_json(detail)
+                    return
+                if action in {"operator-guide", "operator_guide"}:
+                    try:
+                        self.send_json(build_operator_guide(storage, config, incident_id))
+                    except ValueError as exc:
+                        self.send_json({"error": str(exc)}, status=404)
                     return
                 if action == "events":
                     self.send_json(storage.latest_incident_events(incident_id))
@@ -518,6 +538,39 @@ def start_dashboard(
                         200,
                         "success",
                         f"playbook recommendations saved={result.get('saved_count')}",
+                        actor=actor,
+                        auth=auth,
+                    )
+                    self.send_json(result)
+                    return
+
+                if action in {"operator-action", "operator_action"}:
+                    if config is None:
+                        self.record_audit(
+                            path,
+                            503,
+                            "error",
+                            "operator workflow is not configured",
+                            actor=actor,
+                            auth=auth,
+                        )
+                        self.send_json({"error": "operator workflow is not configured"}, status=503)
+                        return
+                    result = execute_primary_operator_action(
+                        storage,
+                        config,
+                        incident_id,
+                        actor=actor,
+                        note=note,
+                        notifier=notifier,
+                        request=body,
+                    )
+                    outcome = str(result.get("status") or "success")
+                    self.record_audit(
+                        path,
+                        200,
+                        outcome,
+                        str(result.get("message") or "operator action completed"),
                         actor=actor,
                         auth=auth,
                     )
@@ -2262,6 +2315,7 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/ops/metrics": ("ops.metrics", "ops", None),
         "/api/ops/report": ("ops.report", "ops", None),
         "/api/remediation/audit": ("remediation.audit", "remediation", None),
+        "/api/operator/inbox": ("operator.inbox", "operator", None),
         "/api/recommendations": ("recommendation.list", "recommendation", None),
         "/api/recommendations/actionable": ("recommendation.actionable", "recommendation", None),
         "/api/recommendations/pending": ("recommendation.pending", "recommendation", None),
