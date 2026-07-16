@@ -16,7 +16,7 @@ CATEGORY_LABELS = {
     "resource_pressure": "服务器资源压力",
     "unknown": "未知异常",
 }
-CATEGORY_LABELS["business_flow_failure"] = "Business flow failure"
+CATEGORY_LABELS["business_flow_failure"] = "业务流程失败"
 
 
 @dataclass

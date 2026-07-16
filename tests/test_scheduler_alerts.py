@@ -34,6 +34,39 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertIn("恢复正常", message)
         self.assertIn("http/Site", message)
 
+    def test_alert_notification_starts_with_operator_brief(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 1, "recovery_after_successes": 2},
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            scheduler.process_alert_states(
+                [
+                    CheckResult(
+                        source="http",
+                        name="Site",
+                        status="critical",
+                        summary="HTTP 500",
+                        details={"url": "https://example.com", "status_code": 500},
+                    )
+                ]
+            )
+            incident = storage.latest_incidents(1)[0]
+            storage.close()
+
+        self.assertEqual("AI自动化运维工具：发现 1 个问题", notifier.sent[0][0])
+        self.assertTrue(notifier.sent[0][1].startswith("先看结论\n"))
+        self.assertIn("你现在要做: 需要处理", notifier.sent[0][1])
+        self.assertIn("没有执行重启、配置修改或代码修改", notifier.sent[0][1])
+        self.assertTrue(incident["analysis"].startswith("先看结论\n"))
+
     def test_daily_report_counts_statuses(self) -> None:
         rows = [
             {"source": "http", "name": "Site", "status": "ok", "summary": "HTTP 200"},
@@ -262,7 +295,7 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertTrue(any(event["note"] == "AI repair auto-triggered" for event in events))
         self.assertEqual(2, len(notifier.sent))
         self.assertIn("Ops Agent AI repair approval queue: 1 item(s)", {title for title, _, _ in notifier.sent})
-        self.assertIn("Ops Agent detected 1 issue(s)", {title for title, _, _ in notifier.sent})
+        self.assertIn("AI自动化运维工具：发现 1 个问题", {title for title, _, _ in notifier.sent})
         self.assertTrue(any(json.loads(row["route_names_json"]) == ["ai-repair-approval-queue"] for row in notifications))
 
     def test_ai_repair_auto_trigger_skips_warning_by_default(self) -> None:
@@ -413,7 +446,11 @@ class SchedulerAlertsTest(unittest.TestCase):
 
         self.assertEqual("open", still_open["status"])
         self.assertEqual("resolved", resolved["status"])
-        self.assertEqual(["Ops Agent detected 1 issue(s)", "Ops Agent recovered 1 issue(s)"], [row[0] for row in notifier.sent])
+        self.assertEqual(
+            ["AI自动化运维工具：发现 1 个问题", "AI自动化运维工具：1 个问题已恢复"],
+            [row[0] for row in notifier.sent],
+        )
+        self.assertIn("连续 2 次检查正常", notifier.sent[1][1])
         self.assertIn("resolved", [event["to_status"] for event in events])
 
     def test_repeated_problem_updates_existing_incident_without_new_alert(self) -> None:
@@ -551,7 +588,7 @@ class SchedulerAlertsTest(unittest.TestCase):
             storage.close()
 
         self.assertEqual(2, len(notifier.sent))
-        self.assertEqual("Ops Agent repeated issue reminder #1", notifier.sent[1][0])
+        self.assertEqual("AI自动化运维工具：问题仍未恢复 #1", notifier.sent[1][0])
         self.assertIn("累计出现次数: 2", notifier.sent[1][1])
         self.assertEqual("repeat", updated["last_notification_kind"])
 
@@ -662,7 +699,7 @@ class SchedulerAlertsTest(unittest.TestCase):
             storage.close()
 
         self.assertEqual(2, len(notifier.sent))
-        self.assertEqual("[升级] Ops Agent incident #1 requires attention", notifier.sent[1][0])
+        self.assertEqual("AI自动化运维工具：需要人工处理 #1", notifier.sent[1][0])
         self.assertIn("事件升级提醒", notifier.sent[1][1])
         self.assertEqual(1, escalated["escalation_level"])
         self.assertEqual("escalation", escalated["last_notification_kind"])
@@ -789,8 +826,8 @@ class SchedulerAlertsTest(unittest.TestCase):
             storage.close()
 
         self.assertEqual(2, len(notifier.sent))
-        self.assertEqual("Ops Agent detected 1 issue(s)", notifier.sent[0][0])
-        self.assertEqual("[升级] Ops Agent incident #1 requires attention", notifier.sent[1][0])
+        self.assertEqual("AI自动化运维工具：发现 1 个问题", notifier.sent[0][0])
+        self.assertEqual("AI自动化运维工具：自动处理失败 #1", notifier.sent[1][0])
         self.assertIn("remediation action(s) failed", notifier.sent[1][1])
         self.assertEqual(1, incident["escalation_level"])
         self.assertTrue(any(event["note"] == "incident escalated" for event in events))
@@ -853,7 +890,7 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertEqual("resolved", resolved["status"])
         self.assertIn("resolved", [event["to_status"] for event in events])
         self.assertEqual(1, len(restarted_notifier.sent))
-        self.assertEqual("Ops Agent recovered 1 issue(s)", restarted_notifier.sent[0][0])
+        self.assertEqual("AI自动化运维工具：1 个问题已恢复", restarted_notifier.sent[0][0])
 
     def test_multi_target_incident_requires_all_targets_healthy_before_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -871,7 +908,7 @@ class SchedulerAlertsTest(unittest.TestCase):
             scheduler = OpsScheduler(config, storage, notifier)
             incident_id = storage.save_incident(
                 "critical",
-                "Ops Agent detected 2 issue(s)",
+                "AI自动化运维工具：发现 2 个问题",
                 "analysis",
                 [
                     CheckResult(source="http", name="Site", status="critical", summary="Request failed"),
@@ -899,7 +936,7 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertEqual("resolved", resolved["status"])
         self.assertIn("resolved", [event["to_status"] for event in events])
         self.assertEqual(1, len(notifier.sent))
-        self.assertEqual("Ops Agent recovered 2 issue(s)", notifier.sent[0][0])
+        self.assertEqual("AI自动化运维工具：2 个问题已恢复", notifier.sent[0][0])
 
     def test_playbook_halt_skips_remaining_steps_after_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1076,7 +1113,7 @@ class SchedulerAlertsTest(unittest.TestCase):
             incident = storage.get_incident(incident_id)
             storage.close()
 
-        self.assertTrue(any(title == "Ops Agent playbook escalation" for title, _, _ in notifier.sent))
+        self.assertTrue(any(title == "AI自动化运维工具：处置流程执行失败" for title, _, _ in notifier.sent))
         self.assertEqual("remediating", incident["status"])
 
 

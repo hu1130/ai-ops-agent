@@ -33,6 +33,7 @@ from ops_agent.monitors.http_monitor import run_http_checks
 from ops_agent.monitors.json_api_monitor import run_json_checks
 from ops_agent.monitors.log_monitor import run_log_checks
 from ops_agent.monitors.server_monitor import run_server_checks
+from ops_agent.operator_guidance import build_operator_brief
 from ops_agent.remediation.actions import ActionResult, RemediationAction
 from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action, format_action_plan
 from ops_agent.remediation.playbooks import (
@@ -224,7 +225,7 @@ class OpsScheduler:
 
         if new_alerts:
             severity = "critical" if any(item.status == "critical" for item in new_alerts) else "warning"
-            title = f"Ops Agent detected {len(new_alerts)} issue(s)"
+            title = f"AI自动化运维工具：发现 {len(new_alerts)} 个问题"
             fingerprint = incident_fingerprint(new_alerts)
             existing = self.storage.find_active_incident_by_fingerprint(fingerprint)
             if existing:
@@ -240,8 +241,9 @@ class OpsScheduler:
 
         if new_alerts:
             severity = "critical" if any(item.status == "critical" for item in new_alerts) else "warning"
-            title = f"Ops Agent detected {len(new_alerts)} issue(s)"
+            title = f"AI自动化运维工具：发现 {len(new_alerts)} 个问题"
             fingerprint = incident_fingerprint(new_alerts)
+            classification = classify_incident(new_alerts, self.config.classification_rules)
             analysis = analyze_incident(new_alerts, self.config.ai, self.config.classification_rules)
             diagnostics = format_snapshot(collect_diagnostics(new_alerts, self.config))
             suggestions = build_action_suggestions(new_alerts)
@@ -279,7 +281,16 @@ class OpsScheduler:
             auto_repair = self.process_ai_repair_auto_trigger(incident_id, new_alerts)
             if auto_repair.get("status") not in {"disabled", "skipped", "not_matched", "duplicate"}:
                 analysis = f"{analysis}{format_ai_repair_auto_trigger_result(auto_repair)}"
-                self.storage.update_incident_analysis(incident_id, analysis)
+            operator_brief = build_operator_brief(
+                new_alerts,
+                classification,
+                action_results,
+                auto_repair,
+                incident_id,
+                recovery_threshold,
+            )
+            analysis = f"{operator_brief}\n\n{analysis}"
+            self.storage.update_incident_analysis(incident_id, analysis)
             for result in new_alerts:
                 self._issues[check_key(result)].incident_id = incident_id
             next_status = incident_status_from_action_results(action_results)
@@ -302,8 +313,12 @@ class OpsScheduler:
             self.send_action_failure_escalation_if_needed(incident_id, action_results, new_alerts)
 
         if recoveries:
-            title = f"Ops Agent recovered {len(recoveries)} issue(s)"
-            text = build_recovery_message(recoveries)
+            title = f"AI自动化运维工具：{len(recoveries)} 个问题已恢复"
+            stable_successes = max(
+                recovery_threshold_for_result(result, recovery_threshold)
+                for result in recoveries
+            )
+            text = build_recovery_message(recoveries, stable_successes)
             recovery_record_id = self.storage.save_incident("ok", title, text, recoveries)
             for incident_id in sorted(recovery_incident_ids):
                 self.storage.transition_incident(
@@ -337,7 +352,7 @@ class OpsScheduler:
         if not results:
             return None
         merged_severity = severity or ("critical" if any(item.status == "critical" for item in results) else "warning")
-        merged_title = title or f"Ops Agent detected {len(results)} issue(s)"
+        merged_title = title or f"AI自动化运维工具：发现 {len(results)} 个问题"
         try:
             return self.storage.update_incident_occurrence(
                 incident_id,
@@ -429,7 +444,7 @@ class OpsScheduler:
             return False
 
         incident_id = int(incident["id"])
-        title = f"Ops Agent repeated issue reminder #{incident_id}"
+        title = f"AI自动化运维工具：问题仍未恢复 #{incident_id}"
         text = build_repeated_alert_message(incident, results, interval_seconds)
         if self.send_alert_notification(
             title,
@@ -452,7 +467,7 @@ class OpsScheduler:
             return False
 
         incident_id = int(incident["id"])
-        title = f"[升级] Ops Agent incident #{incident_id} requires attention"
+        title = f"AI自动化运维工具：需要人工处理 #{incident_id}"
         text = build_escalation_message(incident, results, decision)
         if not self.send_alert_notification(
             title,
@@ -492,7 +507,7 @@ class OpsScheduler:
             "failed_actions": [result.action.title for result in failed_results],
             "action_statuses": [result.status for result in action_results],
         }
-        title = f"[升级] Ops Agent incident #{incident_id} requires attention"
+        title = f"AI自动化运维工具：自动处理失败 #{incident_id}"
         text = build_action_failure_escalation_message(incident, context_results, failed_results, decision)
         if not self.send_alert_notification(
             title,
@@ -752,7 +767,7 @@ class OpsScheduler:
     ) -> None:
         playbook_name = str(meta.get("name") or "")
         step_id = str(meta.get("step_id") or "")
-        title = "Ops Agent playbook escalation"
+        title = "AI自动化运维工具：处置流程执行失败"
         text = (
             f"Playbook: {playbook_name}\n"
             f"Step: {step_id}\n"
@@ -1292,7 +1307,9 @@ def parse_datetime(value: str) -> datetime | None:
 
 def build_repeated_alert_message(incident: dict, results: list[CheckResult], interval_seconds: int) -> str:
     lines = [
-        "持续异常提醒",
+        "结论：问题仍然存在，系统还没有确认恢复。",
+        "你现在要做：严重问题请让项目负责人处理；警告问题无需重复操作，系统会继续复测。",
+        "说明：重复提醒本身不会再次修改代码或服务器。",
         "",
         f"事件: #{incident.get('id')} {incident.get('title', '')}",
         f"严重级别: {incident.get('severity', '')}",
@@ -1410,8 +1427,15 @@ def format_persisted_diagnosis_for_analysis(diagnosis: dict) -> str:
     )
 
 
-def build_recovery_message(results: list[CheckResult]) -> str:
-    lines = ["以下监控项已经恢复正常:", ""]
+def build_recovery_message(results: list[CheckResult], recovery_after_successes: int = 1) -> str:
+    lines = [
+        "结论：问题已经恢复正常，你现在不用操作。",
+        f"系统判断依据：相关监控项已连续 {max(1, recovery_after_successes)} 次检查正常。",
+        "说明：临时网络或外部依赖波动可能自行恢复，这不代表一定有人修改了代码。",
+        "",
+        "已恢复的监控项:",
+        "",
+    ]
     for result in results:
         lines.append(f"- {result.source}/{result.name}: {result.summary}")
     return "\n".join(lines)
