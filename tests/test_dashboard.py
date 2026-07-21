@@ -30,6 +30,40 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual("critical", summary["current_status"])
         self.assertEqual(1, summary["source_counts"]["json"])
 
+    def test_summary_api_excludes_disabled_targets_from_current_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            storage.save_results(
+                [
+                    CheckResult(source="http", name="Enabled site", status="ok", summary="HTTP 200"),
+                    CheckResult(source="http", name="Retired site", status="critical", summary="HTTP 500"),
+                ]
+            )
+            config = AppConfig(
+                raw={
+                    "app": {},
+                    "http_checks": [
+                        {"name": "Enabled site", "url": "https://example.com"},
+                        {"name": "Retired site", "url": "https://old.example.com", "enabled": False},
+                    ],
+                },
+                base_dir=Path(tmp),
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            try:
+                with urllib.request.urlopen(f"http://{host}:{port}/api/summary", timeout=5) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(2, body["total_checks"])
+        self.assertEqual("ok", body["current_status"])
+        self.assertEqual(0, body["active_problem_count"])
+        self.assertEqual(["Enabled site"], [row["name"] for row in body["latest_targets"]])
+
     def test_classification_summary_api_returns_category_stats(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

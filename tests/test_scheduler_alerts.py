@@ -328,6 +328,89 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertEqual([], repairs)
         self.assertEqual(1, len(notifier.sent))
 
+    def test_ai_repair_auto_trigger_runs_sandbox_for_generated_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            tests_dir = repo / "tests"
+            tests_dir.mkdir(parents=True)
+            (repo / "sample.txt").write_text("old\n", encoding="utf-8")
+            (tests_dir / "test_sample.py").write_text(
+                "import unittest\nfrom pathlib import Path\n\n"
+                "class SampleTest(unittest.TestCase):\n"
+                "    def test_value(self):\n"
+                "        self.assertEqual('new', Path('sample.txt').read_text().strip())\n",
+                encoding="utf-8",
+            )
+            response = {
+                "title": "Patch sample file",
+                "summary": "sandbox patch",
+                "risk": "low",
+                "root_cause": "sample value",
+                "repair_plan": ["update", "test"],
+                "patch": {
+                    "schema_version": 1,
+                    "patch_type": "unified_diff",
+                    "apply_mode": "proposal_only",
+                    "diff": (
+                        "diff --git a/sample.txt b/sample.txt\n"
+                        "--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-old\n+new\n"
+                    ),
+                    "files": [{"path": "sample.txt", "change_type": "modify"}],
+                },
+                "test_plan": {"commands": ["python -m unittest discover -s tests"]},
+            }
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 1},
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "projects": [
+                        {
+                            "id": "prod",
+                            "environment": "prod",
+                            "run_types": ["normal"],
+                            "repo_root": str(repo),
+                            "test_commands": ["python -m unittest discover -s tests"],
+                        }
+                    ],
+                    "ai": {
+                        "enabled": True,
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "mock_response": response,
+                            "auto_trigger": {
+                                "enabled": True,
+                                "severities": ["critical"],
+                                "categories": ["service_unavailable"],
+                                "run_dry_run": True,
+                                "run_sandbox": True,
+                                "notify": False,
+                            },
+                        },
+                    },
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=root,
+            )
+            storage = Storage(root / "ops.db")
+            scheduler = OpsScheduler(config, storage, RecordingNotifier())
+            scheduler.process_alert_states(
+                [
+                    CheckResult(
+                        source="http",
+                        name="Site",
+                        status="critical",
+                        summary="HTTP 500",
+                        details={"url": "https://example.com", "status_code": 500},
+                    )
+                ]
+            )
+            repair = storage.latest_ai_repair_proposals(limit=1)[0]
+            storage.close()
+
+        self.assertEqual("test_passed", repair["status"], {"test": repair["test_result"], "prompt": repair["prompt"]})
+        self.assertTrue(repair["test_result"]["approval_report"]["ready_to_approve"])
+
     def test_ai_repair_auto_trigger_rate_limits_recent_proposals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AppConfig(

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 from typing import Any
 
 from ops_agent.config import AppConfig
@@ -14,7 +15,9 @@ from ops_agent.ai.repair import (
     DEEPSEEK_MODEL_ENDPOINT,
     DEFAULT_TEST_COMMANDS,
     MODEL_PROVIDERS,
+    ai_repair_policy_from_config,
     build_repository_context,
+    is_safe_deploy_command,
     is_safe_test_command,
     normalize_ai_repair_policy,
     repair_settings,
@@ -191,6 +194,13 @@ def project_repair_readiness(
     repo_exists = repo_root.exists() and repo_root.is_dir()
     commands = string_list(project.get("test_commands")) or DEFAULT_TEST_COMMANDS
     unsafe_commands = [command for command in commands if not is_safe_test_command(command)]
+    deploy_commands = string_list(project.get("deploy_commands"))
+    rollback_commands = string_list(project.get("rollback_commands"))
+    unsafe_deploy_commands = [command for command in deploy_commands + rollback_commands if not is_safe_deploy_command(command)]
+    git_worktree = repo_exists and is_git_worktree(repo_root)
+    git_remote = str(project.get("git_remote") or "origin")
+    git_remote_configured = git_worktree and has_git_remote(repo_root, git_remote)
+    repair_policy = ai_repair_policy_from_config(config, project=project)
     repository_context = build_repository_context(
         config,
         repair_config,
@@ -215,6 +225,23 @@ def project_repair_readiness(
     if not string_list(project.get("repair_context_files")):
         warnings.append("project repair_context_files is empty; inferred files or tree preview will be used")
     status = "blocked" if blockers else ("warning" if warnings else "ready")
+    closure_blockers: list[str] = []
+    if not git_worktree:
+        closure_blockers.append("repo_root is not a git work tree")
+    if not git_remote_configured:
+        closure_blockers.append(f"git remote is not configured: {git_remote}")
+    if not repair_policy.get("prepare_branch"):
+        closure_blockers.append("repair_policy.prepare_branch is disabled")
+    if not repair_policy.get("create_pr"):
+        closure_blockers.append("repair_policy.create_pr is disabled")
+    if not deploy_commands:
+        closure_blockers.append("project deploy_commands is empty")
+    if not rollback_commands:
+        closure_blockers.append("project rollback_commands is empty")
+    if not string_list(project.get("health_urls")):
+        closure_blockers.append("project health_urls is empty")
+    if unsafe_deploy_commands:
+        closure_blockers.append("unsafe deploy or rollback commands are configured")
     return {
         "id": str(project.get("id") or ""),
         "name": str(project.get("name") or project.get("id") or ""),
@@ -227,7 +254,17 @@ def project_repair_readiness(
         "repo_exists": repo_exists,
         "test_commands": commands,
         "unsafe_test_commands": unsafe_commands,
+        "deploy_commands": deploy_commands,
+        "rollback_commands": rollback_commands,
+        "unsafe_deploy_commands": unsafe_deploy_commands,
         "health_urls": string_list(project.get("health_urls")),
+        "closure": {
+            "status": "blocked" if closure_blockers else "ready",
+            "blockers": closure_blockers,
+            "git_worktree": git_worktree,
+            "git_remote": git_remote,
+            "git_remote_configured": git_remote_configured,
+        },
         "repair_context": {
             "enabled": bool(repository_context.get("enabled")),
             "file_count": len(safe_list(repository_context.get("files"))),
@@ -245,8 +282,36 @@ def project_repair_readiness(
             "tree_preview_count": len(safe_list(repository_context.get("tree"))),
             "reason": str(repository_context.get("reason") or ""),
         },
-        "repair_policy": normalize_ai_repair_policy(safe_dict(project.get("repair_policy"))),
+        "repair_policy": repair_policy,
     }
+
+
+def is_git_worktree(repo_root: Path) -> bool:
+    if not shutil.which("git"):
+        return False
+    completed = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    return completed.returncode == 0 and completed.stdout.strip().lower() == "true"
+
+
+def has_git_remote(repo_root: Path, remote: str) -> bool:
+    if not remote:
+        return False
+    completed = subprocess.run(
+        ["git", "remote", "get-url", remote],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    return completed.returncode == 0 and bool(completed.stdout.strip())
 
 
 def upsert_project_config(config: AppConfig, project: dict[str, Any], reason: str = "project-upsert") -> dict[str, Any]:
@@ -341,7 +406,7 @@ def update_ai_repair_auto_trigger(
 def normalize_ai_repair_auto_trigger_policy(value: Any) -> dict[str, Any]:
     raw = safe_dict(value)
     policy = deepcopy(DEFAULT_AI_REPAIR_AUTO_TRIGGER_POLICY)
-    for key in ("enabled", "run_dry_run", "notify"):
+    for key in ("enabled", "run_dry_run", "run_sandbox", "notify"):
         if key in raw:
             policy[key] = bool(raw.get(key))
     for key in (

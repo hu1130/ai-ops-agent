@@ -167,6 +167,7 @@ class ConfigCenterTest(unittest.TestCase):
                             "provider": "deepseek",
                             "api_key_env": "UNIT_TEST_DEEPSEEK_KEY",
                             "repository_context": {"enabled": True},
+                            "policy": {"prepare_branch": True, "create_pr": False},
                         }
                     },
                     "http_checks": [],
@@ -187,6 +188,8 @@ class ConfigCenterTest(unittest.TestCase):
         self.assertEqual("ready", by_id["app"]["status"])
         self.assertEqual(["app.py"], by_id["app"]["repair_context"]["files"])
         self.assertTrue(any(item["path"] == ".env" for item in by_id["app"]["repair_context"]["skipped_files"]))
+        self.assertNotIn("repair_policy.prepare_branch is disabled", by_id["app"]["closure"]["blockers"])
+        self.assertIn("repair_policy.create_pr is disabled", by_id["app"]["closure"]["blockers"])
         self.assertEqual("blocked", by_id["unsafe"]["status"])
         self.assertIn("unsafe test commands are configured", by_id["unsafe"]["blockers"])
 

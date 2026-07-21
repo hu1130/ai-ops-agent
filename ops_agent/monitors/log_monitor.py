@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+from ops_agent.docker_identity import resolve_container_name
 from ops_agent.events import CheckResult
 
 
@@ -69,13 +70,31 @@ def run_docker_log_check(check: dict[str, Any], base_dir: Path) -> CheckResult:
         bool(check.get("only_new", False)),
         float(check.get("timeout_seconds", 5)),
     )
+    identity: dict[str, Any] = {}
+    if error:
+        identity = resolve_container_name(
+            check,
+            runner=subprocess.run,
+            timeout_seconds=float(check.get("timeout_seconds", 5)),
+        )
+        resolved = str(identity.get("resolved_container") or container)
+        if resolved != container:
+            lines, error = read_container_log_lines(
+                resolved,
+                tail_lines,
+                base_dir,
+                bool(check.get("only_new", False)),
+                float(check.get("timeout_seconds", 5)),
+            )
+            if not error:
+                container = resolved
     if error:
         return CheckResult(
             source="log",
             name=name,
             status="warning",
             summary=f"Docker log read failed: {container}",
-            details={"container": container, "error": error},
+            details={"container": container, "container_resolution": identity, "error": error},
         )
     if check.get("only_new", False) and not lines:
         return CheckResult(
@@ -83,14 +102,14 @@ def run_docker_log_check(check: dict[str, Any], base_dir: Path) -> CheckResult:
             name=name,
             status="ok",
             summary="No new docker log lines",
-            details={"container": container, "match_count": 0, "matches": []},
+            details={"container": container, "container_resolution": identity, "match_count": 0, "matches": []},
         )
     return build_log_result(
         "log",
         name,
         lines,
         keywords,
-        {"container": container, **alert_policy_details(check)},
+        {"container": container, "container_resolution": identity, **alert_policy_details(check)},
         status_on_match(check),
     )
 

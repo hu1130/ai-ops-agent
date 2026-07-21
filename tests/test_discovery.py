@@ -16,6 +16,36 @@ def docker_result(rows: list[dict], returncode: int = 0, stderr: str = "") -> su
 
 
 class RuntimeDiscoveryTest(unittest.TestCase):
+    def test_compose_identity_covers_recreated_container_with_generated_prefix(self) -> None:
+        rows = [
+            {
+                "Names": "40d66a351638_ai-customer-service-semp-api-1",
+                "Image": "ai-customer-service-semp-api:latest",
+                "State": "running",
+                "Ports": "8000/tcp",
+                "Labels": (
+                    "com.docker.compose.project=ai-customer-service,"
+                    "com.docker.compose.service=semp-api"
+                ),
+            }
+        ]
+        config = {
+            "docker_checks": [
+                {
+                    "container": "ai-customer-service-semp-api-1",
+                    "project_id": "ai-customer-service",
+                    "compose_service": "semp-api",
+                }
+            ],
+            "asset_discovery": {"enabled": True},
+        }
+
+        result = discover_runtime_assets(config, runner=lambda *_args, **_kwargs: docker_result(rows))
+
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(0, result["summary"]["unmonitored_applications"])
+        self.assertEqual(1, result["summary"]["covered"])
+
     def test_discovers_unmonitored_application_and_ignores_infrastructure_and_disabled_project(self) -> None:
         rows = [
             {"Names": "known-api", "Image": "known-api", "State": "running", "Ports": "8000/tcp"},

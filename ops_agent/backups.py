@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import gzip
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -159,14 +160,20 @@ def run_backup_target(
             result = backup_mysql_docker(config, target, runner)
         else:
             raise ValueError(f"unsupported backup engine: {engine}")
-        return storage.finish_backup_run(
+        offsite = upload_offsite_backup(config, target, Path(result["path"]))
+        metadata = {**safe_dict(result.get("metadata")), "offsite": offsite}
+        if offsite.get("status") == "failed" and offsite.get("required"):
+            raise ValueError(f"required offsite backup failed: {offsite.get('error') or 'unknown error'}")
+        finished = storage.finish_backup_run(
             run_id,
             "success",
             path=str(result["path"]),
             size_bytes=int(result["size_bytes"]),
             checksum=str(result["checksum"]),
-            metadata=safe_dict(result.get("metadata")),
+            metadata=metadata,
         )
+        cleanup_old_backup_files(config, target, datetime.now(timezone.utc))
+        return finished
     except Exception as exc:
         return storage.finish_backup_run(run_id, "failed", error=clean_error(str(exc)))
 
@@ -236,7 +243,22 @@ def backup_sqlite(config: AppConfig, target: dict[str, Any]) -> dict[str, Any]:
     if integrity.lower() != "ok":
         destination.unlink(missing_ok=True)
         raise ValueError(f"SQLite backup integrity check failed: {integrity}")
-    return file_result(destination, {"integrity_check": integrity, "table_count": table_count})
+    raw_size = destination.stat().st_size
+    if bool(target.get("compress", True)):
+        gzip_path = destination.with_suffix(".sqlite.gz")
+        with destination.open("rb") as source, gzip.open(gzip_path, "wb", compresslevel=6) as compressed:
+            shutil.copyfileobj(source, compressed)
+        destination.unlink(missing_ok=True)
+        return file_result(
+            gzip_path,
+            {
+                "integrity_check": integrity,
+                "table_count": table_count,
+                "compressed": True,
+                "uncompressed_size_bytes": raw_size,
+            },
+        )
+    return file_result(destination, {"integrity_check": integrity, "table_count": table_count, "compressed": False})
 
 
 def backup_mysql_docker(
@@ -270,7 +292,14 @@ def backup_mysql_docker(
 
 def restore_drill_sqlite(backup_path: Path) -> dict[str, Any]:
     restored_path = backup_path.with_name(f".{backup_path.stem}-restore-drill.sqlite")
-    source = sqlite3.connect(backup_path)
+    source_path = backup_path
+    decompressed_path: Path | None = None
+    if backup_path.suffix == ".gz":
+        decompressed_path = backup_path.with_name(f".{backup_path.stem}-restore-source.sqlite")
+        with gzip.open(backup_path, "rb") as compressed, decompressed_path.open("wb") as source_file:
+            shutil.copyfileobj(compressed, source_file)
+        source_path = decompressed_path
+    source = sqlite3.connect(source_path)
     restored = sqlite3.connect(restored_path)
     try:
         source.backup(restored)
@@ -285,6 +314,8 @@ def restore_drill_sqlite(backup_path: Path) -> dict[str, Any]:
         restored.close()
         source.close()
         restored_path.unlink(missing_ok=True)
+        if decompressed_path:
+            decompressed_path.unlink(missing_ok=True)
     if integrity.lower() != "ok":
         raise ValueError(f"restored SQLite integrity check failed: {integrity}")
     return {"integrity_check": integrity, "table_count": table_count, "isolated_restore": True}
@@ -356,10 +387,15 @@ def run_backup_health_checks(storage: Storage, config: AppConfig) -> list[CheckR
     backup_config = safe_dict(config.raw.get("backups"))
     if not backup_config.get("enabled", False):
         return []
-    return [backup_health_result(storage, target) for target in configured_targets(config)]
+    global_offsite = safe_dict(backup_config.get("offsite"))
+    return [backup_health_result(storage, target, global_offsite) for target in configured_targets(config)]
 
 
-def backup_health_result(storage: Storage, target: dict[str, Any]) -> CheckResult:
+def backup_health_result(
+    storage: Storage,
+    target: dict[str, Any],
+    global_offsite: dict[str, Any] | None = None,
+) -> CheckResult:
     target_id = str(target["id"])
     name = str(target.get("name") or target_id)
     latest_backup = storage.latest_successful_backup_run(target_id, "backup")
@@ -379,6 +415,11 @@ def backup_health_result(storage: Storage, target: dict[str, Any]) -> CheckResul
         if age_hours > max_age_hours:
             problems.append(f"last successful backup is {age_hours:.1f} hours old")
             severity = max_severity(severity, str(target.get("stale_status") or "critical"))
+        offsite = safe_dict(safe_dict(latest_backup.get("metadata")).get("offsite"))
+        offsite_policy = {**safe_dict(global_offsite), **safe_dict(target.get("offsite"))}
+        if offsite_policy.get("enabled") and offsite_policy.get("required", True) and offsite.get("status") != "uploaded":
+            problems.append("latest backup is not verified in offsite storage")
+            severity = max_severity(severity, "critical")
 
     drill = safe_dict(target.get("restore_drill"))
     latest_drill = storage.latest_successful_backup_run(target_id, "restore_drill")
@@ -479,6 +520,21 @@ def cleanup_old_backup_files(config: AppConfig, target: dict[str, Any], now: dat
         if path.stat().st_mtime < cutoff:
             path.unlink(missing_ok=True)
             deleted += 1
+    max_total_bytes = max(0, int(target.get("max_total_bytes", 0)))
+    if max_total_bytes:
+        remaining = sorted(
+            [path for path in directory.iterdir() if path.is_file() and not path.name.startswith(".")],
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        total_bytes = sum(path.stat().st_size for path in remaining)
+        for path in reversed(remaining[minimum_backups:]):
+            if total_bytes <= max_total_bytes:
+                break
+            size = path.stat().st_size
+            path.unlink(missing_ok=True)
+            total_bytes -= size
+            deleted += 1
     return deleted
 
 
@@ -566,8 +622,72 @@ def public_target(target: dict[str, Any]) -> dict[str, Any]:
         "container": str(target.get("container") or ""),
         "interval_hours": float(target.get("interval_hours", 24)),
         "retention_days": int(target.get("retention_days", 14)),
+        "max_total_bytes": int(target.get("max_total_bytes", 0)),
         "restore_drill": safe_dict(target.get("restore_drill")),
+        "offsite": {
+            "enabled": bool(safe_dict(target.get("offsite")).get("enabled")),
+            "required": bool(safe_dict(target.get("offsite")).get("required", True)),
+            "provider": str(safe_dict(target.get("offsite")).get("provider") or ""),
+        },
     }
+
+
+def upload_offsite_backup(config: AppConfig, target: dict[str, Any], path: Path) -> dict[str, Any]:
+    global_policy = safe_dict(safe_dict(config.raw.get("backups")).get("offsite"))
+    policy = {**global_policy, **safe_dict(target.get("offsite"))}
+    if not policy.get("enabled", False):
+        return {"status": "disabled", "required": False}
+    required = bool(policy.get("required", True))
+    provider = str(policy.get("provider") or "aliyun_oss").strip().lower()
+    if provider != "aliyun_oss":
+        return {"status": "failed", "required": required, "provider": provider, "error": "unsupported provider"}
+    access_key_id = os.environ.get(str(policy.get("access_key_id_env") or "ALIYUN_OSS_ACCESS_KEY_ID"), "")
+    access_key_secret = os.environ.get(
+        str(policy.get("access_key_secret_env") or "ALIYUN_OSS_ACCESS_KEY_SECRET"), ""
+    )
+    security_token = os.environ.get(str(policy.get("security_token_env") or "ALIYUN_OSS_SECURITY_TOKEN"), "")
+    endpoint = str(policy.get("endpoint") or "").strip()
+    bucket_name = str(policy.get("bucket") or "").strip()
+    if not access_key_id or not access_key_secret or not endpoint or not bucket_name:
+        return {
+            "status": "failed",
+            "required": required,
+            "provider": provider,
+            "error": "OSS credentials, endpoint, or bucket are not configured",
+        }
+    try:
+        import oss2
+
+        auth = (
+            oss2.StsAuth(access_key_id, access_key_secret, security_token)
+            if security_token
+            else oss2.Auth(access_key_id, access_key_secret)
+        )
+        bucket = oss2.Bucket(auth, endpoint, bucket_name)
+        prefix = str(policy.get("prefix") or "ops-agent").strip("/")
+        target_id = str(target.get("id") or "backup")
+        object_key = "/".join(part for part in (prefix, target_id, path.name) if part)
+        result = bucket.put_object_from_file(object_key, str(path))
+        metadata = bucket.get_object_meta(object_key)
+        remote_size = int(metadata.headers.get("Content-Length") or 0)
+        if remote_size != path.stat().st_size:
+            raise ValueError(f"uploaded object size mismatch: {remote_size} != {path.stat().st_size}")
+        return {
+            "status": "uploaded",
+            "required": required,
+            "provider": provider,
+            "bucket": bucket_name,
+            "object_key": object_key,
+            "size_bytes": remote_size,
+            "etag": str(getattr(result, "etag", "") or ""),
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "required": required,
+            "provider": provider,
+            "error": clean_error(str(exc)),
+        }
 
 
 def alert_policy_details(target: dict[str, Any]) -> dict[str, int]:

@@ -60,7 +60,7 @@ class MysqlMigrationTest(unittest.TestCase):
         self.assertIn("CREATE DATABASE IF NOT EXISTS `ops_agent_test`", sql)
         self.assertIn("CREATE TABLE `incidents`", sql)
         self.assertIn("`id` BIGINT NOT NULL AUTO_INCREMENT", sql)
-        self.assertNotIn("LONGTEXT NOT NULL DEFAULT", sql)
+        self.assertIn("`prompt_json` LONGTEXT NOT NULL DEFAULT ('{}')", sql)
         self.assertIn("CREATE INDEX `idx_ai_repair_proposals_status`", sql)
         self.assertIn("INSERT INTO `incidents`", sql)
         self.assertIn("analysis with 中文", sql)

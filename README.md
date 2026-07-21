@@ -1082,32 +1082,50 @@ ops-agent/
 - 登录、权限和审计日志
 - 私有化部署包
 - 人工确认后的低风险自动修复动作
-## SQLite to MySQL export
+## MySQL 生产运行时
 
-The current runtime still uses SQLite. For a safe MySQL migration, first export
-the existing SQLite database into a reviewable MySQL SQL file:
-
-```bash
-python -m ops_agent.cli --config config.json mysql-export \
-  --database-name ops_agent \
-  --output data/mysql_migration.sql
-```
-
-The command creates MySQL-compatible `CREATE TABLE`, indexes, and batched
-`INSERT` statements, then prints table row counts. Review and back up before
-importing:
+运行时支持 `sqlite` 和 `mysql` 两种存储后端。生产迁移使用带快照、逐表行数校验、接口鉴权验证和失败自动回滚的脚本：
 
 ```bash
-mysql -u <user> -p < data/mysql_migration.sql
+sudo scripts/setup_mysql_runtime.sh
+sudo scripts/migrate_sqlite_to_mysql_runtime.sh
 ```
 
-Useful validation commands:
+迁移完成后，`app.storage_backend` 为 `mysql`，MySQL 只绑定本机 `127.0.0.1:3307`。随机密码保存在 `/etc/ops-agent/ops-agent.env`，不要写入仓库。迁移前 SQLite 一致性快照会保留在 `data/ops_agent-before-mysql-*.sqlite`。
+
+生产验收会检查读接口鉴权、摘要、监控覆盖、企业就绪状态，并可实际执行 MySQL 备份和隔离恢复演练：
 
 ```bash
-python -m ops_agent.cli --config config.json mysql-export --schema-only --output data/mysql_schema.sql
-python -m ops_agent.cli --config config.json mysql-export --data-only --output data/mysql_data.sql
+python3 scripts/verify_production_runtime.py --exercise-backup
 ```
 
-This is the first migration phase: data export/import readiness. Runtime MySQL
-storage should be enabled only after the imported data is verified and a
-rollback plan is prepared.
+旧环境若由早期导出器生成了缺少文本默认值的 MySQL 表，可运行：
+
+```bash
+set -a
+. /etc/ops-agent/ops-agent.env
+set +a
+python3 scripts/repair_mysql_text_defaults.py --config config.json
+```
+
+迁移成功并确认回滚文件后，可用受限清理脚本删除失败迁移产生的重复 SQL 和旧快照：
+
+```bash
+sudo scripts/cleanup_mysql_migration_artifacts.sh
+```
+
+备份目标支持 `max_total_bytes` 容量上限。超过上限时会保留 `minimum_backups` 指定的最新备份，并从更旧文件开始清理。
+
+## AI 修复最终闭环
+
+调度器支持以下状态闭环：异常事件 -> DeepSeek 修复建议 -> 补丁 dry-run -> 隔离沙箱测试 -> 人工批准 -> 受控分支 -> GitHub PR -> 合并状态轮询 -> 部署 -> 健康验证 -> 失败自动回滚。`ai.repair.queue_worker` 负责推进已满足条件的队列项；默认仍要求人工批准，不会直接修改生产代码。
+
+每个项目必须通过 `GET /api/projects/repair-readiness` 的 `closure` 检查，至少需要：
+
+- `repo_root` 是干净的 Git 工作树，并配置可推送的远端。
+- `repair_policy.prepare_branch=true` 和 `repair_policy.create_pr=true`。
+- 安全白名单内的 `test_commands`、`deploy_commands`、`rollback_commands`。
+- 至少一个部署后 `health_urls`。
+- 服务环境中配置 `GITHUB_TOKEN`/`GH_TOKEN`，或安装并登录 `gh`。
+
+DeepSeek 密钥只通过 `DEEPSEEK_API_KEY` 环境变量提供。GitHub 推送凭据和外部 dead-man heartbeat URL 属于部署凭据，未配置时系统会明确报告阻塞，不会自动降级为绕过 PR 的直接生产改码。

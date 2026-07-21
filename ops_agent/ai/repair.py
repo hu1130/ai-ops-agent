@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -162,6 +163,12 @@ CODE_LOCATOR_PATH_RE = re.compile(
     + "|".join(sorted(re.escape(suffix.lstrip(".")) for suffix in ALLOWED_CONTEXT_SUFFIXES))
     + r"))(?::\d+)?"
 )
+UNIFIED_DIFF_HUNK_RE = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$"
+)
+UNIFIED_DIFF_PLACEHOLDER_HUNK_RE = re.compile(
+    r"^@@\s+-\s*\.\.\.\s+\+\s*\.\.\.\s+@@(.*)$"
+)
 DEFAULT_AI_REPAIR_POLICY = {
     "enabled": True,
     "auto_approve": False,
@@ -171,6 +178,14 @@ DEFAULT_AI_REPAIR_POLICY = {
     "max_changed_files": 5,
     "allowed_patch_types": ["unified_diff"],
     "require_human_approval_risks": ["medium", "high", "critical"],
+}
+DEFAULT_AI_REPAIR_QUEUE_WORKER_POLICY = {
+    "enabled": False,
+    "interval_seconds": 300,
+    "max_actions_per_cycle": 3,
+    "auto_prepare_branch_after_approval": True,
+    "auto_create_pr_after_approval": True,
+    "auto_deploy_after_merge": True,
 }
 DEFAULT_SANDBOX_MAX_COMMANDS = 5
 AI_REPAIR_RISK_SCORES = {"low": 10, "medium": 40, "high": 70, "critical": 90}
@@ -433,7 +448,7 @@ def run_ai_repair_queue_next_action(
             note=note,
             remote=runtime["remote"],
             base=runtime["base"],
-            commands=runtime["commands"],
+            commands=runtime["deploy_commands"],
             verify_urls=runtime["verify_urls"],
             rollback_commands=runtime["rollback_commands"],
             rollback_verify_urls=runtime["rollback_verify_urls"],
@@ -450,9 +465,134 @@ def run_ai_repair_queue_next_action(
         "runtime": {
             "repo_root": str(runtime["repo_root"]),
             "commands": runtime["commands"] or [],
+            "deploy_commands": runtime["deploy_commands"] or [],
             "remote": runtime["remote"],
             "base": runtime["base"],
         },
+    }
+
+
+def ai_repair_queue_worker_policy(config: AppConfig | None) -> dict[str, Any]:
+    raw: dict[str, Any] = {}
+    if config is not None:
+        raw = safe_dict(safe_dict(safe_dict(config.raw.get("ai")).get("repair")).get("queue_worker"))
+    policy = dict(DEFAULT_AI_REPAIR_QUEUE_WORKER_POLICY)
+    for key in (
+        "enabled",
+        "auto_prepare_branch_after_approval",
+        "auto_create_pr_after_approval",
+        "auto_deploy_after_merge",
+    ):
+        if key in raw:
+            policy[key] = bool(raw.get(key))
+    for key in ("interval_seconds", "max_actions_per_cycle"):
+        if key in raw:
+            policy[key] = max(1, safe_int(raw.get(key), int(policy[key])))
+    return policy
+
+
+def run_ai_repair_automation_cycle(
+    storage: Storage,
+    config: AppConfig | None,
+    actor: str = "scheduler",
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    effective_policy = ai_repair_queue_worker_policy(config)
+    if policy:
+        effective_policy.update(safe_dict(policy))
+    if not effective_policy.get("enabled"):
+        return {
+            "mode": "ai_repair_queue_worker",
+            "status": "disabled",
+            "policy": effective_policy,
+            "actions": [],
+        }
+
+    max_actions = max(1, safe_int(effective_policy.get("max_actions_per_cycle"), 3))
+    repairs = storage.latest_ai_repair_proposals(limit=max(50, max_actions * 10), statuses=AI_REPAIR_QUEUE_ACTIVE_STATUSES)
+    actions: list[dict[str, Any]] = []
+    for repair in reversed(repairs):
+        if len(actions) >= max_actions:
+            break
+        repair_id = safe_int(repair.get("id"))
+        incident_id = safe_int(repair.get("incident_id"))
+        status = str(repair.get("status") or "")
+        runtime = queue_action_runtime(config, repair, {})
+        project_policy = safe_dict(runtime.get("policy"))
+        action = ""
+        try:
+            if (
+                status == "approved"
+                and effective_policy.get("auto_prepare_branch_after_approval")
+                and project_policy.get("prepare_branch")
+            ):
+                action = "prepare-branch"
+                result = run_ai_repair_queue_next_action(storage, config, repair_id, actor=actor)
+                updated = safe_dict(result.get("repair"))
+            elif (
+                status == "branch_prepared"
+                and effective_policy.get("auto_create_pr_after_approval")
+                and project_policy.get("create_pr")
+            ):
+                action = "create-pr"
+                result = run_ai_repair_queue_next_action(storage, config, repair_id, actor=actor)
+                updated = safe_dict(result.get("repair"))
+            elif status in {"pr_created", "merge_pending"} and effective_policy.get("auto_deploy_after_merge"):
+                action = "deploy-merged"
+                updated = deploy_ai_repair_after_merge(
+                    storage,
+                    repair_id,
+                    runtime["repo_root"],
+                    actor=actor,
+                    note="AI repair queue worker merge/deploy check",
+                    remote=runtime["remote"],
+                    base=runtime["base"],
+                    commands=runtime["deploy_commands"],
+                    verify_urls=runtime["verify_urls"],
+                    rollback_commands=runtime["rollback_commands"],
+                    rollback_verify_urls=runtime["rollback_verify_urls"],
+                )
+            else:
+                continue
+            actions.append(
+                {
+                    "repair_id": repair_id,
+                    "incident_id": incident_id,
+                    "action": action,
+                    "status": str(updated.get("status") or ""),
+                    "error": str(safe_dict(updated.get("test_result")).get("error") or ""),
+                }
+            )
+        except Exception as exc:
+            actions.append(
+                {
+                    "repair_id": repair_id,
+                    "incident_id": incident_id,
+                    "action": action or "unknown",
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+            if incident_id > 0:
+                incident = storage.get_incident(incident_id) or {}
+                current_status = str(incident.get("status") or "open")
+                storage.record_incident_event(
+                    incident_id,
+                    current_status,
+                    current_status,
+                    actor,
+                    "AI repair queue worker action failed",
+                    metadata={"repair_id": repair_id, "action": action, "error": str(exc)},
+                )
+
+    failures = sum(1 for item in actions if item.get("status") in {"failed", "branch_failed", "pr_failed", "deploy_failed", "rollback_failed"})
+    return {
+        "mode": "ai_repair_queue_worker",
+        "status": "failed" if failures else ("processed" if actions else "idle"),
+        "processed": len(actions),
+        "failures": failures,
+        "policy": effective_policy,
+        "actions": actions,
     }
 
 
@@ -705,6 +845,7 @@ def queue_action_runtime(
     project = repair_project_from_context(config, repair, request)
     fallback = config.base_dir if config is not None else Path(".")
     commands = request.get("commands")
+    deploy_commands = request.get("deploy_commands")
     verify_urls = request.get("verify_urls") or request.get("verification_urls")
     rollback_commands = request.get("rollback_commands")
     rollback_verify_urls = request.get("rollback_verify_urls") or request.get("rollback_verification_urls")
@@ -712,13 +853,24 @@ def queue_action_runtime(
         "project": project,
         "repo_root": resolve_repair_repo_root(config, project, request, fallback),
         "commands": commands if isinstance(commands, list) else string_list(project.get("test_commands")) or None,
+        "deploy_commands": (
+            deploy_commands if isinstance(deploy_commands, list) else string_list(project.get("deploy_commands")) or None
+        ),
         "policy": ai_repair_policy_from_config(config, project=project),
         "remote": str(request.get("remote") or project.get("git_remote") or "origin"),
         "base": str(request.get("base") or project.get("base_branch") or "main"),
         "draft": bool(request.get("draft", True)),
-        "verify_urls": verify_urls if isinstance(verify_urls, list) else None,
-        "rollback_commands": rollback_commands if isinstance(rollback_commands, list) else None,
-        "rollback_verify_urls": rollback_verify_urls if isinstance(rollback_verify_urls, list) else None,
+        "verify_urls": verify_urls if isinstance(verify_urls, list) else string_list(project.get("health_urls")) or None,
+        "rollback_commands": (
+            rollback_commands
+            if isinstance(rollback_commands, list)
+            else string_list(project.get("rollback_commands")) or None
+        ),
+        "rollback_verify_urls": (
+            rollback_verify_urls
+            if isinstance(rollback_verify_urls, list)
+            else string_list(project.get("health_urls")) or None
+        ),
     }
 
 
@@ -727,6 +879,7 @@ def empty_queue_action_runtime() -> dict[str, Any]:
         "project": {},
         "repo_root": "",
         "commands": [],
+        "deploy_commands": [],
         "policy": {},
         "remote": "",
         "base": "",
@@ -745,6 +898,11 @@ def repair_project_from_context(
     requested = str(request.get("project_id") or request.get("project") or "").strip()
     if requested and config is not None:
         project = find_repair_project_by_id(config, requested)
+        if project:
+            return project
+    stored_project_id = str(safe_dict(repair.get("prompt")).get("project_id") or "").strip()
+    if stored_project_id and config is not None:
+        project = find_repair_project_by_id(config, stored_project_id)
         if project:
             return project
     prompt_project = safe_dict(repair_prompt_payload(repair).get("project"))
@@ -1604,6 +1762,11 @@ def normalize_model_repair_payload(
     patch = safe_dict(payload.get("patch")) or safe_dict(fallback.get("patch"))
     patch["schema_version"] = safe_int(patch.get("schema_version"), 1)
     patch["apply_mode"] = "proposal_only"
+    normalized_diff, normalization = normalize_unified_diff_for_apply(str(patch.get("diff") or ""))
+    if normalized_diff:
+        patch["diff"] = normalized_diff
+    if any(normalization.values()):
+        patch["normalization"] = normalization
     if "patch_type" not in patch:
         patch["patch_type"] = "unified_diff" if str(patch.get("diff") or "").strip() else "manual_code_review"
     validation = validate_patch_dry_run(patch)
@@ -1630,6 +1793,7 @@ def normalize_model_repair_payload(
             "validation": validation,
             "requested_by": safe_dict(context.get("request")).get("actor") or "",
             "source": safe_dict(context.get("request")).get("source") or "",
+            "project_id": str(safe_dict(context.get("project")).get("id") or ""),
         },
         "proposal": {
             "root_cause": str(payload.get("root_cause") or fallback.get("root_cause") or ""),
@@ -1808,6 +1972,7 @@ def base_repair(
             "mode": "rules_until_model_configured",
             "requested_by": request.get("actor") or "",
             "source": request.get("source") or "",
+            "project_id": str(safe_dict(context.get("project")).get("id") or ""),
             "incident": safe_dict(context.get("incident")),
             "diagnosis": safe_dict(context.get("diagnosis")),
             "recommendation_count": len(safe_list(context.get("recommendations"))),
@@ -1978,7 +2143,9 @@ def run_patch_in_sandbox(repo_root: Path, patch: dict[str, Any], commands: list[
         sandbox_result["error"] = "; ".join(validation["errors"])
         sandbox_result["duration_seconds"] = round(time.monotonic() - started, 3)
         return sandbox_result
-    diff = str(patch.get("diff") or "")
+    diff, normalization = normalize_unified_diff_for_apply(str(patch.get("diff") or ""))
+    if any(normalization.values()):
+        sandbox_result["patch_normalization"] = normalization
     if not diff.strip():
         sandbox_result["status"] = "skipped"
         sandbox_result["error"] = "patch has no unified diff to apply in sandbox"
@@ -1997,6 +2164,9 @@ def run_patch_in_sandbox(repo_root: Path, patch: dict[str, Any], commands: list[
     with tempfile.TemporaryDirectory(prefix=f"ops-agent-repair-{safe_int(patch.get('schema_version'), 1)}-") as tmp:
         sandbox_dir = Path(tmp) / "repo"
         copy_repo_to_sandbox(root, sandbox_dir)
+        diff, rebased_hunks = rebase_unified_diff_hunks(diff, sandbox_dir)
+        if rebased_hunks:
+            sandbox_result.setdefault("patch_normalization", {})["rebased_hunks"] = rebased_hunks
         patch_path = Path(tmp) / "repair.patch"
         patch_path.write_text(diff, encoding="utf-8")
         check = run_subprocess(["git", "init"], sandbox_dir, timeout_seconds=30)
@@ -2072,9 +2242,14 @@ def prepare_patch_branch(
         worktree_dir = worktree_base / f"repair-{repair_id}-{timestamp}-{suffix}"
         suffix += 1
 
-    diff = str(patch.get("diff") or "")
+    diff, normalization = normalize_unified_diff_for_apply(str(patch.get("diff") or ""))
+    diff, rebased_hunks = rebase_unified_diff_hunks(diff, root)
     patch_path = worktree_base / f"{branch_name}.patch"
     patch_path.write_text(diff, encoding="utf-8")
+    if any(normalization.values()):
+        result["patch_normalization"] = normalization
+    if rebased_hunks:
+        result.setdefault("patch_normalization", {})["rebased_hunks"] = rebased_hunks
     result.update({"branch_name": branch_name, "worktree_path": str(worktree_dir), "patch_path": str(patch_path)})
 
     added = run_git(["worktree", "add", "-b", branch_name, str(worktree_dir), "HEAD"], root)
@@ -2980,8 +3155,9 @@ def github_token() -> str:
 
 
 def copy_repo_to_sandbox(repo_root: Path, sandbox_dir: Path) -> None:
-    ignore = shutil.ignore_patterns(
+    pattern_ignore = shutil.ignore_patterns(
         ".git",
+        ".playwright*",
         ".mypy_cache",
         ".pytest_cache",
         ".ruff_cache",
@@ -2992,7 +3168,190 @@ def copy_repo_to_sandbox(repo_root: Path, sandbox_dir: Path) -> None:
         ".venv",
         "venv",
     )
-    shutil.copytree(repo_root, sandbox_dir, ignore=ignore)
+
+    def ignore(path: str, names: list[str]) -> set[str]:
+        ignored = set(pattern_ignore(path, names))
+        for name in names:
+            if name in ignored:
+                continue
+            try:
+                mode = (Path(path) / name).lstat().st_mode
+            except OSError:
+                ignored.add(name)
+                continue
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
+                ignored.add(name)
+        return ignored
+
+    shutil.copytree(
+        repo_root,
+        sandbox_dir,
+        ignore=ignore,
+        symlinks=True,
+        ignore_dangling_symlinks=True,
+    )
+
+
+def normalize_unified_diff_hunk_counts(diff: str) -> tuple[str, int]:
+    if not diff.strip():
+        return diff, 0
+    trailing_newline = diff.endswith("\n")
+    lines = diff.splitlines()
+    corrected = 0
+    index = 0
+    while index < len(lines):
+        match = UNIFIED_DIFF_HUNK_RE.match(lines[index])
+        placeholder_match = UNIFIED_DIFF_PLACEHOLDER_HUNK_RE.match(lines[index])
+        if not match and not placeholder_match:
+            index += 1
+            continue
+        end = index + 1
+        old_count = 0
+        new_count = 0
+        while end < len(lines):
+            line = lines[end]
+            if (
+                UNIFIED_DIFF_HUNK_RE.match(line)
+                or UNIFIED_DIFF_PLACEHOLDER_HUNK_RE.match(line)
+                or line.startswith("diff --git ")
+            ):
+                break
+            if line.startswith("--- ") and end + 1 < len(lines) and lines[end + 1].startswith("+++ "):
+                break
+            if line.startswith("\\"):
+                end += 1
+                continue
+            if line.startswith("-"):
+                old_count += 1
+            elif line.startswith("+"):
+                new_count += 1
+            else:
+                old_count += 1
+                new_count += 1
+            end += 1
+        old_start = match.group(1) if match else "1"
+        new_start = match.group(3) if match else "1"
+        suffix = match.group(5) if match else placeholder_match.group(1)
+        expected_old = int(match.group(2) or 1) if match else -1
+        expected_new = int(match.group(4) or 1) if match else -1
+        if old_count != expected_old or new_count != expected_new or placeholder_match:
+            lines[index] = f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}"
+            corrected += 1
+        index = end
+    normalized = "\n".join(lines)
+    if trailing_newline:
+        normalized += "\n"
+    return normalized, corrected
+
+
+def normalize_unified_diff_for_apply(diff: str) -> tuple[str, dict[str, int]]:
+    normalized, corrected_headers = normalize_unified_diff_file_headers(diff)
+    normalized, corrected_hunks = normalize_unified_diff_hunk_counts(normalized)
+    added_trailing_newline = int(bool(normalized) and not normalized.endswith("\n"))
+    if added_trailing_newline:
+        normalized += "\n"
+    return normalized, {
+        "added_trailing_newline": added_trailing_newline,
+        "corrected_file_headers": corrected_headers,
+        "corrected_hunk_counts": corrected_hunks,
+    }
+
+
+def normalize_unified_diff_file_headers(diff: str) -> tuple[str, int]:
+    if not diff.strip():
+        return diff, 0
+    trailing_newline = diff.endswith("\n")
+    lines = diff.splitlines()
+    corrected = 0
+    for index in range(len(lines) - 1):
+        if not lines[index].startswith("--- ") or not lines[index + 1].startswith("+++ "):
+            continue
+        old_path, old_suffix = split_diff_header_path(lines[index][4:])
+        new_path, new_suffix = split_diff_header_path(lines[index + 1][4:])
+        normalized_old = prefixed_diff_path(old_path, "a/")
+        normalized_new = prefixed_diff_path(new_path, "b/")
+        if normalized_old != old_path:
+            lines[index] = f"--- {normalized_old}{old_suffix}"
+            corrected += 1
+        if normalized_new != new_path:
+            lines[index + 1] = f"+++ {normalized_new}{new_suffix}"
+            corrected += 1
+    normalized = "\n".join(lines)
+    if trailing_newline:
+        normalized += "\n"
+    return normalized, corrected
+
+
+def split_diff_header_path(value: str) -> tuple[str, str]:
+    path, separator, suffix = value.partition("\t")
+    return path, f"{separator}{suffix}" if separator else ""
+
+
+def prefixed_diff_path(path: str, prefix: str) -> str:
+    if path == "/dev/null" or path.startswith(prefix):
+        return path
+    return f"{prefix}{path}"
+
+
+def rebase_unified_diff_hunks(diff: str, repo_root: Path) -> tuple[str, int]:
+    if not diff.strip():
+        return diff, 0
+    trailing_newline = diff.endswith("\n")
+    lines = diff.splitlines()
+    corrected = 0
+    current_path = ""
+    line_delta = 0
+    index = 0
+    while index < len(lines):
+        if lines[index].startswith("--- ") and index + 1 < len(lines) and lines[index + 1].startswith("+++ "):
+            current_path = repository_path_from_diff_header(lines[index][4:])
+            line_delta = 0
+            index += 2
+            continue
+        match = UNIFIED_DIFF_HUNK_RE.match(lines[index])
+        if not match:
+            index += 1
+            continue
+        end = index + 1
+        old_lines: list[str] = []
+        while end < len(lines):
+            line = lines[end]
+            if UNIFIED_DIFF_HUNK_RE.match(line) or line.startswith("diff --git "):
+                break
+            if line.startswith("--- ") and end + 1 < len(lines) and lines[end + 1].startswith("+++ "):
+                break
+            if line.startswith(" ") or line.startswith("-"):
+                old_lines.append(line[1:])
+            end += 1
+        old_count = int(match.group(2) or 1)
+        new_count = int(match.group(4) or 1)
+        target = (repo_root / current_path).resolve() if current_path else Path()
+        if old_lines and current_path and target.is_relative_to(repo_root.resolve()) and target.is_file():
+            target_lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            starts = [
+                candidate
+                for candidate in range(0, len(target_lines) - len(old_lines) + 1)
+                if target_lines[candidate : candidate + len(old_lines)] == old_lines
+            ]
+            if len(starts) == 1:
+                old_start = starts[0] + 1
+                new_start = old_start + line_delta
+                if old_start != int(match.group(1)) or new_start != int(match.group(3)):
+                    lines[index] = f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{match.group(5)}"
+                    corrected += 1
+        line_delta += new_count - old_count
+        index = end
+    normalized = "\n".join(lines)
+    if trailing_newline:
+        normalized += "\n"
+    return normalized, corrected
+
+
+def repository_path_from_diff_header(value: str) -> str:
+    path, _ = split_diff_header_path(value)
+    if path == "/dev/null":
+        return ""
+    return path[2:] if path.startswith("a/") else path
 
 
 def run_subprocess(command: str | list[str], cwd: Path, timeout_seconds: int) -> dict[str, Any]:
@@ -3884,12 +4243,27 @@ def normalize_ai_repair_policy(value: Any) -> dict[str, Any]:
 
 def is_safe_test_command(command: str) -> bool:
     normalized = " ".join(command.strip().split())
+    if has_shell_control_characters(normalized):
+        return False
     return any(normalized == prefix or normalized.startswith(prefix + " ") for prefix in SAFE_TEST_COMMAND_PREFIXES)
 
 
 def is_safe_deploy_command(command: str) -> bool:
     normalized = " ".join(command.strip().split())
-    return any(normalized == prefix or normalized.startswith(prefix + " ") for prefix in SAFE_DEPLOY_COMMAND_PREFIXES)
+    if not normalized or has_shell_control_characters(normalized):
+        return False
+    if any(normalized == prefix or normalized.startswith(prefix + " ") for prefix in SAFE_TEST_COMMAND_PREFIXES):
+        return True
+    patterns = (
+        r"systemctl (?:restart|reload|try-restart) [A-Za-z0-9@_.-]+",
+        r"docker (?:restart|start) [A-Za-z0-9_.-]+",
+        r"docker compose(?: -f [A-Za-z0-9_./-]+)? (?:restart|up -d)(?: --build)?(?: [A-Za-z0-9_.-]+)*",
+    )
+    return any(re.fullmatch(pattern, normalized) for pattern in patterns)
+
+
+def has_shell_control_characters(command: str) -> bool:
+    return bool(re.search(r"[;&|><`$()\r\n]", str(command or "")))
 
 
 def runtime_test_command(command: str) -> str:

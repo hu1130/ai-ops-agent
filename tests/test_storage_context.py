@@ -8,6 +8,21 @@ from ops_agent.storage import Storage
 
 
 class StorageContextTest(unittest.TestCase):
+    def test_notification_dedupe_key_is_bounded_without_losing_uniqueness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            first_key = "http:" + "a" * 400
+            second_key = "http:" + "a" * 399 + "b"
+            storage.save_notification_log("first", first_key, "sent")
+            storage.save_notification_log("second", second_key, "sent")
+            rows = storage.latest_notification_logs(limit=2)
+            storage.close()
+
+        stored_keys = [row["dedupe_key"] for row in rows]
+        self.assertTrue(all(len(key) <= 255 for key in stored_keys))
+        self.assertTrue(all("|sha256:" in key for key in stored_keys))
+        self.assertEqual(2, len(set(stored_keys)))
+
     def test_save_results_persists_context_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

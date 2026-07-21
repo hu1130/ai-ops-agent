@@ -11,7 +11,7 @@ from ops_agent.alerts.notifier import Notifier
 from ops_agent.config import load_config
 from ops_agent.dashboard import start_dashboard
 from ops_agent.scheduler import OpsScheduler
-from ops_agent.storage import Storage
+from ops_agent.storage_factory import open_configured_storage
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,8 +24,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = load_config(args.config)
-    database_path = config.resolve_path(str(config.app.get("database_path", "data/ops_agent.db")))
-    storage = Storage(database_path)
+    storage = open_configured_storage(config)
     notifier = Notifier(
         webhook_url=str(config.alerts.get("webhook_url", "")),
         cooldown_seconds=int(config.alerts.get("cooldown_seconds", 300)),

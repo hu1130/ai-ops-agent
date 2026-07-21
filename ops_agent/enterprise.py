@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from ops_agent.config import AppConfig
+from ops_agent.heartbeat import heartbeat_policy
 from ops_agent.monitor_targets import list_monitor_targets
 from ops_agent.projects import list_projects
 from ops_agent.remediation.executor import MUTATING_ACTIONS
@@ -161,6 +162,8 @@ def resilience_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
     ]
     discovery = safe_dict(config.raw.get("asset_discovery"))
     backups = safe_dict(config.raw.get("backups"))
+    heartbeat = heartbeat_policy(config)
+    heartbeat_configured = bool(heartbeat.get("enabled")) and bool(heartbeat.get("url"))
     backup_targets = [
         item
         for item in safe_list(backups.get("targets"))
@@ -207,6 +210,15 @@ def resilience_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
             if backup_targets and not targets_without_drill
             else "Some backup targets do not have restore drills enabled.",
             {"targets_without_restore_drill": targets_without_drill},
+        ),
+        ReadinessCheck(
+            "resilience",
+            "external_deadman_heartbeat",
+            "pass" if heartbeat_configured else "warning",
+            "External dead-man heartbeat is configured."
+            if heartbeat_configured
+            else "External dead-man heartbeat is not configured.",
+            {"enabled": bool(heartbeat.get("enabled")), "url_env": str(heartbeat.get("url_env") or "")},
         ),
     ]
 def remediation_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
@@ -297,22 +309,24 @@ def storage_and_audit_checks(config: AppConfig) -> list[ReadinessCheck]:
     app = safe_dict(config.raw.get("app"))
     retention = safe_dict(config.raw.get("retention"))
     database_path = str(app.get("database_path") or "").strip()
+    backend = str(app.get("storage_backend") or "sqlite").strip().lower()
+    database_configured = bool(database_path) if backend == "sqlite" else backend == "mysql"
     return [
         ReadinessCheck(
             "storage",
             "database_configured",
-            "pass" if database_path else "blocker",
-            "Database path is configured." if database_path else "Database path is missing.",
-            {"database_path": database_path},
+            "pass" if database_configured else "blocker",
+            "Database backend is configured." if database_configured else "Database backend configuration is missing.",
+            {"backend": backend, "database_path": database_path},
         ),
         ReadinessCheck(
             "storage",
             "enterprise_database_backend",
-            "warning" if database_path.endswith(".db") else "pass",
+            "warning" if backend == "sqlite" else "pass",
             "SQLite is acceptable for internal use, but enterprise SaaS should migrate to Postgres/MySQL."
-            if database_path.endswith(".db")
-            else "Database backend is not a local SQLite file.",
-            {"database_path": database_path},
+            if backend == "sqlite"
+            else "Database backend uses MySQL.",
+            {"backend": backend, "database_path": database_path},
         ),
         ReadinessCheck(
             "audit",
@@ -333,6 +347,7 @@ def security_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
     tokens = safe_list(app.get("api_tokens"))
     legacy_token = str(app.get("api_token") or "").strip()
     auth_configured = bool(tokens or legacy_token)
+    protect_reads = bool(app.get("api_auth_required_for_reads", False))
     return [
         ReadinessCheck(
             "security",
@@ -344,7 +359,16 @@ def security_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
                 "legacy_api_token_configured": bool(legacy_token),
                 "api_auth_required_for_reads": bool(app.get("api_auth_required_for_reads", False)),
             },
-        )
+        ),
+        ReadinessCheck(
+            "security",
+            "read_api_authentication",
+            "pass" if auth_configured and protect_reads else "warning",
+            "Read APIs require an authenticated viewer token."
+            if auth_configured and protect_reads
+            else "Read APIs are accessible without authentication.",
+            {"api_auth_required_for_reads": protect_reads},
+        ),
     ]
 
 

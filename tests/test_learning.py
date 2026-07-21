@@ -93,6 +93,26 @@ class LearningOptimizationTest(unittest.TestCase):
         self.assertEqual([1], rows[0]["incident_ids"])
         self.assertEqual(1, summary["open_count"])
 
+    def test_storage_bounds_long_learning_dedupe_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            payload = {
+                "dedupe_key": "frequent_unresolved:" + "project:" * 80,
+                "priority": "medium",
+                "category": "service_unavailable",
+                "trigger_type": "frequent_unresolved",
+                "title": "Improve recurring incident rule",
+                "reason": "frequent incident",
+                "recommended_action": "add rule",
+            }
+            first = storage.save_learning_recommendations([payload])[0]
+            second = storage.save_learning_recommendations([payload])[0]
+            storage.close()
+
+        self.assertLessEqual(len(first["dedupe_key"]), 255)
+        self.assertIn("|sha256:", first["dedupe_key"])
+        self.assertEqual(first["id"], second["id"])
+
     def test_storage_tracks_learning_review_decision_and_draft(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

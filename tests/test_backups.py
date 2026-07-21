@@ -1,13 +1,16 @@
 import gzip
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ops_agent.backups import (
     backup_status_payload,
+    cleanup_old_backup_files,
     run_backup_health_checks,
     run_backup_now,
     run_due_backups,
@@ -73,6 +76,26 @@ class FakeMySQLRunner:
 
 
 class BackupWorkflowTest(unittest.TestCase):
+    def test_backup_cleanup_enforces_capacity_while_preserving_minimum_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = sqlite_config(tmp)
+            target = config.raw["backups"]["targets"][0]
+            target["retention_days"] = 365
+            target["minimum_backups"] = 2
+            target["max_total_bytes"] = 12
+            directory = Path(tmp) / "backups" / "ops-db"
+            directory.mkdir(parents=True)
+            for index in range(4):
+                path = directory / f"backup-{index}.sqlite"
+                path.write_bytes(b"123456")
+                os.utime(path, (100 + index, 100 + index))
+
+            deleted = cleanup_old_backup_files(config, target, datetime.now(timezone.utc))
+            remaining = sorted(path.name for path in directory.iterdir())
+
+        self.assertEqual(2, deleted)
+        self.assertEqual(["backup-2.sqlite", "backup-3.sqlite"], remaining)
+
     def test_sqlite_backup_and_isolated_restore_drill(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = sqlite_config(tmp)

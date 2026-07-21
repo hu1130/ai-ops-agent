@@ -46,6 +46,7 @@ from ops_agent.ai.repair import (
     notify_ai_repair_approval_queue,
     prepare_ai_repair_branch,
     publish_ai_repair_pull_request,
+    queue_action_runtime,
     record_ai_repair_test_result,
     run_ai_repair_pipeline,
     run_ai_repair_pipeline_for_incident,
@@ -64,6 +65,7 @@ from ops_agent.operator_workflow import (
     execute_primary_operator_action,
 )
 from ops_agent.projects import list_projects, project_summary_payload
+from ops_agent.scheduler import enabled_report_target_keys, filter_report_rows
 from ops_agent.remediation.approval import approval_expiry_from_config, approve_action_log, reject_action_log
 from ops_agent.remediation.playbook_center import (
     create_incident_playbook_recommendations,
@@ -102,7 +104,7 @@ def start_dashboard(
                 if auth is None:
                     return
             if path == "/api/summary":
-                self.send_json(storage.dashboard_summary(**summary_filters_from_query(query)))
+                self.send_json(filtered_dashboard_summary(storage, config, **summary_filters_from_query(query)))
                 return
             if path == "/api/ops/metrics":
                 self.send_json(storage.ops_metrics(query_hours(query)))
@@ -419,7 +421,7 @@ def start_dashboard(
                         return
                     self.send_json(row)
                     return
-            self.send_html(render_page(storage))
+            self.send_html(render_page(storage, config))
 
         def do_POST(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
@@ -906,15 +908,19 @@ def start_dashboard(
                         self.record_audit(path, 503, "error", "config is not configured", actor=actor, auth=auth)
                         self.send_json({"error": "config is not configured"}, status=503)
                         return
+                    repair = storage.get_ai_repair_proposal(repair_id)
+                    if not repair:
+                        raise ValueError(f"AI repair proposal not found: #{repair_id}")
+                    runtime = queue_action_runtime(config, repair, body)
                     commands = body.get("commands")
                     updated = sandbox_test_ai_repair_proposal(
                         storage,
                         repair_id,
-                        config.base_dir,
+                        runtime["repo_root"],
                         actor=actor,
                         note=note,
-                        commands=commands if isinstance(commands, list) else None,
-                        policy=ai_repair_policy_from_config(config),
+                        commands=commands if isinstance(commands, list) else runtime["commands"],
+                        policy=runtime["policy"],
                     )
                     outcome = "success" if updated.get("status") == "test_passed" else "error"
                     self.record_audit(path, 200, outcome, "AI repair sandbox test completed", actor=actor, auth=auth)
@@ -925,14 +931,18 @@ def start_dashboard(
                         self.record_audit(path, 503, "error", "config is not configured", actor=actor, auth=auth)
                         self.send_json({"error": "config is not configured"}, status=503)
                         return
+                    repair = storage.get_ai_repair_proposal(repair_id)
+                    if not repair:
+                        raise ValueError(f"AI repair proposal not found: #{repair_id}")
+                    runtime = queue_action_runtime(config, repair, body)
                     commands = body.get("commands")
                     updated = prepare_ai_repair_branch(
                         storage,
                         repair_id,
-                        config.base_dir,
+                        runtime["repo_root"],
                         actor=actor,
                         note=note,
-                        commands=commands if isinstance(commands, list) else None,
+                        commands=commands if isinstance(commands, list) else runtime["commands"],
                     )
                     outcome = "success" if updated.get("status") == "branch_prepared" else "error"
                     self.record_audit(path, 200, outcome, "AI repair controlled branch prepared", actor=actor, auth=auth)
@@ -943,15 +953,19 @@ def start_dashboard(
                         self.record_audit(path, 503, "error", "config is not configured", actor=actor, auth=auth)
                         self.send_json({"error": "config is not configured"}, status=503)
                         return
+                    repair = storage.get_ai_repair_proposal(repair_id)
+                    if not repair:
+                        raise ValueError(f"AI repair proposal not found: #{repair_id}")
+                    runtime = queue_action_runtime(config, repair, body)
                     updated = publish_ai_repair_pull_request(
                         storage,
                         repair_id,
-                        config.base_dir,
+                        runtime["repo_root"],
                         actor=actor,
                         note=note,
-                        remote=str(body.get("remote") or "origin"),
-                        base=str(body.get("base") or "main"),
-                        draft=bool(body.get("draft", True)),
+                        remote=runtime["remote"],
+                        base=runtime["base"],
+                        draft=runtime["draft"],
                     )
                     outcome = "success" if updated.get("status") == "pr_created" else "error"
                     self.record_audit(path, 200, outcome, "AI repair pull request published", actor=actor, auth=auth)
@@ -962,6 +976,10 @@ def start_dashboard(
                         self.record_audit(path, 503, "error", "config is not configured", actor=actor, auth=auth)
                         self.send_json({"error": "config is not configured"}, status=503)
                         return
+                    repair = storage.get_ai_repair_proposal(repair_id)
+                    if not repair:
+                        raise ValueError(f"AI repair proposal not found: #{repair_id}")
+                    runtime = queue_action_runtime(config, repair, body)
                     commands = body.get("commands")
                     verify_urls = body.get("verify_urls") or body.get("verification_urls")
                     rollback_commands = body.get("rollback_commands")
@@ -969,15 +987,21 @@ def start_dashboard(
                     updated = deploy_ai_repair_after_merge(
                         storage,
                         repair_id,
-                        config.base_dir,
+                        runtime["repo_root"],
                         actor=actor,
                         note=note,
-                        remote=str(body.get("remote") or "origin"),
-                        base=str(body.get("base") or "main"),
-                        commands=commands if isinstance(commands, list) else None,
-                        verify_urls=verify_urls if isinstance(verify_urls, list) else None,
-                        rollback_commands=rollback_commands if isinstance(rollback_commands, list) else None,
-                        rollback_verify_urls=rollback_verify_urls if isinstance(rollback_verify_urls, list) else None,
+                        remote=runtime["remote"],
+                        base=runtime["base"],
+                        commands=commands if isinstance(commands, list) else runtime["deploy_commands"],
+                        verify_urls=verify_urls if isinstance(verify_urls, list) else runtime["verify_urls"],
+                        rollback_commands=(
+                            rollback_commands if isinstance(rollback_commands, list) else runtime["rollback_commands"]
+                        ),
+                        rollback_verify_urls=(
+                            rollback_verify_urls
+                            if isinstance(rollback_verify_urls, list)
+                            else runtime["rollback_verify_urls"]
+                        ),
                     )
                     outcome = "success" if updated.get("status") in {"deployed", "rollback_succeeded"} else "error"
                     self.record_audit(path, 200, outcome, "AI repair merged PR deployment checked", actor=actor, auth=auth)
@@ -1882,8 +1906,32 @@ def query_statuses(query: dict[str, list[str]]) -> list[str]:
     return statuses
 
 
-def render_page(storage: Storage) -> str:
-    summary = storage.dashboard_summary()
+def filtered_dashboard_summary(
+    storage: Storage,
+    config: AppConfig | None = None,
+    hours: int = 24,
+    environment: str = "",
+    run_type: str = "",
+) -> dict:
+    summary = storage.dashboard_summary(hours=hours, environment=environment, run_type=run_type)
+    if config is None:
+        return summary
+    latest_targets = filter_report_rows(summary["latest_targets"], enabled_report_target_keys(config))
+    problems = [row for row in latest_targets if row.get("status") in {"warning", "critical"}]
+    summary["latest_targets"] = latest_targets
+    summary["active_problem_count"] = len(problems)
+    summary["current_status"] = (
+        "critical"
+        if any(row.get("status") == "critical" for row in problems)
+        else "warning"
+        if problems
+        else "ok"
+    )
+    return summary
+
+
+def render_page(storage: Storage, config: AppConfig | None = None) -> str:
+    summary = filtered_dashboard_summary(storage, config)
     incidents = storage.latest_incidents(12)
     results = storage.latest_results(60)
     latest_targets = sorted(

@@ -6,11 +6,29 @@
     "cli_run_type": "manual",
     "interval_seconds": 60,
     "database_path": "data/ops_agent.db",
+    "storage_backend": "sqlite",
     "dashboard_host": "127.0.0.1",
     "dashboard_port": 8765,
     "api_token": "",
     "api_tokens": [],
     "api_auth_required_for_reads": false
+  },
+  "mysql": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "ops_agent",
+    "user": "ops_agent",
+    "password_env": "OPS_AGENT_MYSQL_PASSWORD",
+    "connect_timeout_seconds": 5,
+    "read_timeout_seconds": 30,
+    "write_timeout_seconds": 30
+  },
+  "heartbeat": {
+    "enabled": false,
+    "url_env": "OPS_AGENT_HEARTBEAT_URL",
+    "method": "GET",
+    "timeout_seconds": 5,
+    "interval_seconds": 60
   },
   "projects": [
     {
@@ -189,6 +207,7 @@
         "max_age_hours": 48,
         "retention_days": 14,
         "minimum_backups": 3,
+        "max_total_bytes": 1073741824,
         "alert_after_failures": 2,
         "recovery_after_successes": 2,
         "restore_drill": {
@@ -208,6 +227,7 @@
         "max_age_hours": 48,
         "retention_days": 14,
         "minimum_backups": 3,
+        "max_total_bytes": 2147483648,
         "minimum_backup_bytes": 100,
         "restore_drill": {
           "enabled": true,
@@ -278,9 +298,18 @@
         "run_types": [],
         "min_classification_confidence": 0.65,
         "run_dry_run": true,
+        "run_sandbox": true,
         "notify": true,
         "notify_states": ["needs_dry_run", "needs_sandbox", "ready_for_approval", "blocked", "review_only"],
         "notify_limit": 20
+      },
+      "queue_worker": {
+        "enabled": false,
+        "interval_seconds": 300,
+        "max_actions_per_cycle": 3,
+        "auto_prepare_branch_after_approval": true,
+        "auto_create_pr_after_approval": true,
+        "auto_deploy_after_merge": true
       }
     }
   },

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import fnmatch
-import json
 import re
 import subprocess
 from typing import Any, Callable
 
+from ops_agent.docker_identity import container_matches_target, label_value, parse_docker_ps
 from ops_agent.events import CheckResult
 
 
@@ -41,6 +41,7 @@ def discover_runtime_assets(
 
     containers = parse_docker_ps(completed.stdout)
     covered = configured_container_names(raw_config)
+    configured_targets = configured_container_targets(raw_config)
     ignored_patterns = string_list(config.get("ignored_containers"))
     infrastructure_patterns = string_list(config.get("infrastructure_patterns")) or DEFAULT_INFRASTRUCTURE_PATTERNS
     candidate_patterns = string_list(config.get("candidate_patterns"))
@@ -53,7 +54,7 @@ def discover_runtime_assets(
     covered_assets: list[dict[str, Any]] = []
     for container in containers:
         name = str(container.get("name") or "")
-        if name in covered:
+        if name in covered or any(container_matches_target(container, target) for target in configured_targets):
             covered_assets.append({**container, "coverage": "configured_monitor"})
             continue
         ignore_reason = ignored_reason(
@@ -123,32 +124,6 @@ def run_asset_discovery_check(
     return CheckResult(source="discovery", name=name, status=status, summary=summary, details=details)
 
 
-def parse_docker_ps(output: str) -> list[dict[str, Any]]:
-    containers: list[dict[str, Any]] = []
-    for line in str(output or "").splitlines():
-        text = line.strip()
-        if not text:
-            continue
-        try:
-            row = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(row, dict):
-            continue
-        containers.append(
-            {
-                "name": str(row.get("Names") or row.get("Name") or ""),
-                "image": str(row.get("Image") or ""),
-                "state": str(row.get("State") or ""),
-                "status": str(row.get("Status") or ""),
-                "ports": str(row.get("Ports") or ""),
-                "compose_project": label_value(str(row.get("Labels") or ""), "com.docker.compose.project"),
-                "compose_service": label_value(str(row.get("Labels") or ""), "com.docker.compose.service"),
-            }
-        )
-    return containers
-
-
 def configured_container_names(raw_config: dict[str, Any]) -> set[str]:
     names: set[str] = set()
     for key in ("docker_checks", "log_checks", "database_checks"):
@@ -168,6 +143,21 @@ def configured_container_names(raw_config: dict[str, Any]) -> set[str]:
         if container:
             names.add(container)
     return names
+
+
+def configured_container_targets(raw_config: dict[str, Any]) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    for key in ("docker_checks", "log_checks", "database_checks"):
+        for item in safe_list(raw_config.get(key)):
+            payload = safe_dict(item)
+            if bool(payload.get("enabled", True)) and str(payload.get("container") or "").strip():
+                targets.append(payload)
+    backups = safe_dict(raw_config.get("backups"))
+    for item in safe_list(backups.get("targets")):
+        payload = safe_dict(item)
+        if bool(payload.get("enabled", True)) and str(payload.get("container") or "").strip():
+            targets.append(payload)
+    return targets
 
 
 def ignored_reason(
@@ -214,14 +204,6 @@ def suggested_project_id(container: dict[str, Any], projects: list[dict[str, Any
         if normalize_name(project.get("id")) and normalize_name(project.get("id")) in normalized
     ]
     return matches[0] if matches else ""
-
-
-def label_value(labels: str, key: str) -> str:
-    for item in str(labels or "").split(","):
-        name, separator, value = item.partition("=")
-        if separator and name.strip() == key:
-            return value.strip()
-    return ""
 
 
 def matches_any(value: str, patterns: list[str]) -> bool:

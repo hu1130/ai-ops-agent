@@ -183,7 +183,7 @@ def mysql_create_table_sql(connection: sqlite3.Connection, table: str) -> str:
         name = str(column["name"])
         column_type = mysql_column_type(column)
         nullable = "" if int(column["notnull"] or 0) == 0 or int(column["pk"] or 0) else " NOT NULL"
-        default = "" if "TEXT" in column_type.upper() else mysql_default(column["dflt_value"])
+        default = mysql_column_default(column_type, column["dflt_value"])
         if int(column["pk"] or 0):
             primary_keys.append(name)
         if int(column["pk"] or 0) and name == "id":
@@ -239,6 +239,13 @@ def mysql_default(value: Any) -> str:
     if is_number_literal(text):
         return f" DEFAULT {text}"
     return f" DEFAULT {mysql_quote(text)}"
+
+
+def mysql_column_default(column_type: str, value: Any) -> str:
+    default = mysql_default(value)
+    if not default or default == " DEFAULT NULL" or "TEXT" not in column_type.upper():
+        return default
+    return f" DEFAULT ({default.removeprefix(' DEFAULT ')})"
 
 
 def is_number_literal(value: str) -> bool:

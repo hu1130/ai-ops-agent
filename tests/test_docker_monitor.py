@@ -1,4 +1,5 @@
 import json
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -6,6 +7,47 @@ from ops_agent.monitors.docker_monitor import run_docker_check
 
 
 class DockerMonitorTest(unittest.TestCase):
+    @patch("ops_agent.monitors.docker_monitor.subprocess.run")
+    def test_resolves_recreated_compose_container_by_project_and_service(self, run) -> None:
+        missing = subprocess.CompletedProcess([], 1, stdout="", stderr="No such container")
+        listing = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps(
+                {
+                    "Names": "40d66a351638_ai-customer-service-semp-api-1",
+                    "Image": "ai-customer-service-semp-api:latest",
+                    "State": "running",
+                    "Status": "Up 1 minute",
+                    "Labels": (
+                        "com.docker.compose.project=ai-customer-service,"
+                        "com.docker.compose.service=semp-api"
+                    ),
+                }
+            ),
+            stderr="",
+        )
+        healthy = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps({"Status": "running", "Running": True}),
+            stderr="",
+        )
+        run.side_effect = [missing, listing, healthy]
+
+        result = run_docker_check(
+            {
+                "name": "secondary API",
+                "container": "ai-customer-service-semp-api-1",
+                "project_id": "ai-customer-service",
+                "compose_service": "semp-api",
+            }
+        )
+
+        self.assertEqual("ok", result.status)
+        self.assertEqual("40d66a351638_ai-customer-service-semp-api-1", result.details["container"])
+        self.assertEqual("generated_name_suffix", result.details["container_resolution"]["resolution_source"])
+
     @patch("ops_agent.monitors.docker_monitor.subprocess.run")
     def test_running_healthy_container_is_ok(self, run) -> None:
         run.return_value.returncode = 0

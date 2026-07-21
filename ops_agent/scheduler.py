@@ -11,9 +11,13 @@ from ops_agent.ai.analyzer import analyze_incident
 from ops_agent.ai.learning import build_learning_recommendations, format_learning_recommendations
 from ops_agent.ai.repair import (
     AI_REPAIR_QUEUE_ACTIVE_STATUSES,
+    ai_repair_queue_worker_policy,
     build_ai_repair_proposal,
     dry_run_ai_repair_proposal,
     notify_ai_repair_approval_queue,
+    queue_action_runtime,
+    run_ai_repair_automation_cycle,
+    sandbox_test_ai_repair_proposal,
 )
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.alerts.routing import (
@@ -29,6 +33,7 @@ from ops_agent.diagnostics.suggestions import build_action_suggestions
 from ops_agent.diagnosis import diagnostic_snapshot_evidence, persist_incident_diagnosis
 from ops_agent.discovery import run_asset_discovery_check
 from ops_agent.events import CheckResult, RunContext, apply_context
+from ops_agent.heartbeat import heartbeat_policy, send_success_heartbeat
 from ops_agent.monitors.business_flow_monitor import run_business_flow_checks
 from ops_agent.monitors.database_monitor import run_database_checks
 from ops_agent.monitors.docker_monitor import run_docker_checks
@@ -71,6 +76,7 @@ DEFAULT_AI_REPAIR_AUTO_TRIGGER_POLICY = {
     "run_types": [],
     "min_classification_confidence": 0.65,
     "run_dry_run": True,
+    "run_sandbox": True,
     "notify": True,
     "notify_states": ["needs_dry_run", "needs_sandbox", "ready_for_approval", "blocked", "review_only"],
     "notify_limit": 20,
@@ -99,6 +105,8 @@ class OpsScheduler:
         self._last_daily_report_date: str = ""
         self._last_retention_cleanup_date: str = ""
         self._last_learning_optimization_at: float = 0.0
+        self._last_ai_repair_automation_at: float = 0.0
+        self._last_heartbeat_at: float = 0.0
 
     def run_once(self, respect_intervals: bool = False) -> list[CheckResult]:
         cycle_started_at = time.time()
@@ -595,6 +603,21 @@ class OpsScheduler:
                     actor="scheduler",
                     note="AI repair auto trigger dry-run",
                 )
+            if (
+                policy["run_sandbox"]
+                and str(repair.get("status") or "") == "dry_run_passed"
+                and str(safe_dict(repair.get("patch")).get("diff") or "").strip()
+            ):
+                runtime = queue_action_runtime(self.config, repair, {})
+                repair = sandbox_test_ai_repair_proposal(
+                    self.storage,
+                    int(repair["id"]),
+                    runtime["repo_root"],
+                    actor="scheduler",
+                    note="AI repair auto trigger sandbox test",
+                    commands=runtime["commands"],
+                    policy=safe_dict(runtime.get("policy")),
+                )
             notify_result: dict[str, Any] = {}
             if policy["notify"]:
                 notify_result = notify_ai_repair_approval_queue(
@@ -886,6 +909,53 @@ class OpsScheduler:
             )
         return saved
 
+    def run_ai_repair_automation_if_due(self, force: bool = False) -> dict[str, Any]:
+        policy = ai_repair_queue_worker_policy(self.config)
+        if not policy.get("enabled"):
+            return {"status": "disabled", "actions": [], "policy": policy}
+        now = time.time()
+        interval = max(1, safe_int(policy.get("interval_seconds"), 300))
+        if not force and self._last_ai_repair_automation_at and now - self._last_ai_repair_automation_at < interval:
+            return {"status": "not_due", "actions": [], "policy": policy}
+        self._last_ai_repair_automation_at = now
+        result = run_ai_repair_automation_cycle(self.storage, self.config, actor="scheduler", policy=policy)
+        failed_ids = [
+            safe_int(item.get("repair_id"))
+            for item in safe_list(result.get("actions"))
+            if str(item.get("status") or "")
+            in {"failed", "branch_failed", "pr_failed", "deploy_failed", "rollback_failed"}
+        ]
+        if failed_ids:
+            notify_ai_repair_approval_queue(
+                self.storage,
+                self.config,
+                notifier=self.notifier,
+                states=["blocked"],
+                repair_ids=failed_ids,
+                actor="scheduler",
+            )
+        if result.get("processed"):
+            print(
+                "AI repair queue worker: "
+                f"{result.get('processed')} action(s), {result.get('failures', 0)} failure(s)."
+            )
+        return result
+
+    def send_heartbeat_if_due(self, force: bool = False) -> dict[str, Any]:
+        policy = heartbeat_policy(self.config)
+        if not policy.get("enabled"):
+            return {"status": "disabled"}
+        now = time.time()
+        interval = max(30, safe_int(policy.get("interval_seconds"), 60))
+        if not force and self._last_heartbeat_at and now - self._last_heartbeat_at < interval:
+            return {"status": "not_due"}
+        result = send_success_heartbeat(self.config)
+        if result.get("status") == "sent":
+            self._last_heartbeat_at = now
+        else:
+            print(f"External heartbeat failed: {result.get('error') or result.get('status')}")
+        return result
+
     def due_checks(self, source: str, checks: list[dict], respect_intervals: bool, now: float) -> list[dict]:
         enabled_checks = [check for check in checks if check.get("enabled", True)]
         if not respect_intervals:
@@ -913,6 +983,8 @@ class OpsScheduler:
                 self.send_daily_report_if_due()
                 self.run_retention_cleanup_if_due()
                 self.run_learning_optimization_if_due()
+                self.run_ai_repair_automation_if_due()
+                self.send_heartbeat_if_due()
                 print(f"Check complete: {len(results)} result(s).")
             except Exception as exc:
                 print(f"Scheduler error: {exc}")
@@ -928,7 +1000,7 @@ def ai_repair_auto_trigger_policy(config: AppConfig) -> dict[str, Any]:
     repair_config = safe_dict(safe_dict(config.raw.get("ai")).get("repair"))
     raw = safe_dict(repair_config.get("auto_trigger"))
     policy = dict(DEFAULT_AI_REPAIR_AUTO_TRIGGER_POLICY)
-    for key in ("enabled", "run_dry_run", "notify"):
+    for key in ("enabled", "run_dry_run", "run_sandbox", "notify"):
         if key in raw:
             policy[key] = bool(raw.get(key))
     for key in (

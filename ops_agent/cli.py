@@ -22,6 +22,7 @@ from ops_agent.remediation.policy import apply_policy_defaults, decide_action_po
 from ops_agent.remediation.verifier import VerificationResult, verify_after_action
 from ops_agent.retention import format_retention_result, run_retention_cleanup
 from ops_agent.storage import Storage
+from ops_agent.storage_factory import open_configured_storage
 
 
 def parse_args() -> argparse.Namespace:
@@ -492,7 +493,7 @@ def format_verification(verification: VerificationResult | None) -> str:
 
 
 def open_storage(config: AppConfig) -> Storage:
-    return Storage(database_path_from_config(config))
+    return open_configured_storage(config)
 
 
 def database_path_from_config(config: AppConfig) -> Path:
@@ -857,6 +858,8 @@ def validate_config(config: AppConfig) -> list[str]:
                 validate_positive_number(target.get("interval_hours", 24), f"{field}.interval_hours", errors)
                 validate_positive_int(target.get("retention_days", 14), f"{field}.retention_days", errors)
                 validate_positive_int(target.get("minimum_backups", 3), f"{field}.minimum_backups", errors)
+                if "max_total_bytes" in target:
+                    validate_positive_int(target.get("max_total_bytes"), f"{field}.max_total_bytes", errors)
                 validate_optional_positive_int(target.get("alert_after_failures"), f"{field}.alert_after_failures", errors)
                 validate_optional_positive_int(target.get("recovery_after_successes"), f"{field}.recovery_after_successes", errors)
                 drill = target.get("restore_drill", {})

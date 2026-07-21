@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -324,6 +325,10 @@ class Storage:
                     decision_note text
                 );
 
+                create index if not exists idx_check_results_created
+                    on check_results (created_at, id);
+                create index if not exists idx_incidents_created
+                    on incidents (created_at, id);
                 create index if not exists idx_incident_recommendations_incident
                     on incident_recommendations (incident_id, position, id);
                 create index if not exists idx_incident_comments_incident
@@ -357,6 +362,14 @@ class Storage:
                 """
             )
             self.ensure_context_columns()
+            self.connection.executescript(
+                """
+                create index if not exists idx_check_results_context
+                    on check_results (environment, run_type, created_at, id);
+                create index if not exists idx_incidents_context
+                    on incidents (environment, run_type, created_at, id);
+                """
+            )
             self.ensure_incident_lifecycle_columns()
             self.ensure_incident_classification_columns()
             self.ensure_action_log_columns()
@@ -2938,6 +2951,7 @@ class Storage:
         incident_id: int | None = None,
         metadata: dict | None = None,
     ) -> int:
+        stored_dedupe_key = bounded_dedupe_key(dedupe_key)
         with self.lock:
             cursor = self.connection.execute(
                 """
@@ -2956,7 +2970,7 @@ class Storage:
                     incident_id,
                     severity or "",
                     title,
-                    dedupe_key,
+                    stored_dedupe_key,
                     status,
                     json.dumps(list(route_names or []), ensure_ascii=False),
                     json.dumps(list(channels or []), ensure_ascii=False),
@@ -3426,9 +3440,74 @@ class Storage:
 
     def dashboard_summary(self, hours: int = 24, environment: str = "", run_type: str = "") -> dict:
         since = datetime.now(timezone.utc) - timedelta(hours=hours)
-        rows = self.recent_results(since.isoformat(), environment=environment, run_type=run_type)
-        incidents = self.recent_incidents(since.isoformat(), environment=environment, run_type=run_type)
-        return dashboard_summary_from_rows(hours, rows, incidents)
+        with self.lock:
+            where, params = context_where(environment, run_type)
+            where.append("created_at >= ?")
+            params.append(since.isoformat())
+            result_where = " and ".join(where)
+            status_rows = self.connection.execute(
+                f"select status, count(*) as total from check_results where {result_where} group by status",
+                params,
+            ).fetchall()
+            source_rows = self.connection.execute(
+                f"select source, count(*) as total from check_results where {result_where} group by source",
+                params,
+            ).fetchall()
+            latest_rows = self.connection.execute(
+                f"""
+                select current.* from check_results current
+                inner join (
+                    select max(id) as id from check_results
+                    where {result_where}
+                    group by environment, run_type, source, name
+                ) latest on latest.id = current.id
+                order by current.id asc
+                """,
+                params,
+            ).fetchall()
+
+            incident_where, incident_params = context_where(environment, run_type)
+            incident_where.append("created_at >= ?")
+            incident_params.append(since.isoformat())
+            incident_counts = self.connection.execute(
+                f"""
+                select count(*) as total,
+                    sum(case when status not in ('resolved', 'closed') then 1 else 0 end) as open_total
+                from incidents
+                where {' and '.join(incident_where)}
+                """,
+                incident_params,
+            ).fetchone() or {}
+
+        counts = {"ok": 0, "warning": 0, "critical": 0}
+        for raw_row in status_rows:
+            row = dict(raw_row)
+            status = str(row.get("status") or "")
+            if status in counts:
+                counts[status] = int(row.get("total") or 0)
+        latest = [dict(row) for row in latest_rows]
+        incident_count_values = dict(incident_counts)
+        problem_targets = [row for row in latest if row.get("status") in {"warning", "critical"}]
+        total = sum(counts.values())
+        return {
+            "hours": hours,
+            "total_checks": total,
+            "ok": counts["ok"],
+            "warning": counts["warning"],
+            "critical": counts["critical"],
+            "ok_rate": round((counts["ok"] / total) * 100, 1) if total else 100.0,
+            "current_status": "critical" if any(row.get("status") == "critical" for row in latest) else (
+                "warning" if problem_targets else "ok"
+            ),
+            "active_problem_count": len(problem_targets),
+            "incident_count": int(incident_count_values.get("total") or 0),
+            "open_incident_count": int(incident_count_values.get("open_total") or 0),
+            "source_counts": {
+                str(dict(row).get("source") or "unknown"): int(dict(row).get("total") or 0)
+                for row in source_rows
+            },
+            "latest_targets": latest,
+        }
 
     def context_summaries(self, hours: int = 24) -> list[dict]:
         since = datetime.now(timezone.utc) - timedelta(hours=hours)
@@ -3877,6 +3956,15 @@ def incident_review_payload(row: sqlite3.Row) -> dict:
     return payload
 
 
+def bounded_dedupe_key(value: object, max_length: int = 255) -> str:
+    key = str(value or "default")
+    if len(key) <= max_length:
+        return key
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    suffix = f"|sha256:{digest}"
+    return key[: max_length - len(suffix)] + suffix
+
+
 def recommendation_dedupe_key(item: dict, source: str) -> str:
     payload = {
         "source": source,
@@ -3962,7 +4050,7 @@ def validate_incident_priority(value: str) -> str:
 def normalize_learning_recommendation(value: dict | None) -> dict:
     payload = safe_dict(value)
     return {
-        "dedupe_key": str(payload.get("dedupe_key") or ""),
+        "dedupe_key": bounded_dedupe_key(payload.get("dedupe_key") or ""),
         "priority": str(payload.get("priority") or "medium"),
         "category": str(payload.get("category") or ""),
         "trigger_type": str(payload.get("trigger_type") or ""),

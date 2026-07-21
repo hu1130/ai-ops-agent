@@ -12,14 +12,19 @@ from pathlib import Path
 from ops_agent.ai.repair import (
     ai_repair_approval_queue,
     build_ai_repair_proposal,
+    copy_repo_to_sandbox,
     deploy_ai_repair_after_merge,
     dry_run_ai_repair_proposal,
     notify_ai_repair_approval_queue,
+    normalize_unified_diff_for_apply,
+    normalize_unified_diff_hunk_counts,
     normalize_model_endpoint_url,
     prepare_ai_repair_branch,
     publish_ai_repair_pull_request,
     record_ai_repair_test_result,
+    rebase_unified_diff_hunks,
     run_ai_repair_pipeline_for_incident,
+    run_ai_repair_automation_cycle,
     run_ai_repair_queue_next_action,
     run_project_ai_repair_drill,
     sandbox_test_ai_repair_proposal,
@@ -43,6 +48,89 @@ class RecordingNotifier(Notifier):
 
 
 class AiRepairTest(unittest.TestCase):
+    def test_unified_diff_hunk_counts_are_normalized_without_changing_content(self) -> None:
+        malformed = (
+            "--- sample.txt\n"
+            "+++ sample.txt\n"
+            "@@ -1,7 +1,7 @@\n"
+            " old\n"
+            "-value\n"
+            "+new value\n"
+            "+extra\n"
+        )
+
+        normalized, corrected = normalize_unified_diff_hunk_counts(malformed)
+
+        self.assertEqual(1, corrected)
+        self.assertIn("@@ -1,2 +1,3 @@", normalized)
+        self.assertIn("-value\n+new value\n+extra\n", normalized)
+
+    def test_unified_diff_file_headers_are_normalized_for_git_apply(self) -> None:
+        malformed = (
+            "--- sample.txt\n"
+            "+++ sample.txt\n"
+            "@@ -1,7 +1,7 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+
+        normalized, changes = normalize_unified_diff_for_apply(malformed)
+
+        self.assertIn("--- a/sample.txt\n+++ b/sample.txt\n", normalized)
+        self.assertEqual(2, changes["corrected_file_headers"])
+        self.assertEqual(1, changes["corrected_hunk_counts"])
+
+    def test_unified_diff_placeholder_hunk_is_normalized_from_content(self) -> None:
+        malformed = (
+            "--- a/sample.txt\n"
+            "+++ b/sample.txt\n"
+            "@@ - ... + ... @@\n"
+            " old\n"
+            "+new"
+        )
+
+        normalized, changes = normalize_unified_diff_for_apply(malformed)
+
+        self.assertIn("@@ -1,1 +1,2 @@", normalized)
+        self.assertTrue(normalized.endswith("\n"))
+        self.assertEqual(1, changes["added_trailing_newline"])
+        self.assertEqual(1, changes["corrected_hunk_counts"])
+
+    def test_unified_diff_hunk_is_rebased_only_on_unique_repository_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "sample.txt").write_text("one\ntwo\ntarget\nold\ntail\n", encoding="utf-8")
+            diff = (
+                "--- a/sample.txt\n"
+                "+++ b/sample.txt\n"
+                "@@ -1,3 +1,3 @@\n"
+                " target\n"
+                "-old\n"
+                "+new\n"
+                " tail\n"
+            )
+
+            rebased, corrected = rebase_unified_diff_hunks(diff, repo)
+
+            self.assertEqual(1, corrected)
+            self.assertIn("@@ -3,3 +3,3 @@", rebased)
+
+    def test_sandbox_copy_ignores_live_browser_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            destination = root / "sandbox"
+            repo.mkdir()
+            (repo / "sample.py").write_text("value = 1\n", encoding="utf-8")
+            profile = repo / ".playwright_profile"
+            profile.mkdir()
+            (profile / "SingletonLock").write_text("live", encoding="utf-8")
+
+            copy_repo_to_sandbox(repo, destination)
+
+            self.assertTrue((destination / "sample.py").is_file())
+            self.assertFalse((destination / ".playwright_profile").exists())
+
     def test_rule_based_repair_proposal_tracks_dry_run_and_test_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")
@@ -165,6 +253,14 @@ class AiRepairTest(unittest.TestCase):
             config = AppConfig(
                 raw={
                     "app": {"name": "ops"},
+                    "projects": [
+                        {
+                            "id": "prod",
+                            "name": "Production",
+                            "repo_root": str(repo),
+                            "test_commands": ["python -m unittest discover -s tests"],
+                        }
+                    ],
                     "ai": {
                         "repair": {
                             "provider": "openai_compatible",
@@ -173,7 +269,7 @@ class AiRepairTest(unittest.TestCase):
                         }
                     },
                 },
-                base_dir=repo,
+                base_dir=Path(tmp),
             )
             incident_id = storage.save_incident(
                 "critical",
@@ -998,6 +1094,83 @@ class AiRepairTest(unittest.TestCase):
         self.assertEqual(str(repo), prepared["runtime"]["repo_root"])
         self.assertEqual("", main_status)
 
+    def test_queue_worker_completes_approved_pr_deploy_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = create_git_sandbox_repo(root / "repo")
+            remote = create_bare_remote(root / "remote.git")
+            run_git_fixture(repo, ["remote", "add", "origin", str(remote)])
+            run_git_fixture(repo, ["push", "-u", "origin", "main"])
+            storage = Storage(root / "ops.db")
+            config = AppConfig(
+                raw={
+                    "projects": [
+                        {
+                            "id": "prod",
+                            "environment": "prod",
+                            "run_types": ["normal"],
+                            "repo_root": str(repo),
+                            "test_commands": ["python -m unittest discover -s tests"],
+                            "deploy_commands": ["python -m unittest discover -s tests"],
+                            "rollback_commands": ["python -m unittest discover -s tests"],
+                            "repair_policy": {"prepare_branch": True, "create_pr": True},
+                        }
+                    ],
+                    "ai": {
+                        "repair": {
+                            "provider": "openai_compatible",
+                            "model": "mock-repair-model",
+                            "mock_response": sandbox_patch_response(),
+                            "queue_worker": {"enabled": True, "max_actions_per_cycle": 1},
+                        }
+                    },
+                },
+                base_dir=root,
+            )
+            incident_id = storage.save_incident(
+                "critical",
+                "Ops Agent detected 1 issue(s)",
+                "analysis",
+                [CheckResult(source="http", name="Site", status="critical", summary="HTTP 500")],
+            )
+            proposal = build_ai_repair_proposal(
+                storage,
+                config,
+                incident_id,
+                request={"actor": "tester", "project_id": "prod"},
+            )
+            dry_run_ai_repair_proposal(storage, proposal["id"], actor="tester")
+            sandbox_test_ai_repair_proposal(storage, proposal["id"], repo, actor="tester")
+            storage.update_ai_repair_proposal_status(proposal["id"], "approved", actor="tester")
+
+            prepared_cycle = run_ai_repair_automation_cycle(storage, config)
+            prepared = storage.get_ai_repair_proposal(proposal["id"])
+            fake_bin = create_fake_gh(root / "bin-unmerged", "https://github.com/example/repo/pull/17")
+            with patched_path(fake_bin):
+                pr_cycle = run_ai_repair_automation_cycle(storage, config)
+            published = storage.get_ai_repair_proposal(proposal["id"])
+            branch_name = published["test_result"]["controlled_apply"]["branch_name"]
+            merge_branch_to_remote_main(remote, branch_name, root / "merge-clone")
+
+            with ok_http_server() as health_url:
+                config.raw["projects"][0]["health_urls"] = [health_url]
+                merged_bin = create_fake_gh(
+                    root / "bin-merged",
+                    "https://github.com/example/repo/pull/17",
+                    merged=True,
+                )
+                with patched_path(merged_bin):
+                    deploy_cycle = run_ai_repair_automation_cycle(storage, config)
+            deployed = storage.get_ai_repair_proposal(proposal["id"])
+            storage.close()
+
+        self.assertEqual("branch_prepared", prepared["status"])
+        self.assertEqual("prepare-branch", prepared_cycle["actions"][0]["action"])
+        self.assertEqual("pr_created", published["status"])
+        self.assertEqual("create-pr", pr_cycle["actions"][0]["action"])
+        self.assertEqual("deployed", deployed["status"])
+        self.assertEqual("deploy-merged", deploy_cycle["actions"][0]["action"])
+
     def test_ai_repair_queue_approval_does_not_require_project_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = create_sandbox_repo(Path(tmp) / "repo")
@@ -1398,6 +1571,14 @@ class AiRepairTest(unittest.TestCase):
             config = AppConfig(
                 raw={
                     "app": {"name": "ops"},
+                    "projects": [
+                        {
+                            "id": "prod",
+                            "name": "Production",
+                            "repo_root": str(repo),
+                            "test_commands": ["python -m unittest discover -s tests"],
+                        }
+                    ],
                     "ai": {
                         "repair": {
                             "provider": "openai_compatible",
@@ -1406,7 +1587,7 @@ class AiRepairTest(unittest.TestCase):
                         }
                     },
                 },
-                base_dir=repo,
+                base_dir=Path(tmp),
             )
             incident_id = storage.save_incident(
                 "critical",
@@ -1419,7 +1600,7 @@ class AiRepairTest(unittest.TestCase):
             try:
                 proposal = post_json(
                     f"http://{host}:{port}/api/incidents/{incident_id}/ai-repair/propose",
-                    {"actor": "tester"},
+                    {"actor": "tester", "project_id": "prod"},
                 )
                 tested = post_json(
                     f"http://{host}:{port}/api/ai-repairs/{proposal['id']}/sandbox-test",

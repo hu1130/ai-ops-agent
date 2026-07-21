@@ -7,6 +7,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from ops_agent.docker_identity import resolve_container_name
 from ops_agent.events import CheckResult
 
 
@@ -40,20 +41,46 @@ def run_docker_check(check: dict[str, Any]) -> CheckResult:
         timeout=timeout_seconds,
     )
     if completed.returncode != 0:
+        identity = resolve_container_name(check, runner=subprocess.run, timeout_seconds=timeout_seconds)
+        resolved = str(identity.get("resolved_container") or container)
+        if resolved != container:
+            completed = subprocess.run(
+                ["docker", "inspect", "--format", "{{json .State}}", resolved],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds,
+            )
+            if completed.returncode == 0:
+                state = parse_state(completed.stdout)
+                return result_from_state(name, resolved, state, check, identity=identity)
         error = (completed.stderr or completed.stdout or "").strip()
         return CheckResult(
             source="docker",
             name=name,
             status=status_value(check, "missing_status", "critical"),
             summary=f"Docker inspect failed: {container}",
-            details={"container": container, "error": error, **alert_policy_details(check)},
+            details={
+                "container": container,
+                "configured_container": container,
+                "container_resolution": identity,
+                "error": error,
+                **alert_policy_details(check),
+            },
         )
 
     state = parse_state(completed.stdout)
     return result_from_state(name, container, state, check)
 
 
-def result_from_state(name: str, container: str, state: dict[str, Any], check: dict[str, Any]) -> CheckResult:
+def result_from_state(
+    name: str,
+    container: str,
+    state: dict[str, Any],
+    check: dict[str, Any],
+    identity: dict[str, Any] | None = None,
+) -> CheckResult:
     container_status = str(state.get("Status") or "").strip().lower()
     running = bool(state.get("Running"))
     health = state.get("Health") if isinstance(state.get("Health"), dict) else {}
@@ -61,6 +88,8 @@ def result_from_state(name: str, container: str, state: dict[str, Any], check: d
 
     details = {
         "container": container,
+        "configured_container": str(check.get("container") or container),
+        "container_resolution": identity or {},
         "container_status": container_status,
         "running": running,
         "health_status": health_status,

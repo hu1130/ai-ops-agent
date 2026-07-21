@@ -1,2 +1,4 @@
 # Optional. The agent runs without this, but psutil enables CPU and memory checks.
 psutil>=5.9.0
+PyMySQL>=1.1.0
+oss2>=2.19.0

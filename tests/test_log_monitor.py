@@ -1,12 +1,44 @@
 import tempfile
 import unittest
 from pathlib import Path
+import subprocess
 from unittest.mock import Mock, patch
 
 from ops_agent.monitors.log_monitor import run_log_check
 
 
 class LogMonitorTest(unittest.TestCase):
+    @patch("ops_agent.monitors.log_monitor.subprocess.run")
+    def test_resolves_recreated_compose_container_before_reading_logs(self, run) -> None:
+        missing = subprocess.CompletedProcess([], 1, stdout="", stderr="No such container")
+        listing = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=(
+                '{"Names":"40d66a351638_ai-customer-service-semp-api-1",'
+                '"Image":"api:latest","State":"running","Status":"Up",'
+                '"Labels":"com.docker.compose.project=ai-customer-service,'
+                'com.docker.compose.service=semp-api"}'
+            ),
+            stderr="",
+        )
+        healthy_log = subprocess.CompletedProcess([], 0, stdout="request completed\n", stderr="")
+        run.side_effect = [missing, listing, healthy_log]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_log_check(
+                {
+                    "name": "secondary API log",
+                    "container": "ai-customer-service-semp-api-1",
+                    "project_id": "ai-customer-service",
+                    "compose_service": "semp-api",
+                },
+                Path(tmp),
+            )
+
+        self.assertEqual("ok", result.status)
+        self.assertEqual("40d66a351638_ai-customer-service-semp-api-1", result.details["container"])
+
     def test_run_log_check_finds_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
