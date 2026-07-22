@@ -3511,6 +3511,30 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def latest_results_for_target(
+        self,
+        since_iso: str,
+        environment: str,
+        run_type: str,
+        source: str,
+        name: str,
+        limit: int = 100,
+    ) -> list[dict]:
+        with self.lock:
+            where, params = context_where(environment, run_type)
+            where.extend(["created_at >= ?", "source = ?", "name = ?"])
+            params.extend([since_iso, source, name])
+            rows = self.connection.execute(
+                f"""
+                select * from check_results
+                where {' and '.join(where)}
+                order by id desc
+                limit ?
+                """,
+                (*params, min(max(int(limit or 100), 1), 500)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def recent_incidents(
         self,
         since_iso: str,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -200,6 +201,26 @@ class OpsScheduler:
                 ok_results_by_context.setdefault(context_key, {})[key] = result
 
         if recovery_enabled:
+            persisted_recoveries = self.reconcile_persisted_recoveries(
+                {
+                    (result.environment or "prod", result.run_type or "normal")
+                    for result in results
+                },
+                recovery_threshold,
+            )
+            for incident_id, incident_results in persisted_recoveries.items():
+                recovery_incident_ids.add(incident_id)
+                for result in incident_results:
+                    target_key = check_key(result)
+                    if target_key not in {check_key(item) for item in recoveries}:
+                        recoveries.append(result)
+                    state = self._issues.setdefault(target_key, IssueState())
+                    state.failure_count = 0
+                    state.recovery_count = 0
+                    state.is_open = False
+                    state.last_summary = result.summary
+                    state.incident_id = None
+
             existing_recovery_keys = {check_key(result) for result in recoveries}
             for (environment, run_type), ok_results_by_key in ok_results_by_context.items():
                 recovered_incidents = self.storage.find_recoverable_active_incidents(
@@ -368,6 +389,59 @@ class OpsScheduler:
                 "ok",
                 incident_id=notification_incident_id,
             )
+
+    def reconcile_persisted_recoveries(
+        self,
+        contexts: set[tuple[str, str]],
+        default_recovery_threshold: int,
+    ) -> dict[int, list[CheckResult]]:
+        recovered: dict[int, list[CheckResult]] = {}
+        enabled_targets = enabled_report_target_keys(self.config)
+        managed_sources = explicitly_managed_target_sources(self.config)
+
+        for environment, run_type in contexts:
+            for incident in self.storage.active_fingerprint_incidents(environment, run_type):
+                incident_id = int(incident["id"])
+                target_keys = fingerprint_target_keys(str(incident.get("fingerprint") or ""))
+                monitored_targets = {
+                    split_target_key(target_key)
+                    for target_key in target_keys
+                    if target_key_is_monitored(target_key, enabled_targets, managed_sources)
+                }
+                monitored_targets.discard(("", ""))
+                disabled_targets = sorted(target_keys - {f"{source}:{name}" for source, name in monitored_targets})
+
+                if not monitored_targets:
+                    self.storage.transition_incident(
+                        incident_id,
+                        "closed",
+                        actor="scheduler",
+                        note="monitor target disabled or removed",
+                        metadata={"disabled_targets": sorted(target_keys)},
+                    )
+                    continue
+
+                stable_results = persisted_stable_results(
+                    self.storage,
+                    incident,
+                    monitored_targets,
+                    default_recovery_threshold,
+                )
+                if len(stable_results) != len(monitored_targets):
+                    continue
+
+                self.storage.transition_incident(
+                    incident_id,
+                    "resolved",
+                    actor="scheduler",
+                    note="monitor recovered from persisted checks",
+                    metadata={
+                        "recovered_checks": [check_key(result) for result in stable_results],
+                        "ignored_disabled_targets": disabled_targets,
+                    },
+                )
+                recovered[incident_id] = stable_results
+        return recovered
 
     def update_existing_incident(
         self,
@@ -1384,6 +1458,98 @@ def recovery_threshold_for_result(result: CheckResult, default_threshold: int) -
         if value > 0:
             return value
     return max(1, int(default_threshold or 1))
+
+
+def explicitly_managed_target_sources(config: AppConfig) -> set[str]:
+    source_keys = {
+        "http": "http_checks",
+        "json_api": "json_checks",
+        "business_flow": "business_flow_checks",
+        "docker": "docker_checks",
+        "database": "database_checks",
+        "log": "log_checks",
+        "server": "server_checks",
+        "discovery": "asset_discovery",
+        "backup": "backups",
+    }
+    managed = {source for source, key in source_keys.items() if key in config.raw}
+    if "fleet" in config.raw:
+        managed.update({"fleet", "fleet_project", "fleet_resource"})
+    return managed
+
+
+def split_target_key(target_key: str) -> tuple[str, str]:
+    if ":" not in target_key:
+        return "", ""
+    source, name = target_key.split(":", 1)
+    return source, name
+
+
+def target_key_is_monitored(
+    target_key: str,
+    enabled_targets: set[tuple[str, str]],
+    managed_sources: set[str],
+) -> bool:
+    source, name = split_target_key(target_key)
+    if not source or not name:
+        return False
+    if source not in managed_sources:
+        return True
+    return (source, name) in enabled_targets or (source, "*") in enabled_targets
+
+
+def persisted_stable_results(
+    storage: Storage,
+    incident: dict,
+    targets: set[tuple[str, str]],
+    default_recovery_threshold: int,
+) -> list[CheckResult]:
+    since_iso = str(incident.get("last_seen_at") or incident.get("created_at") or "")
+    environment = str(incident.get("environment") or "prod")
+    run_type = str(incident.get("run_type") or "normal")
+    stable: list[CheckResult] = []
+
+    for source, name in sorted(targets):
+        rows = storage.latest_results_for_target(
+            since_iso,
+            environment,
+            run_type,
+            source,
+            name,
+            limit=250,
+        )
+        if not rows:
+            continue
+        latest = check_result_from_storage_row(rows[0])
+        threshold = recovery_threshold_for_result(latest, default_recovery_threshold)
+        consecutive_successes = 0
+        for row in rows:
+            if str(row.get("status") or "") in {"warning", "critical"}:
+                break
+            consecutive_successes += 1
+        if consecutive_successes >= threshold:
+            stable.append(latest)
+    return stable
+
+
+def check_result_from_storage_row(row: dict) -> CheckResult:
+    try:
+        details = json.loads(str(row.get("details_json") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        details = {}
+    if not isinstance(details, dict):
+        details = {}
+    return CheckResult(
+        source=str(row.get("source") or ""),
+        name=str(row.get("name") or ""),
+        status=str(row.get("status") or "ok"),
+        summary=str(row.get("summary") or ""),
+        details=details,
+        created_at=str(row.get("created_at") or ""),
+        environment=str(row.get("environment") or "prod"),
+        run_type=str(row.get("run_type") or "normal"),
+        trace_id=str(row.get("trace_id") or ""),
+    )
 
 
 def action_failed(result: ActionResult) -> bool:

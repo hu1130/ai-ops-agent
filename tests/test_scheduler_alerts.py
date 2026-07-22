@@ -1032,6 +1032,121 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertEqual(1, len(notifier.sent))
         self.assertEqual("AI自动化运维工具：2 个问题已恢复", notifier.sent[0][0])
 
+    def test_multi_target_incident_recovers_from_staggered_persisted_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 1, "recovery_enabled": True},
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "http_checks": [{"name": "Site", "url": "https://example.com"}],
+                    "json_checks": [{"name": "Chat", "url": "https://example.com/chat"}],
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            incident_id = storage.save_incident(
+                "critical",
+                "AI自动化运维工具：发现 2 个问题",
+                "analysis",
+                [
+                    CheckResult(source="http", name="Site", status="critical", summary="Request failed"),
+                    CheckResult(source="json_api", name="Chat", status="warning", summary="Slow response"),
+                ],
+                fingerprint="prod:normal:http:Site|json_api:Chat",
+            )
+            storage.save_results([CheckResult(source="http", name="Site", status="ok", summary="HTTP 200")])
+            storage.save_results([CheckResult(source="json_api", name="Chat", status="ok", summary="Fast response")])
+
+            notifier = RecordingNotifier()
+            restarted_scheduler = OpsScheduler(config, storage, notifier)
+            restarted_scheduler.process_alert_states(
+                [CheckResult(source="http", name="Site", status="ok", summary="HTTP 200")]
+            )
+            resolved = storage.get_incident(incident_id)
+            events = storage.latest_incident_events(incident_id)
+            storage.close()
+
+        self.assertEqual("resolved", resolved["status"])
+        self.assertTrue(any(event["note"] == "monitor recovered from persisted checks" for event in events))
+        self.assertEqual("AI自动化运维工具：2 个问题已恢复", notifier.sent[0][0])
+
+    def test_removed_monitor_target_does_not_block_other_targets_from_recovering(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 1, "recovery_enabled": True},
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "http_checks": [{"name": "Site", "url": "https://example.com"}],
+                    "docker_checks": [],
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            incident_id = storage.save_incident(
+                "critical",
+                "AI自动化运维工具：发现 2 个问题",
+                "analysis",
+                [
+                    CheckResult(source="http", name="Site", status="critical", summary="Request failed"),
+                    CheckResult(source="docker", name="Removed", status="critical", summary="Exited"),
+                ],
+                fingerprint="prod:normal:docker:Removed|http:Site",
+            )
+            storage.save_results([CheckResult(source="http", name="Site", status="ok", summary="HTTP 200")])
+
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            scheduler.process_alert_states(
+                [CheckResult(source="http", name="Site", status="ok", summary="HTTP 200")]
+            )
+            resolved = storage.get_incident(incident_id)
+            events = storage.latest_incident_events(incident_id)
+            storage.close()
+
+        self.assertEqual("resolved", resolved["status"])
+        recovery_event = next(event for event in events if event["to_status"] == "resolved")
+        recovery_metadata = json.loads(recovery_event["metadata_json"])
+        self.assertIn("docker:Removed", recovery_metadata["ignored_disabled_targets"])
+        self.assertEqual("AI自动化运维工具：1 个问题已恢复", notifier.sent[0][0])
+
+    def test_incident_with_only_removed_targets_is_closed_without_recovery_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AppConfig(
+                raw={
+                    "alerts": {"consecutive_failures": 1, "recovery_enabled": True},
+                    "app": {"environment": "prod", "run_type": "normal"},
+                    "http_checks": [{"name": "Current", "url": "https://example.com"}],
+                    "ai": {"enabled": False},
+                    "remediation": {"enabled": False, "mode": "off"},
+                },
+                base_dir=Path(tmp),
+            )
+            storage = Storage(Path(tmp) / "ops.db")
+            incident_id = storage.save_incident(
+                "warning",
+                "Old monitor",
+                "analysis",
+                [CheckResult(source="http", name="Removed", status="warning", summary="Old failure")],
+                fingerprint="prod:normal:http:Removed",
+            )
+
+            notifier = RecordingNotifier()
+            scheduler = OpsScheduler(config, storage, notifier)
+            scheduler.process_alert_states(
+                [CheckResult(source="http", name="Current", status="ok", summary="HTTP 200")]
+            )
+            closed = storage.get_incident(incident_id)
+            events = storage.latest_incident_events(incident_id)
+            storage.close()
+
+        self.assertEqual("closed", closed["status"])
+        self.assertTrue(any(event["note"] == "monitor target disabled or removed" for event in events))
+        self.assertEqual([], notifier.sent)
+
     def test_playbook_halt_skips_remaining_steps_after_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = AppConfig(
