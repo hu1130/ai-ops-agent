@@ -818,6 +818,36 @@ Use `GET /api/config/ai-repair-auto-trigger` to inspect the effective policy. Us
 
 `GET /api/projects/repair-readiness` reports whether each project is ready for AI repair: repository path availability, safe test commands, configured model key, loaded context files, skipped/missing files, and effective repair policy. Use this before allowing DeepSeek to generate patches for a real business project.
 
+### Project discovery and binding
+
+The dashboard groups running Docker containers into business project candidates. Docker Compose labels are preferred, so an API, database, Redis, and web container from the same Compose project appear as one project.
+
+- `GET /api/project-onboarding` returns discovered candidates, evidence, assets, binding state, and configured projects.
+- `POST /api/project-onboarding/{candidate_id}/bind` persists the selection and creates or updates Docker monitor targets. This endpoint requires an admin token.
+- `GET /api/projects/capabilities` returns the selected and currently available automation level for every project.
+
+Binding modes are `managed`, `observe_only`, and `ignored`. Newly discovered projects are not managed automatically. `observe_only` and `ignored` are restricted to `monitor_only`.
+
+Automation levels are enforced by the backend:
+
+1. `monitor_only`: detect and notify only.
+2. `runtime_self_heal`: allow approved runtime remediation such as service or container restart.
+3. `code_suggest`: read a bound repository and generate or sandbox-test a patch suggestion.
+4. `pull_request`: prepare a controlled branch and create a pull request.
+5. `full_closure`: deploy a merged repair, verify health URLs, and run configured rollback commands on failure.
+
+Example binding request:
+
+```json
+{
+  "management_mode": "managed",
+  "automation_level": "runtime_self_heal",
+  "actor": "admin"
+}
+```
+
+Code repair levels remain blocked until that project's `repo_root` and the required Git, test, deployment, rollback, and health-check settings are present. A project without a bound repository still benefits from monitoring and runtime remediation, but the agent cannot inspect or modify its source code.
+
 Model repair proposals can include bounded repository context so DeepSeek/OpenAI-compatible models can generate concrete reviewable diffs instead of guessing. Configure it globally under `ai.repair.repository_context`, and optionally add project-level `repair_context_files`:
 
 ```json

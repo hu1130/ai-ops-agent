@@ -4,6 +4,7 @@ import json
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 from ops_agent.config import AppConfig, load_config
 from ops_agent.dashboard import render_page, start_dashboard
@@ -12,6 +13,60 @@ from ops_agent.storage import Storage
 
 
 class DashboardTest(unittest.TestCase):
+    def test_project_onboarding_and_capability_apis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            raw = {
+                "app": {"interval_seconds": 60},
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+                "projects": [
+                    {
+                        "id": "sales",
+                        "name": "Sales",
+                        "management_mode": "observe_only",
+                        "automation_level": "monitor_only",
+                    }
+                ],
+            }
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = AppConfig(raw=raw, base_dir=Path(tmp), config_path=config_path)
+            storage = Storage(Path(tmp) / "ops.db")
+            snapshot = {
+                "status": "warning",
+                "summary": {"detected_projects": 1, "bound_projects": 0, "unbound_projects": 1},
+                "candidates": [{"id": "compose--sales", "name": "sales"}],
+                "projects": [],
+                "error": "",
+            }
+            bound = {"status": "bound", "project": {"id": "sales", "name": "Sales"}}
+            with patch("ops_agent.dashboard.project_onboarding_snapshot", return_value=snapshot), patch(
+                "ops_agent.dashboard.bind_project_candidate", return_value=bound
+            ) as bind:
+                server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+                host, port = server.server_address
+                try:
+                    with urllib.request.urlopen(f"http://{host}:{port}/api/project-onboarding", timeout=5) as response:
+                        onboarding = json.loads(response.read().decode("utf-8"))
+                    with urllib.request.urlopen(f"http://{host}:{port}/api/projects/capabilities", timeout=5) as response:
+                        capabilities = json.loads(response.read().decode("utf-8"))
+                    request = urllib.request.Request(
+                        f"http://{host}:{port}/api/project-onboarding/compose--sales/bind",
+                        data=json.dumps({"management_mode": "managed", "actor": "tester"}).encode("utf-8"),
+                        method="POST",
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        binding = json.loads(response.read().decode("utf-8"))
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    storage.close()
+
+        self.assertEqual("compose--sales", onboarding["candidates"][0]["id"])
+        self.assertEqual(5, len(capabilities["levels"]))
+        self.assertEqual("bound", binding["status"])
+        bind.assert_called_once()
+
     def test_dashboard_summary_counts_recent_results(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")
@@ -573,10 +628,10 @@ class DashboardTest(unittest.TestCase):
             html = render_page(storage)
             storage.close()
 
-        self.assertIn("事件中心", html)
-        self.assertIn("当前监控目标", html)
-        self.assertIn("AI 客服", html)
-        self.assertIn("下一步建议", html)
+        self.assertIn("AI自动化运维工具", html)
+        self.assertIn("现在需要做", html)
+        self.assertIn("项目", html)
+        self.assertIn("记录", html)
 
     def test_incident_lifecycle_api_transitions_incident(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

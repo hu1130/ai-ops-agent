@@ -391,6 +391,11 @@ def run_ai_repair_queue_next_action(
     if next_action.get("type") and action_type != next_action.get("type") and not bool(request_payload.get("force")):
         raise ValueError(f"next action is {next_action.get('type')}, not {action_type}")
 
+    project = repair_project_from_context(config, repair, request_payload)
+    from ops_agent.project_capabilities import ensure_project_action_allowed
+
+    ensure_project_action_allowed(project, action_type)
+
     runtime = empty_queue_action_runtime()
     note = str(request_payload.get("note") or request_payload.get("reason") or f"queue next action: {action_type}")
     if action_type == "dry-run":
@@ -958,6 +963,10 @@ def run_ai_repair_pipeline_for_incident(
     diagnosis_rows = storage.latest_incident_diagnoses(incident_id, limit=1)
     diagnosis = diagnosis_rows[0] if diagnosis_rows else {}
     project = select_repair_project(config, incident, diagnosis, request_payload)
+    from ops_agent.project_capabilities import ensure_project_action_allowed
+
+    requested_action = "create-pr" if bool(create_pr) or bool(prepare_branch) else "sandbox-test"
+    ensure_project_action_allowed(project, requested_action)
     effective_repo_root = resolve_repair_repo_root(config, project, request_payload, repo_root)
     effective_commands = commands if commands is not None else string_list(project.get("test_commands"))
     effective_remote = str(request_payload.get("remote") or project.get("git_remote") or remote)
@@ -1000,6 +1009,9 @@ def run_project_ai_repair_drill(
     project = find_repair_project_by_id(config, project_id)
     if not project:
         raise ValueError(f"project not found: {project_id}")
+    from ops_agent.project_capabilities import ensure_project_action_allowed
+
+    ensure_project_action_allowed(project, "drill")
 
     request_payload = safe_dict(request)
     project_key = str(project.get("id") or project_id)
@@ -4218,7 +4230,24 @@ def ai_repair_policy_from_config(config: AppConfig | None, project: dict[str, An
     repair_config = safe_dict(safe_dict(config.raw.get("ai")).get("repair"))
     policy = safe_dict(repair_config.get("policy"))
     policy.update(safe_dict(safe_dict(project).get("repair_policy")))
-    return normalize_ai_repair_policy(policy)
+    normalized = normalize_ai_repair_policy(policy)
+    project_payload = safe_dict(project)
+    if bool(project_payload.get("automation_level_configured")) or str(
+        project_payload.get("automation_level") or ""
+    ).strip():
+        from ops_agent.project_capabilities import LEVEL_RANK, normalize_automation_level
+
+        level = normalize_automation_level(project_payload.get("automation_level"))
+        if LEVEL_RANK[level] < LEVEL_RANK["code_suggest"]:
+            normalized["enabled"] = False
+            normalized["auto_approve"] = False
+            normalized["prepare_branch"] = False
+            normalized["create_pr"] = False
+        elif LEVEL_RANK[level] < LEVEL_RANK["pull_request"]:
+            normalized["auto_approve"] = False
+            normalized["prepare_branch"] = False
+            normalized["create_pr"] = False
+    return normalized
 
 
 def normalize_ai_repair_policy(value: Any) -> dict[str, Any]:

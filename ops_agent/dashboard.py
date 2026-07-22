@@ -4,7 +4,7 @@ import html
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from ops_agent.alerts.notifier import Notifier
 from ops_agent.auth import AuthResult, authenticate_token, configured_api_tokens, has_role
@@ -64,6 +64,8 @@ from ops_agent.operator_workflow import (
     build_operator_inbox,
     execute_primary_operator_action,
 )
+from ops_agent.project_capabilities import ensure_project_action_allowed, projects_capability_snapshot
+from ops_agent.project_onboarding import bind_project_candidate, project_onboarding_snapshot
 from ops_agent.projects import list_projects, project_summary_payload
 from ops_agent.scheduler import enabled_report_target_keys, filter_report_rows
 from ops_agent.remediation.approval import approval_expiry_from_config, approve_action_log, reject_action_log
@@ -80,6 +82,7 @@ from ops_agent.remediation.recommendations import (
     request_recommendation_approval,
 )
 from ops_agent.storage import Storage
+from ops_agent.simple_dashboard import render_simple_page
 
 
 ACTIONABLE_RECOMMENDATION_STATUSES = ["suggested", "pending_approval", "failed", "verified_failed", "skipped"]
@@ -141,6 +144,12 @@ def start_dashboard(
                     self.send_json({"error": "config is not configured"}, status=503)
                     return
                 self.send_json(discover_runtime_assets(config.raw))
+                return
+            if path == "/api/project-onboarding":
+                if config is None:
+                    self.send_json({"error": "config is not configured"}, status=503)
+                    return
+                self.send_json(project_onboarding_snapshot(config))
                 return
             if path == "/api/backups":
                 if config is None:
@@ -247,6 +256,9 @@ def start_dashboard(
                     self.send_json({"error": "config is not configured"}, status=503)
                     return
                 self.send_json(project_repair_readiness_snapshot(config))
+                return
+            if path == "/api/projects/capabilities":
+                self.send_json(projects_capability_snapshot(config, list_projects(config)))
                 return
             if path == "/api/monitor-targets":
                 self.send_json(list_monitor_targets(config.raw if config else {}))
@@ -427,6 +439,11 @@ def start_dashboard(
             path = self.path.split("?", 1)[0]
             auth = self.require_role(path, "operator")
             if auth is None:
+                return
+
+            onboarding_request = parse_project_onboarding_api_path(path)
+            if onboarding_request:
+                self.handle_project_onboarding_post(onboarding_request, auth)
                 return
 
             config_patch_request = parse_learning_config_patch_api_path(path)
@@ -741,6 +758,51 @@ def start_dashboard(
                 self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
                 self.send_json({"error": str(exc)}, status=500)
 
+        def handle_project_onboarding_post(
+            self,
+            onboarding_request: tuple[str, str],
+            auth: AuthResult,
+        ) -> None:
+            candidate_id, action = onboarding_request
+            path = self.path.split("?", 1)[0]
+            actor = "api"
+            if not has_role(auth.role, "admin"):
+                self.record_audit(path, 403, "forbidden", "admin role required", auth=auth)
+                self.send_json({"error": "admin role is required"}, status=403)
+                return
+            try:
+                body = self.read_json_body()
+                actor = self.actor_from_body(body, auth)
+                if action != "bind":
+                    self.record_audit(path, 404, "not_found", "unsupported onboarding action", actor=actor, auth=auth)
+                    self.send_json({"error": "unsupported onboarding action"}, status=404)
+                    return
+                if config is None or config.config_path is None:
+                    self.record_audit(path, 503, "error", "config path is not configured", actor=actor, auth=auth)
+                    self.send_json({"error": "config path is not configured"}, status=503)
+                    return
+                result = bind_project_candidate(config, candidate_id, body)
+                project = safe_body_dict(result.get("project"))
+                project_id = str(project.get("id") or "")
+                self.record_change_event(
+                    config_change_event_payload(
+                        "project_onboarding",
+                        f"Discovered project bound: {project_id}",
+                        result,
+                        actor,
+                        config,
+                        project_id=project_id,
+                    )
+                )
+                self.record_audit(path, 200, "success", f"project bound {project_id}", actor=actor, auth=auth)
+                self.send_json(result)
+            except ValueError as exc:
+                self.record_audit(path, 400, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), actor=actor, auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
+
         def handle_project_ai_repair_post(
             self,
             repair_request: tuple[str, str],
@@ -780,6 +842,15 @@ def start_dashboard(
                     self.record_audit(path, 404, "not_found", f"project not found: {project_id}", actor=actor, auth=auth)
                     self.send_json({"error": f"project not found: {project_id}"}, status=404)
                     return
+                project = next(
+                    (
+                        row
+                        for row in list_projects(config)
+                        if project_id in {str(row.get("id") or ""), str(row.get("name") or "")}
+                    ),
+                    {},
+                )
+                ensure_project_action_allowed(project, "drill")
                 if project_ready.get("status") == "blocked" and not bool(body.get("force")):
                     self.record_audit(
                         path,
@@ -852,6 +923,14 @@ def start_dashboard(
                 body = self.read_json_body()
                 actor = self.actor_from_body(body, auth)
                 note = str(body.get("note") or body.get("reason") or "")
+                if config is not None and action not in {"advance", "run-next", "next-action", "reject"}:
+                    repair_for_capability = storage.get_ai_repair_proposal(repair_id)
+                    if repair_for_capability:
+                        runtime_for_capability = queue_action_runtime(config, repair_for_capability, body)
+                        ensure_project_action_allowed(
+                            safe_body_dict(runtime_for_capability.get("project")),
+                            capability_action_for_repair_api(action, body),
+                        )
                 if action in {"advance", "run-next", "next-action"}:
                     updated = run_ai_repair_queue_next_action(
                         storage,
@@ -1932,6 +2011,22 @@ def filtered_dashboard_summary(
 
 def render_page(storage: Storage, config: AppConfig | None = None) -> str:
     summary = filtered_dashboard_summary(storage, config)
+    onboarding = (
+        project_onboarding_snapshot(config)
+        if config is not None
+        else {
+            "status": "warning",
+            "summary": {"detected_projects": 0, "bound_projects": 0, "unbound_projects": 0},
+            "candidates": [],
+            "projects": [],
+            "error": "config is not configured",
+        }
+    )
+    inbox = build_operator_inbox(storage, config, limit=30)
+    return render_simple_page(summary, onboarding, inbox, storage.latest_api_audit_logs(50))
+
+    # Kept temporarily because the helper renderers below are part of the public test surface.
+    summary = filtered_dashboard_summary(storage, config)
     incidents = storage.latest_incidents(12)
     results = storage.latest_results(60)
     latest_targets = sorted(
@@ -2240,6 +2335,16 @@ def parse_project_ai_repair_api_path(path: str) -> tuple[str, str] | None:
     return parts[2], parts[4]
 
 
+def parse_project_onboarding_api_path(path: str) -> tuple[str, str] | None:
+    prefix = "/api/project-onboarding/"
+    if not path.startswith(prefix):
+        return None
+    parts = [unquote(part) for part in path[len(prefix) :].split("/") if part]
+    if len(parts) != 2:
+        return None
+    return parts[0], parts[1]
+
+
 def parse_action_api_path(path: str) -> tuple[int, str] | None:
     parts = [part for part in path.strip("/").split("/") if part]
     if len(parts) < 3 or parts[0] != "api" or parts[1] != "actions":
@@ -2353,6 +2458,11 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         operation_name = (action or "read").replace("-", "_")
         return f"ai_repair.project_{operation_name}", "project", None
 
+    onboarding_request = parse_project_onboarding_api_path(path)
+    if onboarding_request:
+        _candidate_id, action = onboarding_request
+        return f"project.onboarding_{action.replace('-', '_')}", "project", None
+
     recommendation_request = parse_recommendation_api_path(path)
     if recommendation_request:
         recommendation_id, action = recommendation_request
@@ -2394,6 +2504,8 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/projects": ("project.list", "project", None),
         "/api/projects/summary": ("project.summary", "project", None),
         "/api/projects/repair-readiness": ("project.repair_readiness", "project", None),
+        "/api/projects/capabilities": ("project.capabilities", "project", None),
+        "/api/project-onboarding": ("project.onboarding", "project", None),
         "/api/actions/failed": ("action.failed", "action", None),
         "/api/actions/pending": ("action.pending", "action", None),
         "/api/incidents": ("incident.list", "incident", None),
@@ -2421,6 +2533,19 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         "/api/results": ("result.list", "result", None),
     }
     return mapping.get(path, ("api.unknown", "", None))
+
+
+def capability_action_for_repair_api(action: str, body: dict) -> str:
+    normalized = str(action or "").strip()
+    if normalized in {"prepare-branch", "apply-approved", "prepare-pr", "create-pr", "publish-pr", "open-pr"}:
+        return "create-pr"
+    if normalized in {"deploy-merged", "deploy", "verify-deploy"}:
+        return "deploy-merged"
+    if normalized in {"run-pipeline", "pipeline", "autopilot"} and (
+        bool(body.get("prepare_branch")) or bool(body.get("create_pr"))
+    ):
+        return "create-pr"
+    return "sandbox-test"
 
 
 def status_from_incident_action(action: str, body: dict) -> str:

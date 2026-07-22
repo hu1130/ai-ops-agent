@@ -473,6 +473,14 @@ def normalize_project_payload(project: dict[str, Any]) -> dict[str, Any]:
         payload["run_types"] = ["normal"]
     if "environment" not in payload:
         payload["environment"] = "prod"
+    if "management_mode" in payload:
+        from ops_agent.project_capabilities import normalize_management_mode
+
+        payload["management_mode"] = normalize_management_mode(payload.get("management_mode"))
+    if "automation_level" in payload:
+        from ops_agent.project_capabilities import normalize_automation_level
+
+        payload["automation_level"] = normalize_automation_level(payload.get("automation_level"))
     return payload
 
 

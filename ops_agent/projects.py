@@ -81,6 +81,13 @@ def public_project(item: dict[str, Any], index: int, app: dict[str, Any]) -> dic
         "owners": string_list(item.get("owners")),
         "repair_context_files": string_list(item.get("repair_context_files") or item.get("context_files")),
         "repair_policy": dict(item.get("repair_policy")) if isinstance(item.get("repair_policy"), dict) else {},
+        "management_mode": str(item.get("management_mode") or "managed"),
+        "management_mode_configured": bool(str(item.get("management_mode") or "").strip()),
+        "automation_level": str(item.get("automation_level") or ""),
+        "automation_level_configured": bool(str(item.get("automation_level") or "").strip()),
+        "discovery_bindings": (
+            dict(item.get("discovery_bindings")) if isinstance(item.get("discovery_bindings"), dict) else {}
+        ),
     }
 
 
@@ -106,6 +113,11 @@ def default_project(app: dict[str, Any]) -> dict[str, Any]:
         "owners": [],
         "repair_context_files": [],
         "repair_policy": {},
+        "management_mode": "managed",
+        "management_mode_configured": False,
+        "automation_level": "",
+        "automation_level_configured": False,
+        "discovery_bindings": {},
     }
 
 
