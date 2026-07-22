@@ -5,6 +5,34 @@ from ops_agent.events import CheckResult
 
 
 class IncidentClassifierTest(unittest.TestCase):
+    def test_fleet_node_offline_has_specific_classification(self) -> None:
+        result = CheckResult(
+            source="fleet",
+            name="node/server-1",
+            status="critical",
+            summary="服务器 server-1 已失联 240 秒",
+            details={"node_id": "server-1", "heartbeat_age_seconds": 240, "discovery": {"status": "ok"}},
+        )
+
+        classification = classify_incident([result])
+
+        self.assertEqual("node_offline", classification.category)
+        self.assertGreaterEqual(classification.confidence, 0.9)
+
+    def test_fleet_discovery_failure_is_not_project_outage(self) -> None:
+        result = CheckResult(
+            source="fleet",
+            name="node/server-1",
+            status="warning",
+            summary="服务器在线，但项目探测失败",
+            details={"node_id": "server-1", "discovery": {"status": "warning", "error": "docker timeout"}},
+        )
+
+        classification = classify_incident([result])
+
+        self.assertEqual("probe_config_issue", classification.category)
+        self.assertIn("不按真实业务故障", classification.summary)
+
     def test_http_fallback_reachable_is_probe_config_issue(self) -> None:
         result = CheckResult(
             source="http",

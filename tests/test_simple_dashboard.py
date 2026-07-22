@@ -34,6 +34,32 @@ class SimpleDashboardTest(unittest.TestCase):
         self.assertIn('data-management-mode="managed"', html)
         self.assertNotIn('onclick="bindProject(', html)
 
+    def test_server_view_keeps_node_actions_in_data_attributes(self) -> None:
+        html = render_simple_page(
+            {"current_status": "ok", "latest_targets": []},
+            {"summary": {}, "candidates": [], "projects": []},
+            {"items": []},
+            [],
+            {
+                "summary": {"total": 1, "online": 1, "offline": 0, "disabled": 0},
+                "nodes": [
+                    {
+                        "node_id": "server-1",
+                        "name": "Production",
+                        "hostname": "prod-1",
+                        "status": "online",
+                        "heartbeat_age_seconds": 4,
+                        "projects": [{"candidate_id": "compose--sales"}],
+                        "metrics": {"disk_percent": 42.5},
+                    }
+                ],
+            },
+        )
+
+        self.assertIn('data-node-id="server-1"', html)
+        self.assertIn('data-node-action="disable"', html)
+        self.assertIn("1 台服务器在线", html)
+
 
 if __name__ == "__main__":
     unittest.main()

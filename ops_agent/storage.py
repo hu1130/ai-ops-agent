@@ -237,6 +237,25 @@ class Storage:
                     metadata_json text not null default '{}'
                 );
 
+                create table if not exists fleet_nodes (
+                    node_id text primary key,
+                    created_at text not null,
+                    updated_at text not null,
+                    last_seen_at text not null,
+                    name text not null default '',
+                    hostname text not null default '',
+                    address text not null default '',
+                    agent_version text not null default '',
+                    platform text not null default '',
+                    enabled integer not null default 1,
+                    labels_json text not null default '{}',
+                    capabilities_json text not null default '[]',
+                    metrics_json text not null default '{}',
+                    projects_json text not null default '[]',
+                    assets_json text not null default '[]',
+                    discovery_json text not null default '{}'
+                );
+
                 create table if not exists change_events (
                     id integer primary key autoincrement,
                     created_at text not null,
@@ -3321,6 +3340,82 @@ class Storage:
             self.connection.commit()
             return int(cursor.lastrowid)
 
+    def upsert_fleet_node(self, node: dict) -> dict:
+        node_id = str(node.get("node_id") or "").strip()
+        if not node_id:
+            raise ValueError("node_id is required")
+        now = utc_now_iso()
+        with self.lock:
+            existing = self.connection.execute(
+                "select node_id, created_at, enabled from fleet_nodes where node_id = ?",
+                (node_id,),
+            ).fetchone()
+            values = (
+                str(node.get("last_seen_at") or now),
+                str(node.get("name") or node_id),
+                str(node.get("hostname") or node_id),
+                str(node.get("address") or ""),
+                str(node.get("agent_version") or ""),
+                str(node.get("platform") or ""),
+                json.dumps(node.get("labels") or {}, ensure_ascii=False),
+                json.dumps(node.get("capabilities") or [], ensure_ascii=False),
+                json.dumps(node.get("metrics") or {}, ensure_ascii=False),
+                json.dumps(node.get("projects") or [], ensure_ascii=False),
+                json.dumps(node.get("assets") or [], ensure_ascii=False),
+                json.dumps(node.get("discovery") or {}, ensure_ascii=False),
+            )
+            if existing:
+                self.connection.execute(
+                    """
+                    update fleet_nodes
+                    set updated_at = ?, last_seen_at = ?, name = ?, hostname = ?, address = ?,
+                        agent_version = ?, platform = ?, labels_json = ?, capabilities_json = ?,
+                        metrics_json = ?, projects_json = ?, assets_json = ?, discovery_json = ?
+                    where node_id = ?
+                    """,
+                    (now, *values, node_id),
+                )
+            else:
+                self.connection.execute(
+                    """
+                    insert into fleet_nodes (
+                        node_id, created_at, updated_at, last_seen_at, name, hostname, address,
+                        agent_version, platform, enabled, labels_json, capabilities_json,
+                        metrics_json, projects_json, assets_json, discovery_json
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (node_id, now, now, *values[:6], 1, *values[6:]),
+                )
+            self.connection.commit()
+        return self.get_fleet_node(node_id) or {}
+
+    def get_fleet_node(self, node_id: str) -> dict | None:
+        with self.lock:
+            row = self.connection.execute(
+                "select * from fleet_nodes where node_id = ?",
+                (node_id,),
+            ).fetchone()
+        return decode_fleet_node(row) if row else None
+
+    def list_fleet_nodes(self) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                "select * from fleet_nodes order by name, node_id"
+            ).fetchall()
+        return [decode_fleet_node(row) for row in rows]
+
+    def set_fleet_node_enabled(self, node_id: str, enabled: bool) -> dict:
+        with self.lock:
+            cursor = self.connection.execute(
+                "update fleet_nodes set enabled = ?, updated_at = ? where node_id = ?",
+                (1 if enabled else 0, utc_now_iso(), node_id),
+            )
+            if int(cursor.rowcount or 0) <= 0:
+                self.connection.rollback()
+                raise ValueError(f"fleet node not found: {node_id}")
+            self.connection.commit()
+        return self.get_fleet_node(node_id) or {}
+
     def finish_backup_run(
         self,
         run_id: int,
@@ -4699,3 +4794,22 @@ def build_test_clause(test_environments: Sequence[str], test_run_types: Sequence
         clauses.append(f"run_type in ({','.join('?' for _ in run_types)})")
         params.extend(run_types)
     return " or ".join(clauses), params
+
+
+def decode_fleet_node(row: object) -> dict:
+    item = dict(row)  # type: ignore[arg-type]
+    for column, output, fallback in (
+        ("labels_json", "labels", {}),
+        ("capabilities_json", "capabilities", []),
+        ("metrics_json", "metrics", {}),
+        ("projects_json", "projects", []),
+        ("assets_json", "assets", []),
+        ("discovery_json", "discovery", {}),
+    ):
+        try:
+            item[output] = json.loads(str(item.get(column) or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            item[output] = fallback
+        item.pop(column, None)
+    item["enabled"] = bool(item.get("enabled", 1))
+    return item

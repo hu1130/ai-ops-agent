@@ -28,6 +28,7 @@ def render_simple_page(
     onboarding: dict[str, Any],
     inbox: dict[str, Any],
     audit_logs: list[dict[str, Any]],
+    fleet: dict[str, Any] | None = None,
 ) -> str:
     active = safe_int(summary.get("active_problem_count"))
     current_status = str(summary.get("current_status") or "ok")
@@ -37,6 +38,9 @@ def render_simple_page(
     problem_rows = [item for item in safe_list(inbox.get("items")) if isinstance(item, dict)]
     candidates = [item for item in safe_list(onboarding.get("candidates")) if isinstance(item, dict)]
     projects = [item for item in safe_list(onboarding.get("projects")) if isinstance(item, dict)]
+    fleet = safe_dict(fleet)
+    fleet_summary = safe_dict(fleet.get("summary"))
+    nodes = [item for item in safe_list(fleet.get("nodes")) if isinstance(item, dict)]
     payload = json.dumps({"onboarding": onboarding}, ensure_ascii=False).replace("</", "<\\/")
 
     return f"""<!doctype html>
@@ -92,6 +96,7 @@ def render_simple_page(
   <header class="topbar"><div class="topbar-inner"><div class="brand">AI自动化运维工具</div><div class="live"><span class="dot"></span>监控运行中</div></div></header>
   <nav class="tabs" aria-label="主要页面"><div class="tablist" role="tablist">
     <button class="tab active" data-view="home" role="tab">首页</button>
+    <button class="tab" data-view="servers" role="tab">服务器 <span class="muted">{len(nodes)}</span></button>
     <button class="tab" data-view="projects" role="tab">项目 <span class="muted">{len(candidates)}</span></button>
     <button class="tab" data-view="records" role="tab">记录</button>
   </div></nav>
@@ -103,6 +108,11 @@ def render_simple_page(
       </div>
       <h2>现在需要做</h2>
       <div class="list">{render_problem_items(problem_rows)}</div>
+    </section>
+    <section id="servers" class="view">
+      <div class="status"><div><h1>{safe_int(fleet_summary.get('online'))} 台服务器在线</h1><div class="muted">共 {safe_int(fleet_summary.get('total'))} 台 · 失联 {safe_int(fleet_summary.get('offline'))} 台 · 已停用 {safe_int(fleet_summary.get('disabled'))} 台</div></div><button class="btn" onclick="location.reload()">刷新</button></div>
+      <h2>服务器</h2>
+      <div class="project-grid">{render_fleet_nodes(nodes)}</div>
     </section>
     <section id="projects" class="view">
       <div class="status"><div><h1>发现 {safe_int(safe_dict(onboarding.get('summary')).get('detected_projects'))} 个项目</h1><div class="muted">已绑定 {safe_int(safe_dict(onboarding.get('summary')).get('bound_projects'))} 个 · 待选择 {safe_int(safe_dict(onboarding.get('summary')).get('unbound_projects'))} 个</div></div><button class="btn" onclick="location.reload()">重新扫描</button></div>
@@ -128,8 +138,10 @@ def render_simple_page(
     async function post(url, body) {{ const headers={{'Content-Type':'application/json'}}; const value=token(); if(value)headers.Authorization='Bearer '+value; const response=await fetch(url,{{method:'POST',headers,body:JSON.stringify(body)}}); const data=await response.json(); if(!response.ok)throw new Error(data.error||'操作失败'); return data; }}
     async function bindProject(id, mode) {{ try {{ const select=document.querySelector(`[data-level="${{id}}"]`); const level=mode==='managed'?select.value:'monitor_only'; await post('/api/project-onboarding/'+encodeURIComponent(id)+'/bind',{{management_mode:mode,automation_level:level,actor:'dashboard'}}); toast('项目设置已保存'); setTimeout(()=>location.reload(),700); }} catch(error) {{ toast(error.message); }} }}
     async function incidentAction(id) {{ try {{ await post('/api/incidents/'+id+'/operator-action',{{actor:'dashboard'}}); toast('处理动作已执行'); setTimeout(()=>location.reload(),700); }} catch(error) {{ toast(error.message); }} }}
+    async function nodeAction(id, action) {{ try {{ await post('/api/fleet/nodes/'+encodeURIComponent(id)+'/'+action,{{actor:'dashboard'}}); toast('服务器设置已保存'); setTimeout(()=>location.reload(),700); }} catch(error) {{ toast(error.message); }} }}
     document.querySelectorAll('[data-bind-project]').forEach(button => button.addEventListener('click', () => bindProject(button.dataset.candidateId,button.dataset.managementMode)));
     document.querySelectorAll('[data-incident-action]').forEach(button => button.addEventListener('click', () => incidentAction(button.dataset.incidentAction)));
+    document.querySelectorAll('[data-node-action]').forEach(button => button.addEventListener('click', () => nodeAction(button.dataset.nodeId,button.dataset.nodeAction)));
   </script>
 </body>
 </html>"""
@@ -178,6 +190,36 @@ def render_candidates(candidates: list[dict[str, Any]]) -> str:
             f'<article class="item"><div class="item-head"><div><h3>{escape(item.get("name") or candidate_id)}</h3><div class="muted">{escape(item.get("evidence") or "自动识别")}</div></div><span class="mode">{escape(MODE_LABELS.get(mode, mode))}</span></div>'
             f'<ul class="assets">{assets}</ul><div class="project-controls"><label>自动化级别<select data-level="{escape(candidate_id)}">{options}</select></label>'
             f'<div class="actions"><button class="btn primary" data-bind-project data-candidate-id="{escape(candidate_id)}" data-management-mode="managed">托管</button><button class="btn" data-bind-project data-candidate-id="{escape(candidate_id)}" data-management-mode="observe_only">只读</button><button class="btn danger" data-bind-project data-candidate-id="{escape(candidate_id)}" data-management-mode="ignored">忽略</button></div></div></article>'
+        )
+    return "".join(rows)
+
+
+def render_fleet_nodes(nodes: list[dict[str, Any]]) -> str:
+    if not nodes:
+        return '<div class="empty">还没有接入其他服务器。</div>'
+    labels = {"online": "在线", "offline": "失联", "disabled": "已停用"}
+    rows = []
+    for item in nodes:
+        node_id = str(item.get("node_id") or "")
+        status = str(item.get("status") or "offline")
+        metrics = safe_dict(item.get("metrics"))
+        project_count = len(safe_list(item.get("projects")))
+        metric_text = " · ".join(
+            value
+            for value in (
+                f"CPU {escape(metrics.get('cpu_percent'))}%" if metrics.get("cpu_percent") is not None else "",
+                f"内存 {escape(metrics.get('memory_percent'))}%" if metrics.get("memory_percent") is not None else "",
+                f"磁盘 {escape(metrics.get('disk_percent'))}%" if metrics.get("disk_percent") is not None else "",
+            )
+            if value
+        )
+        action = "enable" if status == "disabled" else "disable"
+        action_label = "恢复监控" if action == "enable" else "停止监控"
+        button_class = "btn primary" if action == "enable" else "btn danger"
+        rows.append(
+            f'<article class="item"><div class="item-head"><div><h3>{escape(item.get("name") or node_id)}</h3><div class="muted">{escape(item.get("hostname") or node_id)} · {project_count} 个项目</div></div><span class="mode">{labels.get(status, status)}</span></div>'
+            f'<div class="muted">{metric_text or "等待资源数据"}</div><div class="muted">最近上报 {safe_int(item.get("heartbeat_age_seconds"))} 秒前</div>'
+            f'<div class="actions"><button class="{button_class}" data-node-action="{action}" data-node-id="{escape(node_id)}">{action_label}</button></div></article>'
         )
     return "".join(rows)
 

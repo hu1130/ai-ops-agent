@@ -17,6 +17,8 @@ CATEGORY_LABELS = {
     "database_failure": "数据库故障",
     "monitor_coverage_gap": "监控覆盖缺口",
     "backup_failure": "备份或恢复演练失败",
+    "node_offline": "服务器失联",
+    "remote_project_missing": "远程项目停止运行",
     "unknown": "未知异常",
 }
 CATEGORY_LABELS["business_flow_failure"] = "业务流程失败"
@@ -75,12 +77,16 @@ def classify_signal(
         return classify_docker(result)
     if result.source == "server":
         return classify_server(result)
+    if result.source == "fleet_resource":
+        return classify_server(result)
     if result.source == "database":
         return classify_database(result)
     if result.source == "discovery":
         return classify_discovery(result)
     if result.source == "backup":
         return classify_backup(result)
+    if result.source in {"fleet", "fleet_project"}:
+        return classify_fleet(result)
     return unknown_classification(result)
 
 
@@ -537,6 +543,46 @@ def classify_backup(result: CheckResult) -> IncidentClassification:
             "先修复备份失败原因，不要删除现有可用备份。",
             "重新执行备份并在隔离目标中完成恢复演练。",
             "确认备份文件大小、校验和和恢复后的表数量。",
+        ],
+    )
+
+
+def classify_fleet(result: CheckResult) -> IncidentClassification:
+    details = result.details or {}
+    evidence = base_evidence(result)
+    node_id = str(details.get("node_id") or "")
+    if node_id:
+        evidence.append(f"服务器节点: {node_id}")
+    if result.source == "fleet_project":
+        return IncidentClassification(
+            category="remote_project_missing",
+            confidence=0.94,
+            summary="远程服务器仍在线，但已绑定项目不再出现在运行容器中。",
+            evidence=evidence,
+            next_steps=[
+                "先确认项目是否计划停机、改名或迁移到了其他服务器。",
+                "如果不是计划变更，查看该服务器上的容器状态和最近部署记录。",
+                "恢复项目后等待连续两次上报正常，系统会自动关闭事件。",
+            ],
+        )
+    discovery = safe_dict(details.get("discovery"))
+    if discovery.get("status") not in {"", "ok"}:
+        return IncidentClassification(
+            category="probe_config_issue",
+            confidence=0.84,
+            summary="服务器仍在上报，但暂时无法读取 Docker 项目列表，系统未把项目误判为停机。",
+            evidence=evidence + [f"项目探测错误: {discovery.get('error') or discovery.get('status')}"],
+            next_steps=["检查该服务器的 Docker 服务和采集进程权限。", "无需逐个重启业务项目。"],
+        )
+    return IncidentClassification(
+        category="node_offline",
+        confidence=0.96,
+        summary="中心端超过允许时间没有收到服务器心跳，无法确认该服务器上的项目状态。",
+        evidence=evidence,
+        next_steps=[
+            "确认服务器是否关机、断网或迁移。",
+            "检查远程 ops-agent-fleet 服务是否正在运行。",
+            "服务器恢复上报后等待连续两次正常，系统会自动关闭事件。",
         ],
     )
 

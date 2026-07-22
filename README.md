@@ -1159,3 +1159,50 @@ sudo scripts/cleanup_mysql_migration_artifacts.sh
 - 服务环境中配置 `GITHUB_TOKEN`/`GH_TOKEN`，或安装并登录 `gh`。
 
 DeepSeek 密钥只通过 `DEEPSEEK_API_KEY` 环境变量提供。GitHub 推送凭据和外部 dead-man heartbeat URL 属于部署凭据，未配置时系统会明确报告阻塞，不会自动降级为绕过 PR 的直接生产改码。
+
+## 多服务器自动纳管
+
+中心端开启 `fleet` 后，其他 Linux 服务器可以通过独立节点令牌上报心跳、资源快照和 Docker 项目。节点令牌只能调用注册和心跳接口，不能访问配置、审批、修复或部署接口。
+
+中心端配置：
+
+```json
+"fleet": {
+  "enabled": true,
+  "enrollment_token_env": "OPS_AGENT_FLEET_ENROLLMENT_TOKEN",
+  "heartbeat_interval_seconds": 60,
+  "offline_after_seconds": 180,
+  "alert_after_failures": 2,
+  "recovery_after_successes": 2
+}
+```
+
+在中心端服务环境中设置一个随机令牌：
+
+```bash
+OPS_AGENT_FLEET_ENROLLMENT_TOKEN="使用 openssl rand -hex 32 生成"
+```
+
+在需要纳管的服务器下载本仓库后执行：
+
+```bash
+export OPS_AGENT_FLEET_ENROLLMENT_TOKEN="与中心端相同的令牌"
+sudo -E scripts/install_fleet_agent.sh https://你的运维中心地址 server-1 "生产服务器 1"
+```
+
+安装完成后，页面会出现“服务器”和远程项目。管理员可以对服务器停止或恢复监控，并在“项目”页把自动发现的项目设置为托管、只读或忽略。
+
+判断规则：
+
+- 超过 `offline_after_seconds` 没有心跳时，先产生服务器失联信号。
+- 服务器在线且 Docker 探测正常，但已绑定项目消失时，才判断项目停止运行。
+- Docker 探测暂时失败时只报告探测问题，不会把该服务器上的所有项目误判为宕机。
+- 连续失败和连续恢复阈值继续由统一告警状态机控制，避免网络抖动反复发送邮件。
+
+远程采集器也可以不安装 systemd，手动验证一次：
+
+```bash
+export OPS_AGENT_FLEET_SERVER_URL="https://你的运维中心地址"
+export OPS_AGENT_FLEET_ENROLLMENT_TOKEN="节点令牌"
+python3 -m ops_agent.cli --config config.json fleet-agent --node-id server-1 --once
+```

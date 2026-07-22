@@ -31,6 +31,13 @@ from ops_agent.config_center import (
 from ops_agent.diagnosis import persist_incident_diagnosis
 from ops_agent.discovery import discover_runtime_assets
 from ops_agent.enterprise import enterprise_readiness_snapshot
+from ops_agent.fleet import (
+    authenticate_fleet_token,
+    bind_fleet_project_candidate,
+    combined_onboarding_snapshot,
+    fleet_snapshot,
+    register_fleet_node,
+)
 from ops_agent.ai.config_patches import (
     apply_config_patch,
     build_config_patch_from_recommendation,
@@ -106,6 +113,10 @@ def start_dashboard(
                 auth = self.require_role(path, "viewer")
                 if auth is None:
                     return
+            if path == "/api/fleet/nodes" and not protect_reads:
+                auth = self.require_role(path, "viewer")
+                if auth is None:
+                    return
             if path == "/api/summary":
                 self.send_json(filtered_dashboard_summary(storage, config, **summary_filters_from_query(query)))
                 return
@@ -145,11 +156,14 @@ def start_dashboard(
                     return
                 self.send_json(discover_runtime_assets(config.raw))
                 return
+            if path == "/api/fleet/nodes":
+                self.send_json(fleet_snapshot(storage, config))
+                return
             if path == "/api/project-onboarding":
                 if config is None:
                     self.send_json({"error": "config is not configured"}, status=503)
                     return
-                self.send_json(project_onboarding_snapshot(config))
+                self.send_json(combined_onboarding_snapshot(storage, config, project_onboarding_snapshot(config)))
                 return
             if path == "/api/backups":
                 if config is None:
@@ -437,8 +451,16 @@ def start_dashboard(
 
         def do_POST(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
+            if path in {"/api/fleet/register", "/api/fleet/heartbeat"}:
+                self.handle_fleet_heartbeat_post(path)
+                return
             auth = self.require_role(path, "operator")
             if auth is None:
+                return
+
+            fleet_node_request = parse_fleet_node_api_path(path)
+            if fleet_node_request:
+                self.handle_fleet_node_post(fleet_node_request, auth)
                 return
 
             onboarding_request = parse_project_onboarding_api_path(path)
@@ -508,6 +530,71 @@ def start_dashboard(
                 self.send_json({"error": "not found"}, status=404)
                 return
             self.handle_incident_post(incident_request, auth)
+
+        def handle_fleet_heartbeat_post(self, path: str) -> None:
+            if config is None:
+                self.send_json({"error": "config is not configured"}, status=503)
+                return
+            token_name = authenticate_fleet_token(self.provided_token(), config)
+            if not token_name:
+                auth = AuthResult(authenticated=False, reason="invalid fleet enrollment token")
+                self.record_audit(path, 401, "unauthorized", auth.reason, auth=auth)
+                self.send_auth_error(401, "unauthorized")
+                return
+            auth = AuthResult(authenticated=True, role="fleet_node", token_name=token_name)
+            try:
+                content_length = int(self.headers.get("Content-Length", "0") or "0")
+                if content_length > 1_000_000:
+                    self.record_audit(path, 413, "error", "fleet heartbeat payload is too large", auth=auth)
+                    self.send_json({"error": "payload is too large"}, status=413)
+                    return
+                body = self.read_json_body()
+                node = register_fleet_node(storage, config, body, source_ip=self.client_ip())
+                self.record_audit(
+                    path,
+                    200,
+                    "success",
+                    f"fleet heartbeat accepted for {node.get('node_id')}",
+                    actor=str(node.get("node_id") or token_name),
+                    auth=auth,
+                )
+                self.send_json({"status": "online", "node": node})
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                self.record_audit(path, 400, "error", str(exc), auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
+
+        def handle_fleet_node_post(self, request: tuple[str, str], auth: AuthResult) -> None:
+            node_id, action = request
+            path = self.path.split("?", 1)[0]
+            if not has_role(auth.role, "admin"):
+                self.record_audit(path, 403, "forbidden", "admin role required", auth=auth)
+                self.send_json({"error": "admin role is required"}, status=403)
+                return
+            try:
+                if action not in {"enable", "disable"}:
+                    self.record_audit(path, 404, "not_found", "unsupported fleet node action", auth=auth)
+                    self.send_json({"error": "unsupported fleet node action"}, status=404)
+                    return
+                enabled = action == "enable"
+                updated = storage.set_fleet_node_enabled(node_id, enabled)
+                self.record_audit(
+                    path,
+                    200,
+                    "success",
+                    f"fleet node {'enabled' if enabled else 'disabled'}: {node_id}",
+                    actor=auth.token_name,
+                    auth=auth,
+                )
+                self.send_json({"status": "enabled" if enabled else "disabled", "node": updated})
+            except ValueError as exc:
+                self.record_audit(path, 404, "error", str(exc), auth=auth)
+                self.send_json({"error": str(exc)}, status=404)
+            except Exception as exc:
+                self.record_audit(path, 500, "error", str(exc), auth=auth)
+                self.send_json({"error": str(exc)}, status=500)
 
         def handle_incident_post(self, incident_request: tuple[int, str], auth: AuthResult) -> None:
             incident_id, action = incident_request
@@ -781,7 +868,11 @@ def start_dashboard(
                     self.record_audit(path, 503, "error", "config path is not configured", actor=actor, auth=auth)
                     self.send_json({"error": "config path is not configured"}, status=503)
                     return
-                result = bind_project_candidate(config, candidate_id, body)
+                result = (
+                    bind_fleet_project_candidate(storage, config, candidate_id, body)
+                    if candidate_id.startswith("fleet--")
+                    else bind_project_candidate(config, candidate_id, body)
+                )
                 project = safe_body_dict(result.get("project"))
                 project_id = str(project.get("id") or "")
                 self.record_change_event(
@@ -2012,7 +2103,7 @@ def filtered_dashboard_summary(
 def render_page(storage: Storage, config: AppConfig | None = None) -> str:
     summary = filtered_dashboard_summary(storage, config)
     onboarding = (
-        project_onboarding_snapshot(config)
+        combined_onboarding_snapshot(storage, config, project_onboarding_snapshot(config))
         if config is not None
         else {
             "status": "warning",
@@ -2023,7 +2114,13 @@ def render_page(storage: Storage, config: AppConfig | None = None) -> str:
         }
     )
     inbox = build_operator_inbox(storage, config, limit=30)
-    return render_simple_page(summary, onboarding, inbox, storage.latest_api_audit_logs(50))
+    return render_simple_page(
+        summary,
+        onboarding,
+        inbox,
+        storage.latest_api_audit_logs(50),
+        fleet_snapshot(storage, config),
+    )
 
     # Kept temporarily because the helper renderers below are part of the public test surface.
     summary = filtered_dashboard_summary(storage, config)
@@ -2345,6 +2442,13 @@ def parse_project_onboarding_api_path(path: str) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
+def parse_fleet_node_api_path(path: str) -> tuple[str, str] | None:
+    parts = [unquote(part) for part in path.strip("/").split("/") if part]
+    if len(parts) != 5 or parts[:3] != ["api", "fleet", "nodes"]:
+        return None
+    return parts[3], parts[4]
+
+
 def parse_action_api_path(path: str) -> tuple[int, str] | None:
     parts = [part for part in path.strip("/").split("/") if part]
     if len(parts) < 3 or parts[0] != "api" or parts[1] != "actions":
@@ -2420,6 +2524,13 @@ def parse_monitor_target_api_path(path: str) -> tuple[str, int | None, str] | No
 
 
 def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
+    fleet_request = parse_fleet_node_api_path(path)
+    if fleet_request:
+        _node_id, action = fleet_request
+        return f"fleet.node_{action.replace('-', '_')}", "fleet_node", None
+    if path in {"/api/fleet/register", "/api/fleet/heartbeat"}:
+        return "fleet.heartbeat", "fleet_node", None
+
     monitor_request = parse_monitor_target_api_path(path)
     if monitor_request:
         target_type, index, action = monitor_request

@@ -30,6 +30,22 @@
     "timeout_seconds": 5,
     "interval_seconds": 60
   },
+  "fleet": {
+    "enabled": false,
+    "enrollment_token_env": "OPS_AGENT_FLEET_ENROLLMENT_TOKEN",
+    "heartbeat_interval_seconds": 60,
+    "offline_after_seconds": 180,
+    "alert_after_failures": 2,
+    "recovery_after_successes": 2,
+    "resource_thresholds": {
+      "cpu_warning": 90,
+      "cpu_critical": 98,
+      "memory_warning": 85,
+      "memory_critical": 95,
+      "disk_warning": 85,
+      "disk_critical": 95
+    }
+  },
   "projects": [
     {
       "id": "prod",

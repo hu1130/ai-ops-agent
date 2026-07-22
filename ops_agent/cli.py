@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import socket
 import sys
 from urllib.parse import urlparse
 
@@ -11,6 +13,7 @@ from ops_agent.config import AppConfig, load_config
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.enterprise import enterprise_readiness_snapshot, format_enterprise_readiness
 from ops_agent.events import CheckResult, RunContext
+from ops_agent.fleet import run_fleet_agent
 from ops_agent.incident_lifecycle import INCIDENT_STATUSES
 from ops_agent.mysql_migration import MysqlExportOptions, export_sqlite_to_mysql, format_mysql_export_result
 from ops_agent.remediation import approval
@@ -40,6 +43,15 @@ def parse_args() -> argparse.Namespace:
     mysql_export_parser.add_argument("--schema-only", action="store_true", help="Export schema without data")
     mysql_export_parser.add_argument("--data-only", action="store_true", help="Export data without schema")
     mysql_export_parser.add_argument("--batch-size", type=int, default=200, help="INSERT batch size")
+
+    fleet_parser = subparsers.add_parser("fleet-agent", help="Report this server to a central Ops Agent")
+    fleet_parser.add_argument("--server-url", default="", help="Central Ops Agent URL; or OPS_AGENT_FLEET_SERVER_URL")
+    fleet_parser.add_argument("--node-id", default="", help="Stable node id; default uses the hostname")
+    fleet_parser.add_argument("--name", default="", help="Human-readable server name")
+    fleet_parser.add_argument("--token-env", default="OPS_AGENT_FLEET_ENROLLMENT_TOKEN", help="Enrollment token environment variable")
+    fleet_parser.add_argument("--interval-seconds", type=int, default=60, help="Heartbeat interval")
+    fleet_parser.add_argument("--timeout-seconds", type=int, default=10, help="Central server request timeout")
+    fleet_parser.add_argument("--once", action="store_true", help="Send one heartbeat and exit")
 
     plan_parser = subparsers.add_parser("remediation-plan", help="Build a remediation plan for a synthetic issue")
     plan_parser.add_argument("--source", default="json_api", help="Issue source, for example http/json_api/log/server")
@@ -143,6 +155,25 @@ def main() -> int:
         )
         print(format_mysql_export_result(result))
         return 0
+
+    if args.command == "fleet-agent":
+        server_url = str(args.server_url or os.environ.get("OPS_AGENT_FLEET_SERVER_URL", "")).strip()
+        token = os.environ.get(str(args.token_env or "OPS_AGENT_FLEET_ENROLLMENT_TOKEN"), "").strip()
+        node_id = str(args.node_id or socket.gethostname()).strip()
+        try:
+            return run_fleet_agent(
+                config,
+                server_url,
+                token,
+                node_id,
+                name=str(args.name or ""),
+                once=bool(args.once),
+                interval_seconds=max(15, int(args.interval_seconds or 60)),
+                timeout_seconds=max(1, int(args.timeout_seconds or 10)),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Fleet agent failed: {exc}", file=sys.stderr)
+            return 1
 
     if args.command == "remediation-plan":
         details = {}
@@ -821,6 +852,46 @@ def validate_config(config: AppConfig) -> list[str]:
             "asset_discovery.infrastructure_patterns",
             errors,
         )
+
+    fleet = dict(config.raw.get("fleet", {}))
+    if fleet:
+        if "enabled" in fleet and not isinstance(fleet["enabled"], bool):
+            errors.append("fleet.enabled 必须是 true/false")
+        validate_positive_int(fleet.get("heartbeat_interval_seconds", 60), "fleet.heartbeat_interval_seconds", errors)
+        validate_positive_int(fleet.get("offline_after_seconds", 180), "fleet.offline_after_seconds", errors)
+        validate_optional_positive_int(fleet.get("alert_after_failures"), "fleet.alert_after_failures", errors)
+        validate_optional_positive_int(fleet.get("recovery_after_successes"), "fleet.recovery_after_successes", errors)
+        token_env = fleet.get("enrollment_token_env", "OPS_AGENT_FLEET_ENROLLMENT_TOKEN")
+        if not isinstance(token_env, str) or not token_env.strip():
+            errors.append("fleet.enrollment_token_env 必须是非空字符串")
+        resource_thresholds = fleet.get("resource_thresholds", {})
+        if resource_thresholds and not isinstance(resource_thresholds, dict):
+            errors.append("fleet.resource_thresholds 必须是对象")
+        elif isinstance(resource_thresholds, dict):
+            defaults = {
+                "cpu_warning": 90,
+                "cpu_critical": 98,
+                "memory_warning": 85,
+                "memory_critical": 95,
+                "disk_warning": 85,
+                "disk_critical": 95,
+            }
+            for key, default in defaults.items():
+                value = resource_thresholds.get(key, default)
+                validate_positive_number(value, f"fleet.resource_thresholds.{key}", errors)
+                try:
+                    if float(value) > 100:
+                        errors.append(f"fleet.resource_thresholds.{key} 不能大于 100")
+                except (TypeError, ValueError):
+                    pass
+            for prefix in ("cpu", "memory", "disk"):
+                try:
+                    warning = float(resource_thresholds.get(f"{prefix}_warning", defaults[f"{prefix}_warning"]))
+                    critical = float(resource_thresholds.get(f"{prefix}_critical", defaults[f"{prefix}_critical"]))
+                    if warning >= critical:
+                        errors.append(f"fleet.resource_thresholds.{prefix}_warning 必须小于 critical")
+                except (TypeError, ValueError):
+                    pass
 
     backups = dict(config.raw.get("backups", {}))
     if backups:

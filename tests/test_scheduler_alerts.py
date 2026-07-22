@@ -109,6 +109,17 @@ class SchedulerAlertsTest(unittest.TestCase):
         self.assertNotIn("Disabled container", report)
         self.assertNotIn("Disk usage", report)
 
+    def test_daily_report_includes_dynamic_fleet_targets(self) -> None:
+        config = AppConfig(raw={"fleet": {"enabled": True}, "server_checks": {"enabled": False}}, base_dir=Path("."))
+        rows = [
+            {"source": "fleet", "name": "node/server-1", "status": "ok", "summary": "online"},
+            {"source": "fleet_project", "name": "server-1/sales", "status": "ok", "summary": "running"},
+        ]
+
+        filtered = filter_report_rows(rows, enabled_report_target_keys(config))
+
+        self.assertEqual(rows, filtered)
+
     def test_due_checks_skips_disabled_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

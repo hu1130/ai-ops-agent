@@ -34,6 +34,7 @@ from ops_agent.diagnosis import diagnostic_snapshot_evidence, persist_incident_d
 from ops_agent.discovery import run_asset_discovery_check
 from ops_agent.events import CheckResult, RunContext, apply_context
 from ops_agent.heartbeat import heartbeat_policy, send_success_heartbeat
+from ops_agent.fleet import run_fleet_node_checks
 from ops_agent.monitors.business_flow_monitor import run_business_flow_checks
 from ops_agent.monitors.database_monitor import run_database_checks
 from ops_agent.monitors.docker_monitor import run_docker_checks
@@ -135,6 +136,7 @@ class OpsScheduler:
             cycle_started_at,
         ):
             results.append(run_asset_discovery_check(self.config.raw))
+        results.extend(run_fleet_node_checks(self.storage, self.config))
         results.extend(run_backup_health_checks(self.storage, self.config))
         apply_context(results, context)
         if results:
@@ -1566,6 +1568,9 @@ def enabled_report_target_keys(config: AppConfig) -> set[tuple[str, str]]:
     if config.asset_discovery.get("enabled", False):
         targets.add(("discovery", str(config.asset_discovery.get("name") or "Runtime asset coverage")))
 
+    if safe_dict(config.raw.get("fleet")).get("enabled", False):
+        targets.update({("fleet", "*"), ("fleet_project", "*"), ("fleet_resource", "*")})
+
     backups = safe_dict(config.raw.get("backups"))
     if backups.get("enabled", False):
         for target in safe_list(backups.get("targets")):
@@ -1615,6 +1620,7 @@ def filter_report_rows(rows: list[dict], target_keys: set[tuple[str, str]]) -> l
         row
         for row in rows
         if (str(row.get("source") or ""), str(row.get("name") or "")) in target_keys
+        or (str(row.get("source") or ""), "*") in target_keys
     ]
 
 

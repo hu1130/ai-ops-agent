@@ -17,6 +17,7 @@ REQUIRED_MYSQL_TABLES = {
     "check_results",
     "incidents",
     "notification_logs",
+    "fleet_nodes",
 }
 
 
@@ -77,6 +78,7 @@ class MySQLStorage(Storage):
         )
         self.connection = MySQLConnectionAdapter(raw_connection)
         self.lock = RLock()
+        self.ensure_fleet_schema()
         self.verify_schema()
 
     def migrate(self) -> None:
@@ -91,6 +93,32 @@ class MySQLStorage(Storage):
         if missing:
             self.connection.close()
             raise RuntimeError("MySQL schema is incomplete; missing tables: " + ", ".join(missing))
+
+    def ensure_fleet_schema(self) -> None:
+        self.connection.execute(
+            """
+            create table if not exists fleet_nodes (
+                node_id varchar(64) not null,
+                created_at varchar(255) not null,
+                updated_at varchar(255) not null,
+                last_seen_at varchar(255) not null,
+                name varchar(255) not null,
+                hostname varchar(255) not null,
+                address varchar(255) not null,
+                agent_version varchar(80) not null,
+                platform varchar(255) not null,
+                enabled tinyint not null default 1,
+                labels_json longtext not null,
+                capabilities_json longtext not null,
+                metrics_json longtext not null,
+                projects_json longtext not null,
+                assets_json longtext not null,
+                discovery_json longtext not null,
+                primary key (node_id)
+            ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci
+            """
+        )
+        self.connection.commit()
 
     def vacuum(self) -> None:
         return None

@@ -120,6 +120,10 @@ def business_impact(category: str, severity: str) -> str:
         return "容器健康检查异常，服务可能仍可访问，但稳定性存在风险。"
     if category in {"service_unavailable", "dependency_failure", "business_flow_failure"}:
         return "可能已经影响用户访问或核心业务流程。"
+    if category == "node_offline":
+        return "中心端无法确认这台服务器及其项目状态，服务器可能断网、关机或采集服务停止。"
+    if category == "remote_project_missing":
+        return "服务器仍在线，但已绑定项目没有运行，可能已经影响该项目用户。"
     if severity == "critical":
         return "这是严重异常，可能已经影响用户，需要尽快确认。"
     return "当前是警告级异常，尚未确认造成真实业务中断。"
@@ -134,6 +138,10 @@ def operator_action(category: str, severity: str, action_state: dict[str, Any]) 
         return "只需审核系统生成的修复建议；审核前系统不会修改代码。"
     if category == "probe_config_issue":
         return "现在不用按网站宕机处理；安排同事修正监控配置即可。"
+    if category == "node_offline":
+        return "先确认服务器能否登录，再检查 ops-agent-fleet 服务；不要同时重启服务器上的所有项目。"
+    if category == "remote_project_missing":
+        return "确认是否计划停机；若不是，联系项目负责人查看容器和最近部署记录。"
     if severity == "critical":
         return "需要处理。请让项目负责人确认用户是否受影响，并查看最近发布或配置变更。"
     if category == "unknown":

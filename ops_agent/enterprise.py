@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from ops_agent.config import AppConfig
+from ops_agent.fleet import configured_fleet_tokens, fleet_policy
 from ops_agent.heartbeat import heartbeat_policy
 from ops_agent.monitor_targets import list_monitor_targets
 from ops_agent.projects import list_projects
@@ -164,6 +165,8 @@ def resilience_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
     backups = safe_dict(config.raw.get("backups"))
     heartbeat = heartbeat_policy(config)
     heartbeat_configured = bool(heartbeat.get("enabled")) and bool(heartbeat.get("url"))
+    fleet = fleet_policy(config)
+    fleet_tokens_ready = bool(configured_fleet_tokens(config))
     backup_targets = [
         item
         for item in safe_list(backups.get("targets"))
@@ -219,6 +222,24 @@ def resilience_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
             if heartbeat_configured
             else "External dead-man heartbeat is not configured.",
             {"enabled": bool(heartbeat.get("enabled")), "url_env": str(heartbeat.get("url_env") or "")},
+        ),
+        ReadinessCheck(
+            "resilience",
+            "multi_server_fleet",
+            "pass" if fleet["enabled"] and fleet_tokens_ready else "blocker" if fleet["enabled"] else "warning",
+            (
+                "Multi-server fleet enrollment is enabled."
+                if fleet["enabled"] and fleet_tokens_ready
+                else "Fleet is enabled but its enrollment token is missing."
+                if fleet["enabled"]
+                else "Multi-server fleet enrollment is disabled."
+            ),
+            {
+                "enabled": fleet["enabled"],
+                "enrollment_token_env": fleet["enrollment_token_env"],
+                "enrollment_ready": fleet_tokens_ready,
+                "offline_after_seconds": fleet["offline_after_seconds"],
+            },
         ),
     ]
 def remediation_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
