@@ -44,6 +44,7 @@ from ops_agent.monitors.json_api_monitor import run_json_checks
 from ops_agent.monitors.log_monitor import run_log_checks
 from ops_agent.monitors.server_monitor import run_server_checks
 from ops_agent.operator_guidance import build_operator_brief
+from ops_agent.projects import list_projects, project_matches_context
 from ops_agent.remediation.actions import ActionResult, RemediationAction
 from ops_agent.remediation.executor import MUTATING_ACTIONS, execute_action, format_action_plan
 from ops_agent.remediation.playbooks import (
@@ -140,6 +141,7 @@ class OpsScheduler:
         results.extend(run_fleet_node_checks(self.storage, self.config))
         results.extend(run_backup_health_checks(self.storage, self.config))
         apply_context(results, context)
+        assign_project_scope(results, self.config)
         if results:
             self.storage.save_results(results)
 
@@ -1273,10 +1275,55 @@ def check_key(result: CheckResult) -> str:
 
 def build_run_context(config: AppConfig) -> RunContext:
     app = dict(config.app)
+    identity = dict(config.raw.get("identity") or {})
     return RunContext(
         environment=clean_context_value(app.get("environment"), "prod"),
         run_type=clean_context_value(app.get("run_type"), "normal"),
+        organization_id=clean_context_value(
+            identity.get("organization_id") or app.get("organization_id"), "default"
+        ),
     )
+
+
+def assign_project_scope(results: list[CheckResult], config: AppConfig) -> None:
+    configured_checks = (
+        ("http", config.http_checks),
+        ("json_api", config.json_checks),
+        ("business_flow", config.business_flow_checks),
+        ("docker", config.docker_checks),
+        ("database", config.database_checks),
+        ("log", config.log_checks),
+    )
+    explicit: dict[tuple[str, str], str] = {}
+    for source, checks in configured_checks:
+        for check in checks:
+            name = str(check.get("name") or "").strip()
+            project_id = str(check.get("project_id") or "").strip()
+            if name and project_id:
+                explicit[(source, name)] = project_id
+
+    projects = [project for project in list_projects(config) if bool(project.get("enabled", True))]
+    for result in results:
+        if result.project_id:
+            continue
+        details_project = str(result.details.get("project_id") or "").strip()
+        if details_project:
+            result.project_id = details_project
+            continue
+        configured_project = explicit.get((result.source, result.name), "")
+        if configured_project:
+            result.project_id = configured_project
+            continue
+        matching = [
+            project
+            for project in projects
+            if project_matches_context(
+                project,
+                {"environment": result.environment, "run_type": result.run_type},
+            )
+        ]
+        if len(matching) == 1 and result.source not in {"server", "fleet", "fleet_resource", "backup"}:
+            result.project_id = str(matching[0].get("id") or "")
 
 
 def context_from_results(results: list[CheckResult]) -> RunContext:
@@ -1474,7 +1521,7 @@ def explicitly_managed_target_sources(config: AppConfig) -> set[str]:
     }
     managed = {source for source, key in source_keys.items() if key in config.raw}
     if "fleet" in config.raw:
-        managed.update({"fleet", "fleet_project", "fleet_resource"})
+        managed.update({"fleet", "fleet_agent", "fleet_project", "fleet_resource"})
     return managed
 
 
@@ -1735,7 +1782,7 @@ def enabled_report_target_keys(config: AppConfig) -> set[tuple[str, str]]:
         targets.add(("discovery", str(config.asset_discovery.get("name") or "Runtime asset coverage")))
 
     if safe_dict(config.raw.get("fleet")).get("enabled", False):
-        targets.update({("fleet", "*"), ("fleet_project", "*"), ("fleet_resource", "*")})
+        targets.update({("fleet", "*"), ("fleet_agent", "*"), ("fleet_project", "*"), ("fleet_resource", "*")})
 
     backups = safe_dict(config.raw.get("backups"))
     if backups.get("enabled", False):

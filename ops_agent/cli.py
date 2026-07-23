@@ -8,7 +8,7 @@ import sys
 from urllib.parse import urlparse
 
 from ops_agent.alerts.notifier import Notifier
-from ops_agent.auth import ROLE_ORDER
+from ops_agent.auth import API_TOKEN_ROLES
 from ops_agent.config import AppConfig, load_config
 from ops_agent.diagnostics.collector import collect_diagnostics, format_snapshot
 from ops_agent.enterprise import enterprise_readiness_snapshot, format_enterprise_readiness
@@ -747,6 +747,8 @@ def validate_config(config: AppConfig) -> list[str]:
         validate_positive_int(check.get("max_running_threads", 20), f"{field}.max_running_threads", errors)
 
     for index, check in enumerate(config.log_checks):
+        if "enabled" in check and not isinstance(check["enabled"], bool):
+            errors.append(f"log_checks[{index}].enabled 必须是 true/false")
         validate_optional_positive_int(check.get("alert_after_failures"), f"log_checks[{index}].alert_after_failures", errors)
         validate_optional_positive_int(check.get("consecutive_failures"), f"log_checks[{index}].consecutive_failures", errors)
         if "status_on_match" in check:
@@ -762,7 +764,7 @@ def validate_config(config: AppConfig) -> list[str]:
             errors.append(f"log_checks[{index}].path 或 container 不能为空")
             continue
         path = config.resolve_path(path_value)
-        if not path.exists():
+        if check.get("enabled", True) and not path.exists():
             errors.append(f"log_checks[{index}].path 不存在: {path_value}")
 
     alerts = config.alerts
@@ -1230,7 +1232,7 @@ def validate_api_auth_config(app: dict, errors: list[str]) -> None:
             if "token" in item and not isinstance(item["token"], str):
                 errors.append(f"{field}.token 必须是字符串")
             role = str(item.get("role", "viewer")).strip().lower()
-            if role not in ROLE_ORDER:
+            if role not in API_TOKEN_ROLES:
                 errors.append(f"{field}.role 必须是 viewer/operator/admin")
         return
     if isinstance(tokens, dict):
@@ -1240,7 +1242,7 @@ def validate_api_auth_config(app: dict, errors: list[str]) -> None:
                 if "token" in value and not isinstance(value["token"], str):
                     errors.append(f"{field}.token 必须是字符串")
                 role = str(value.get("role", "viewer")).strip().lower()
-                if role not in ROLE_ORDER:
+                if role not in API_TOKEN_ROLES:
                     errors.append(f"{field}.role 必须是 viewer/operator/admin")
             elif not isinstance(value, str):
                 errors.append(f"{field} 必须是字符串或对象")

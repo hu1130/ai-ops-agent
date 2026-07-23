@@ -18,6 +18,11 @@ REQUIRED_MYSQL_TABLES = {
     "incidents",
     "notification_logs",
     "fleet_nodes",
+    "organizations",
+    "users",
+    "auth_sessions",
+    "api_credentials",
+    "fleet_enrollment_tokens",
 }
 
 
@@ -79,6 +84,8 @@ class MySQLStorage(Storage):
         self.connection = MySQLConnectionAdapter(raw_connection)
         self.lock = RLock()
         self.ensure_fleet_schema()
+        self.ensure_scope_columns()
+        self.ensure_identity_schema()
         self.verify_schema()
 
     def migrate(self) -> None:

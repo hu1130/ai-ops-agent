@@ -33,6 +33,8 @@ class Storage:
                 create table if not exists check_results (
                     id integer primary key autoincrement,
                     created_at text not null,
+                    organization_id text not null default 'default',
+                    project_id text not null default '',
                     environment text not null default 'prod',
                     run_type text not null default 'normal',
                     trace_id text not null default '',
@@ -47,6 +49,8 @@ class Storage:
                     id integer primary key autoincrement,
                     created_at text not null,
                     updated_at text,
+                    organization_id text not null default 'default',
+                    project_id text not null default '',
                     environment text not null default 'prod',
                     run_type text not null default 'normal',
                     trace_id text not null default '',
@@ -256,6 +260,71 @@ class Storage:
                     discovery_json text not null default '{}'
                 );
 
+                create table if not exists organizations (
+                    id text primary key,
+                    name text not null,
+                    status text not null default 'active',
+                    created_at text not null,
+                    updated_at text not null
+                );
+
+                create table if not exists users (
+                    id integer primary key autoincrement,
+                    organization_id text not null default 'default',
+                    email text not null,
+                    display_name text not null default '',
+                    password_hash text not null,
+                    role text not null default 'viewer',
+                    project_ids_json text not null default '[]',
+                    enabled integer not null default 1,
+                    created_at text not null,
+                    updated_at text not null,
+                    last_login_at text
+                );
+
+                create table if not exists auth_sessions (
+                    id integer primary key autoincrement,
+                    organization_id text not null default 'default',
+                    user_id integer not null,
+                    token_hash text not null,
+                    expires_at text not null,
+                    created_at text not null,
+                    last_seen_at text not null,
+                    revoked_at text
+                );
+
+                create table if not exists api_credentials (
+                    id integer primary key autoincrement,
+                    organization_id text not null default 'default',
+                    name text not null,
+                    token_hash text not null,
+                    token_prefix text not null default '',
+                    role text not null default 'viewer',
+                    project_ids_json text not null default '[]',
+                    enabled integer not null default 1,
+                    expires_at text,
+                    created_at text not null,
+                    created_by text not null default '',
+                    last_used_at text,
+                    revoked_at text
+                );
+
+                create table if not exists fleet_enrollment_tokens (
+                    id integer primary key autoincrement,
+                    organization_id text not null default 'default',
+                    name text not null,
+                    token_hash text not null,
+                    token_prefix text not null default '',
+                    allowed_node_id text not null default '',
+                    enabled integer not null default 1,
+                    expires_at text,
+                    created_at text not null,
+                    created_by text not null default '',
+                    last_used_at text,
+                    use_count integer not null default 0,
+                    revoked_at text
+                );
+
                 create table if not exists change_events (
                     id integer primary key autoincrement,
                     created_at text not null,
@@ -378,15 +447,30 @@ class Storage:
                     on change_events (project_id, created_at, id);
                 create index if not exists idx_change_events_related
                     on change_events (related_incident_id, related_ai_repair_id, id);
+                create unique index if not exists idx_users_org_email
+                    on users (organization_id, email);
+                create unique index if not exists idx_auth_sessions_token
+                    on auth_sessions (token_hash);
+                create index if not exists idx_auth_sessions_user
+                    on auth_sessions (user_id, expires_at);
+                create unique index if not exists idx_api_credentials_token
+                    on api_credentials (token_hash);
+                create index if not exists idx_api_credentials_org
+                    on api_credentials (organization_id, enabled, id);
+                create unique index if not exists idx_fleet_enrollment_tokens_hash
+                    on fleet_enrollment_tokens (token_hash);
+                create index if not exists idx_fleet_enrollment_tokens_org
+                    on fleet_enrollment_tokens (organization_id, enabled, id);
                 """
             )
             self.ensure_context_columns()
+            self.ensure_scope_columns()
             self.connection.executescript(
                 """
                 create index if not exists idx_check_results_context
-                    on check_results (environment, run_type, created_at, id);
+                    on check_results (organization_id, project_id, environment, run_type, created_at, id);
                 create index if not exists idx_incidents_context
-                    on incidents (environment, run_type, created_at, id);
+                    on incidents (organization_id, project_id, environment, run_type, created_at, id);
                 """
             )
             self.ensure_incident_lifecycle_columns()
@@ -398,6 +482,134 @@ class Storage:
             self.ensure_ai_repair_proposal_columns()
             self.ensure_notification_log_columns()
             self.ensure_change_event_columns()
+            self.connection.commit()
+
+    def ensure_scope_columns(self) -> None:
+        tables = ("check_results", "incidents")
+        if getattr(self.connection, "backend", "sqlite") == "mysql":
+            for table in tables:
+                rows = self.connection.execute(
+                    """
+                    select column_name from information_schema.columns
+                    where table_schema = database() and table_name = ?
+                    """,
+                    (table,),
+                ).fetchall()
+                columns = {str(row.get("column_name") or row.get("COLUMN_NAME") or "") for row in rows}
+                if "organization_id" not in columns:
+                    self.connection.execute(
+                        f"alter table {table} add column organization_id varchar(80) not null default 'default'"
+                    )
+                if "project_id" not in columns:
+                    self.connection.execute(
+                        f"alter table {table} add column project_id varchar(120) not null default ''"
+                    )
+            self.connection.commit()
+            return
+        for table in tables:
+            columns = {
+                row["name"] for row in self.connection.execute(f"pragma table_info({table})").fetchall()
+            }
+            if "organization_id" not in columns:
+                self.connection.execute(
+                    f"alter table {table} add column organization_id text not null default 'default'"
+                )
+            if "project_id" not in columns:
+                self.connection.execute(
+                    f"alter table {table} add column project_id text not null default ''"
+                )
+
+    def ensure_identity_schema(self) -> None:
+        """Create identity tables on backends that do not run SQLite migrations."""
+        if getattr(self.connection, "backend", "sqlite") != "mysql":
+            return
+        statements = [
+            """
+            create table if not exists organizations (
+                id varchar(80) not null,
+                name varchar(255) not null,
+                status varchar(32) not null default 'active',
+                created_at varchar(255) not null,
+                updated_at varchar(255) not null,
+                primary key (id)
+            ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci
+            """,
+            """
+            create table if not exists users (
+                id bigint not null auto_increment,
+                organization_id varchar(80) not null default 'default',
+                email varchar(255) not null,
+                display_name varchar(255) not null default '',
+                password_hash varchar(512) not null,
+                role varchar(32) not null default 'viewer',
+                project_ids_json longtext not null,
+                enabled tinyint not null default 1,
+                created_at varchar(255) not null,
+                updated_at varchar(255) not null,
+                last_login_at varchar(255),
+                primary key (id),
+                unique key idx_users_org_email (organization_id, email)
+            ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci
+            """,
+            """
+            create table if not exists auth_sessions (
+                id bigint not null auto_increment,
+                organization_id varchar(80) not null default 'default',
+                user_id bigint not null,
+                token_hash varchar(64) not null,
+                expires_at varchar(255) not null,
+                created_at varchar(255) not null,
+                last_seen_at varchar(255) not null,
+                revoked_at varchar(255),
+                primary key (id),
+                unique key idx_auth_sessions_token (token_hash),
+                key idx_auth_sessions_user (user_id, expires_at)
+            ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci
+            """,
+            """
+            create table if not exists api_credentials (
+                id bigint not null auto_increment,
+                organization_id varchar(80) not null default 'default',
+                name varchar(255) not null,
+                token_hash varchar(64) not null,
+                token_prefix varchar(32) not null default '',
+                role varchar(32) not null default 'viewer',
+                project_ids_json longtext not null,
+                enabled tinyint not null default 1,
+                expires_at varchar(255),
+                created_at varchar(255) not null,
+                created_by varchar(255) not null default '',
+                last_used_at varchar(255),
+                revoked_at varchar(255),
+                primary key (id),
+                unique key idx_api_credentials_token (token_hash),
+                key idx_api_credentials_org (organization_id, enabled, id)
+            ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci
+            """,
+            """
+            create table if not exists fleet_enrollment_tokens (
+                id bigint not null auto_increment,
+                organization_id varchar(80) not null default 'default',
+                name varchar(255) not null,
+                token_hash varchar(64) not null,
+                token_prefix varchar(32) not null default '',
+                allowed_node_id varchar(64) not null default '',
+                enabled tinyint not null default 1,
+                expires_at varchar(255),
+                created_at varchar(255) not null,
+                created_by varchar(255) not null default '',
+                last_used_at varchar(255),
+                use_count bigint not null default 0,
+                revoked_at varchar(255),
+                primary key (id),
+                unique key idx_fleet_enrollment_tokens_hash (token_hash),
+                key idx_fleet_enrollment_tokens_org (organization_id, enabled, id)
+            ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci
+            """,
+        ]
+        with self.lock:
+            for statement in statements:
+                self.connection.execute(statement)
             self.connection.commit()
 
     def ensure_context_columns(self) -> None:
@@ -677,13 +889,16 @@ class Storage:
             self.connection.executemany(
                 """
                 insert into check_results (
-                    created_at, environment, run_type, trace_id, source, name, status, summary, details_json
+                    created_at, organization_id, project_id, environment, run_type, trace_id,
+                    source, name, status, summary, details_json
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         result.created_at,
+                        result.organization_id or "default",
+                        result.project_id or "",
                         result.environment or "prod",
                         result.run_type or "normal",
                         result.trace_id or "",
@@ -739,7 +954,7 @@ class Storage:
             cursor = self.connection.execute(
                 """
                 insert into incidents (
-                    created_at, updated_at, environment, run_type, trace_id,
+                    created_at, updated_at, organization_id, project_id, environment, run_type, trace_id,
                     fingerprint, occurrence_count, first_seen_at, last_seen_at, last_summary,
                     last_notification_at, last_notification_kind, status,
                     severity, title, analysis, results_json,
@@ -747,11 +962,13 @@ class Storage:
                     classification_evidence_json, classification_next_steps_json,
                     resolved_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     created_at,
                     created_at,
+                    common_value([result.organization_id for result in results], "default"),
+                    common_value([result.project_id for result in results], ""),
                     common_value([result.environment for result in results], "prod"),
                     common_value([result.run_type for result in results], "normal"),
                     common_value([result.trace_id for result in results], ""),
@@ -1109,9 +1326,17 @@ class Storage:
             ).fetchone()
         return dict(updated)
 
-    def latest_results(self, limit: int = 50, environment: str = "", run_type: str = "") -> list[dict]:
+    def latest_results(
+        self,
+        limit: int = 50,
+        environment: str = "",
+        run_type: str = "",
+        organization_id: str = "",
+        project_ids: Sequence[str] | None = None,
+    ) -> list[dict]:
         with self.lock:
             where, params = context_where(environment, run_type)
+            append_scope_where(where, params, organization_id, project_ids)
             where_sql = f"where {' and '.join(where)}" if where else ""
             rows = self.connection.execute(
                 f"""
@@ -1134,9 +1359,12 @@ class Storage:
         false_positive: bool | None = None,
         environment: str = "",
         run_type: str = "",
+        organization_id: str = "",
+        project_ids: Sequence[str] | None = None,
     ) -> list[dict]:
         with self.lock:
             where, params = context_where(environment, run_type)
+            append_scope_where(where, params, organization_id, project_ids)
             if status:
                 where.append("status = ?")
                 params.append(status)
@@ -3299,9 +3527,17 @@ class Storage:
         with self.lock:
             self.connection.execute("vacuum")
 
-    def recent_results(self, since_iso: str, environment: str = "", run_type: str = "") -> list[dict]:
+    def recent_results(
+        self,
+        since_iso: str,
+        environment: str = "",
+        run_type: str = "",
+        organization_id: str = "",
+        project_ids: Sequence[str] | None = None,
+    ) -> list[dict]:
         with self.lock:
             where, params = context_where(environment, run_type)
+            append_scope_where(where, params, organization_id, project_ids)
             where.append("created_at >= ?")
             params.append(since_iso)
             rows = self.connection.execute(
@@ -3541,9 +3777,12 @@ class Storage:
         limit: int = 100,
         environment: str = "",
         run_type: str = "",
+        organization_id: str = "",
+        project_ids: Sequence[str] | None = None,
     ) -> list[dict]:
         with self.lock:
             where, params = context_where(environment, run_type)
+            append_scope_where(where, params, organization_id, project_ids)
             where.append("created_at >= ?")
             params.append(since_iso)
             rows = self.connection.execute(
@@ -3557,10 +3796,18 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def dashboard_summary(self, hours: int = 24, environment: str = "", run_type: str = "") -> dict:
+    def dashboard_summary(
+        self,
+        hours: int = 24,
+        environment: str = "",
+        run_type: str = "",
+        organization_id: str = "",
+        project_ids: Sequence[str] | None = None,
+    ) -> dict:
         since = datetime.now(timezone.utc) - timedelta(hours=hours)
         with self.lock:
             where, params = context_where(environment, run_type)
+            append_scope_where(where, params, organization_id, project_ids)
             where.append("created_at >= ?")
             params.append(since.isoformat())
             result_where = " and ".join(where)
@@ -3586,6 +3833,7 @@ class Storage:
             ).fetchall()
 
             incident_where, incident_params = context_where(environment, run_type)
+            append_scope_where(incident_where, incident_params, organization_id, project_ids)
             incident_where.append("created_at >= ?")
             incident_params.append(since.isoformat())
             incident_counts = self.connection.execute(
@@ -3967,6 +4215,372 @@ class Storage:
             },
         }
 
+    def ensure_organization(self, organization_id: str, name: str) -> dict:
+        organization_id = str(organization_id or "default").strip() or "default"
+        name = str(name or organization_id).strip() or organization_id
+        now = utc_now_iso()
+        with self.lock:
+            row = self.connection.execute(
+                "select * from organizations where id = ?", (organization_id,)
+            ).fetchone()
+            if row:
+                self.connection.execute(
+                    "update organizations set name = ?, updated_at = ? where id = ?",
+                    (name, now, organization_id),
+                )
+            else:
+                self.connection.execute(
+                    "insert into organizations (id, name, status, created_at, updated_at) values (?, ?, 'active', ?, ?)",
+                    (organization_id, name, now, now),
+                )
+            self.connection.commit()
+            saved = self.connection.execute(
+                "select * from organizations where id = ?", (organization_id,)
+            ).fetchone()
+        return dict(saved)
+
+    def identity_user_count(self, organization_id: str = "") -> int:
+        with self.lock:
+            if organization_id:
+                row = self.connection.execute(
+                    "select count(*) as total from users where organization_id = ?",
+                    (organization_id,),
+                ).fetchone()
+            else:
+                row = self.connection.execute("select count(*) as total from users").fetchone()
+        return int(row["total"] if row else 0)
+
+    def create_identity_user(
+        self,
+        organization_id: str,
+        email: str,
+        display_name: str,
+        password_hash: str,
+        role: str,
+        project_ids: Sequence[str] | None = None,
+    ) -> dict:
+        now = utc_now_iso()
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                insert into users (
+                    organization_id, email, display_name, password_hash, role,
+                    project_ids_json, enabled, created_at, updated_at
+                ) values (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    organization_id or "default",
+                    email,
+                    display_name,
+                    password_hash,
+                    role,
+                    json.dumps(list(project_ids or []), ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            user_id = int(cursor.lastrowid)
+            self.connection.commit()
+            row = self.connection.execute("select * from users where id = ?", (user_id,)).fetchone()
+        return dict(row)
+
+    def find_identity_user(self, organization_id: str, email: str) -> dict | None:
+        with self.lock:
+            row = self.connection.execute(
+                "select * from users where organization_id = ? and email = ? limit 1",
+                (organization_id or "default", email),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_identity_user(self, user_id: int) -> dict | None:
+        with self.lock:
+            row = self.connection.execute("select * from users where id = ?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_identity_users(self, organization_id: str = "default") -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                "select * from users where organization_id = ? order by id asc",
+                (organization_id or "default",),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_identity_user(
+        self,
+        user_id: int,
+        *,
+        display_name: str | None = None,
+        password_hash: str | None = None,
+        role: str | None = None,
+        project_ids: Sequence[str] | None = None,
+        enabled: bool | None = None,
+        last_login: bool = False,
+    ) -> dict:
+        assignments = ["updated_at = ?"]
+        params: list[object] = [utc_now_iso()]
+        for column, value in (
+            ("display_name", display_name),
+            ("password_hash", password_hash),
+            ("role", role),
+        ):
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                params.append(value)
+        if project_ids is not None:
+            assignments.append("project_ids_json = ?")
+            params.append(json.dumps(list(project_ids), ensure_ascii=False))
+        if enabled is not None:
+            assignments.append("enabled = ?")
+            params.append(1 if enabled else 0)
+        if last_login:
+            assignments.append("last_login_at = ?")
+            params.append(utc_now_iso())
+        params.append(user_id)
+        with self.lock:
+            cursor = self.connection.execute(
+                f"update users set {', '.join(assignments)} where id = ?", params
+            )
+            if cursor.rowcount <= 0:
+                raise ValueError(f"user not found: {user_id}")
+            self.connection.commit()
+            row = self.connection.execute("select * from users where id = ?", (user_id,)).fetchone()
+        return dict(row)
+
+    def create_auth_session(
+        self, organization_id: str, user_id: int, token_hash: str, expires_at: str
+    ) -> dict:
+        now = utc_now_iso()
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                insert into auth_sessions (
+                    organization_id, user_id, token_hash, expires_at, created_at, last_seen_at
+                ) values (?, ?, ?, ?, ?, ?)
+                """,
+                (organization_id or "default", user_id, token_hash, expires_at, now, now),
+            )
+            session_id = int(cursor.lastrowid)
+            self.connection.commit()
+            row = self.connection.execute("select * from auth_sessions where id = ?", (session_id,)).fetchone()
+        return dict(row)
+
+    def find_auth_session(self, token_hash: str) -> dict | None:
+        with self.lock:
+            row = self.connection.execute(
+                """
+                select s.*, u.email, u.display_name, u.role, u.project_ids_json,
+                       u.enabled as user_enabled
+                from auth_sessions s
+                inner join users u on u.id = s.user_id
+                where s.token_hash = ? and s.revoked_at is null
+                limit 1
+                """,
+                (token_hash,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def touch_auth_session(self, session_id: int) -> None:
+        with self.lock:
+            self.connection.execute(
+                "update auth_sessions set last_seen_at = ? where id = ?",
+                (utc_now_iso(), session_id),
+            )
+            self.connection.commit()
+
+    def revoke_auth_session(self, token_hash: str) -> bool:
+        with self.lock:
+            cursor = self.connection.execute(
+                "update auth_sessions set revoked_at = ? where token_hash = ? and revoked_at is null",
+                (utc_now_iso(), token_hash),
+            )
+            self.connection.commit()
+        return cursor.rowcount > 0
+
+    def revoke_user_sessions(self, user_id: int) -> int:
+        with self.lock:
+            cursor = self.connection.execute(
+                "update auth_sessions set revoked_at = ? where user_id = ? and revoked_at is null",
+                (utc_now_iso(), user_id),
+            )
+            self.connection.commit()
+        return int(cursor.rowcount)
+
+    def delete_expired_auth_sessions(self, now_iso: str) -> int:
+        with self.lock:
+            cursor = self.connection.execute(
+                "delete from auth_sessions where expires_at < ? or revoked_at is not null", (now_iso,)
+            )
+            self.connection.commit()
+        return int(cursor.rowcount)
+
+    def create_api_credential(
+        self,
+        organization_id: str,
+        name: str,
+        token_hash: str,
+        token_prefix: str,
+        role: str,
+        project_ids: Sequence[str] | None,
+        expires_at: str | None,
+        created_by: str,
+    ) -> dict:
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                insert into api_credentials (
+                    organization_id, name, token_hash, token_prefix, role, project_ids_json,
+                    enabled, expires_at, created_at, created_by
+                ) values (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                (
+                    organization_id or "default",
+                    name,
+                    token_hash,
+                    token_prefix,
+                    role,
+                    json.dumps(list(project_ids or []), ensure_ascii=False),
+                    expires_at,
+                    utc_now_iso(),
+                    created_by,
+                ),
+            )
+            credential_id = int(cursor.lastrowid)
+            self.connection.commit()
+            row = self.connection.execute(
+                "select * from api_credentials where id = ?", (credential_id,)
+            ).fetchone()
+        return dict(row)
+
+    def find_api_credential(self, token_hash: str) -> dict | None:
+        with self.lock:
+            row = self.connection.execute(
+                """
+                select * from api_credentials
+                where token_hash = ? and enabled = 1 and revoked_at is null
+                limit 1
+                """,
+                (token_hash,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_api_credentials(self, organization_id: str = "default") -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                "select * from api_credentials where organization_id = ? order by id desc",
+                (organization_id or "default",),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def touch_api_credential(self, credential_id: int) -> None:
+        with self.lock:
+            self.connection.execute(
+                "update api_credentials set last_used_at = ? where id = ?",
+                (utc_now_iso(), credential_id),
+            )
+            self.connection.commit()
+
+    def revoke_api_credential(self, credential_id: int, organization_id: str = "default") -> dict:
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                update api_credentials set enabled = 0, revoked_at = ?
+                where id = ? and organization_id = ? and revoked_at is null
+                """,
+                (utc_now_iso(), credential_id, organization_id or "default"),
+            )
+            if cursor.rowcount <= 0:
+                raise ValueError(f"API credential not found: {credential_id}")
+            self.connection.commit()
+            row = self.connection.execute(
+                "select * from api_credentials where id = ?", (credential_id,)
+            ).fetchone()
+        return dict(row)
+
+    def create_fleet_enrollment_token(
+        self,
+        organization_id: str,
+        name: str,
+        token_hash: str,
+        token_prefix: str,
+        allowed_node_id: str,
+        expires_at: str | None,
+        created_by: str,
+    ) -> dict:
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                insert into fleet_enrollment_tokens (
+                    organization_id, name, token_hash, token_prefix, allowed_node_id,
+                    enabled, expires_at, created_at, created_by
+                ) values (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                (
+                    organization_id or "default",
+                    name,
+                    token_hash,
+                    token_prefix,
+                    allowed_node_id,
+                    expires_at,
+                    utc_now_iso(),
+                    created_by,
+                ),
+            )
+            token_id = int(cursor.lastrowid)
+            self.connection.commit()
+            row = self.connection.execute(
+                "select * from fleet_enrollment_tokens where id = ?", (token_id,)
+            ).fetchone()
+        return dict(row)
+
+    def find_fleet_enrollment_token(self, token_hash: str) -> dict | None:
+        with self.lock:
+            row = self.connection.execute(
+                """
+                select * from fleet_enrollment_tokens
+                where token_hash = ? and enabled = 1 and revoked_at is null
+                limit 1
+                """,
+                (token_hash,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def touch_fleet_enrollment_token(self, token_id: int) -> None:
+        with self.lock:
+            self.connection.execute(
+                """
+                update fleet_enrollment_tokens
+                set last_used_at = ?, use_count = use_count + 1
+                where id = ?
+                """,
+                (utc_now_iso(), token_id),
+            )
+            self.connection.commit()
+
+    def list_fleet_enrollment_tokens(self, organization_id: str = "default") -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                "select * from fleet_enrollment_tokens where organization_id = ? order by id desc",
+                (organization_id or "default",),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def revoke_fleet_enrollment_token(self, token_id: int, organization_id: str = "default") -> dict:
+        with self.lock:
+            cursor = self.connection.execute(
+                """
+                update fleet_enrollment_tokens set enabled = 0, revoked_at = ?
+                where id = ? and organization_id = ? and revoked_at is null
+                """,
+                (utc_now_iso(), token_id, organization_id or "default"),
+            )
+            if cursor.rowcount <= 0:
+                raise ValueError(f"fleet enrollment token not found: {token_id}")
+            self.connection.commit()
+            row = self.connection.execute(
+                "select * from fleet_enrollment_tokens where id = ?", (token_id,)
+            ).fetchone()
+        return dict(row)
+
     def close(self) -> None:
         with self.lock:
             self.connection.close()
@@ -4022,6 +4636,26 @@ def context_where(environment: str = "", run_type: str = "") -> tuple[list[str],
         where.append("run_type = ?")
         params.append(run_type)
     return where, params
+
+
+def append_scope_where(
+    where: list[str],
+    params: list[object],
+    organization_id: str = "",
+    project_ids: Sequence[str] | None = None,
+) -> None:
+    if organization_id:
+        where.append("organization_id = ?")
+        params.append(organization_id)
+    if project_ids is None:
+        return
+    scoped = [str(value).strip() for value in project_ids if str(value).strip()]
+    if not scoped:
+        where.append("1 = 0")
+        return
+    placeholders = ", ".join("?" for _ in scoped)
+    where.append(f"project_id in ({placeholders})")
+    params.extend(scoped)
 
 
 def common_value(values: list[str], default: str) -> str:

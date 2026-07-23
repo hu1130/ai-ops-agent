@@ -1052,6 +1052,8 @@ def run_project_ai_repair_drill(
         status=severity,
         summary=summary,
         details=details,
+        organization_id=str(safe_dict(config.raw.get("identity")).get("organization_id") or "default"),
+        project_id=project_key,
         environment=environment,
         run_type=run_type,
     )

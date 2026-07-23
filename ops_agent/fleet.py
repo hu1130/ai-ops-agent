@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import socket
 import time
@@ -17,6 +18,7 @@ from typing import Any
 from ops_agent.config import AppConfig
 from ops_agent.config_center import apply_config_update
 from ops_agent.events import CheckResult, utc_now_iso
+from ops_agent.identity import hash_access_token, normalize_expiry
 from ops_agent.project_capabilities import normalize_automation_level, normalize_management_mode
 from ops_agent.projects import list_projects
 from ops_agent.storage import Storage
@@ -37,6 +39,10 @@ def fleet_policy(config: AppConfig | None) -> dict[str, Any]:
         "alert_after_failures": max(1, safe_int(raw.get("alert_after_failures"), 2)),
         "recovery_after_successes": max(1, safe_int(raw.get("recovery_after_successes"), 2)),
         "enrollment_token_env": str(raw.get("enrollment_token_env") or "OPS_AGENT_FLEET_ENROLLMENT_TOKEN"),
+        "required_agent_version": bounded_text(raw.get("required_agent_version"), 80),
+        "public_url": str(raw.get("public_url") or "").strip(),
+        "installer_url": str(raw.get("installer_url") or "").strip(),
+        "release_url": str(raw.get("release_url") or "").strip(),
         "resource_thresholds": {
             "cpu_warning": bounded_percent(thresholds.get("cpu_warning"), 90),
             "cpu_critical": bounded_percent(thresholds.get("cpu_critical"), 98),
@@ -78,13 +84,67 @@ def configured_fleet_tokens(config: AppConfig | None) -> list[tuple[str, str]]:
     return unique
 
 
-def authenticate_fleet_token(provided_token: str, config: AppConfig | None) -> str:
+def authenticate_fleet_token(
+    provided_token: str,
+    config: AppConfig | None,
+    storage: Storage | None = None,
+    node_id: str = "",
+) -> str:
     if not provided_token:
         return ""
     for name, token in configured_fleet_tokens(config):
         if hmac.compare_digest(provided_token, token):
             return name
+    if storage is not None:
+        row = storage.find_fleet_enrollment_token(hash_access_token(provided_token))
+        if row and not timestamp_expired(row.get("expires_at")):
+            allowed_node_id = str(row.get("allowed_node_id") or "").strip()
+            if allowed_node_id and allowed_node_id != str(node_id or "").strip():
+                return ""
+            storage.touch_fleet_enrollment_token(int(row["id"]))
+            return str(row.get("name") or f"enrollment-{row.get('id')}")
     return ""
+
+
+def create_fleet_enrollment(
+    storage: Storage,
+    organization_id: str,
+    body: dict[str, Any],
+    created_by: str,
+) -> tuple[dict[str, Any], str]:
+    name = bounded_text(body.get("name") or body.get("node_id") or "server enrollment", 160)
+    node_id = str(body.get("node_id") or "").strip()
+    if node_id:
+        validate_node_id(node_id)
+    expires_at = normalize_expiry(body.get("expires_at"))
+    token = "ops_fleet_" + secrets.token_urlsafe(32)
+    row = storage.create_fleet_enrollment_token(
+        organization_id,
+        name,
+        hash_access_token(token),
+        token[:18],
+        node_id,
+        expires_at,
+        created_by,
+    )
+    return public_fleet_enrollment(row), token
+
+
+def public_fleet_enrollment(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(row.get("id") or 0),
+        "organization_id": str(row.get("organization_id") or "default"),
+        "name": str(row.get("name") or ""),
+        "token_prefix": str(row.get("token_prefix") or ""),
+        "node_id": str(row.get("allowed_node_id") or ""),
+        "enabled": bool(row.get("enabled")),
+        "expires_at": row.get("expires_at"),
+        "created_at": row.get("created_at"),
+        "created_by": row.get("created_by"),
+        "last_used_at": row.get("last_used_at"),
+        "use_count": safe_int(row.get("use_count"), 0),
+        "revoked_at": row.get("revoked_at"),
+    }
 
 
 def register_fleet_node(
@@ -104,19 +164,27 @@ def fleet_snapshot(storage: Storage, config: AppConfig | None) -> dict[str, Any]
     nodes = [public_node(row, policy) for row in storage.list_fleet_nodes()]
     nodes.sort(key=lambda row: (row["status"] != "offline", str(row.get("name") or row["node_id"]).lower()))
     return {
-        "status": "disabled" if not policy["enabled"] else "warning" if any(row["status"] == "offline" for row in nodes) else "ok",
+        "status": "disabled" if not policy["enabled"] else "warning" if any(
+            row["status"] == "offline" or row.get("upgrade_required") for row in nodes
+        ) else "ok",
         "summary": {
             "total": len(nodes),
             "online": sum(1 for row in nodes if row["status"] == "online"),
             "offline": sum(1 for row in nodes if row["status"] == "offline"),
             "disabled": sum(1 for row in nodes if row["status"] == "disabled"),
+            "outdated": sum(1 for row in nodes if row.get("upgrade_required")),
             "projects": sum(len(safe_list(row.get("projects"))) for row in nodes if row["status"] != "disabled"),
         },
         "policy": {
             "enabled": policy["enabled"],
             "heartbeat_interval_seconds": policy["heartbeat_interval_seconds"],
             "offline_after_seconds": policy["offline_after_seconds"],
-            "enrollment_ready": bool(configured_fleet_tokens(config)),
+            "required_agent_version": policy["required_agent_version"],
+            "installer_ready": bool(policy["installer_url"] and policy["release_url"]),
+            "enrollment_ready": bool(configured_fleet_tokens(config)) or any(
+                bool(row.get("enabled")) and not row.get("revoked_at") and not timestamp_expired(row.get("expires_at"))
+                for row in storage.list_fleet_enrollment_tokens()
+            ),
         },
         "nodes": nodes,
     }
@@ -163,6 +231,26 @@ def run_fleet_node_checks(storage: Storage, config: AppConfig) -> list[CheckResu
                 },
             )
         )
+        if node.get("upgrade_required"):
+            results.append(
+                CheckResult(
+                    source="fleet_agent",
+                    name=f"node/{node_id}/agent-version",
+                    status="warning",
+                    summary=(
+                        f"Server {node.get('name') or node_id} agent version "
+                        f"{node.get('agent_version') or 'unknown'} is below required "
+                        f"{node.get('required_agent_version')}"
+                    ),
+                    details={
+                        **thresholds,
+                        "node_id": node_id,
+                        "agent_version": node.get("agent_version"),
+                        "required_agent_version": node.get("required_agent_version"),
+                        "operator_action": "upgrade_fleet_agent",
+                    },
+                )
+            )
         if node["status"] != "online":
             continue
         metrics = safe_dict(node.get("metrics"))
@@ -501,7 +589,31 @@ def public_node(row: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
     item["heartbeat_age_seconds"] = age
     item["status"] = "disabled" if not enabled else "offline" if age > policy["offline_after_seconds"] else "online"
     item["enabled"] = enabled
+    required_version = str(policy.get("required_agent_version") or "").strip()
+    item["required_agent_version"] = required_version
+    item["upgrade_required"] = version_is_older(str(item.get("agent_version") or ""), required_version)
     return item
+
+
+def version_is_older(current: str, required: str) -> bool:
+    if not required:
+        return False
+    current_parts = version_parts(current)
+    required_parts = version_parts(required)
+    if not current_parts:
+        return True
+    width = max(len(current_parts), len(required_parts))
+    return (*current_parts, *([0] * (width - len(current_parts)))) < (
+        *required_parts,
+        *([0] * (width - len(required_parts))),
+    )
+
+
+def version_parts(value: str) -> tuple[int, ...]:
+    match = re.search(r"\d+(?:\.\d+)*", str(value or ""))
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.group(0).split("."))
 
 
 def fleet_candidate_id(node_id: str, remote_id: str) -> str:
@@ -540,6 +652,14 @@ def parse_datetime(value: str) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def timestamp_expired(value: object) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    parsed = parse_datetime(text)
+    return parsed is None or parsed <= datetime.now(timezone.utc)
 
 
 def agent_version() -> str:

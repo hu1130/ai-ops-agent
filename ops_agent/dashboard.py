@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import html
 import json
+import shlex
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ops_agent.alerts.notifier import Notifier
-from ops_agent.auth import AuthResult, authenticate_token, configured_api_tokens, has_role
+from ops_agent.auth import AuthResult, authenticate_access_token, authenticate_token, configured_api_tokens, has_role
 from ops_agent.backups import backup_status_payload, run_backup_now, run_restore_drill_now
 from ops_agent.config import AppConfig
 from ops_agent.config_center import (
@@ -35,7 +37,9 @@ from ops_agent.fleet import (
     authenticate_fleet_token,
     bind_fleet_project_candidate,
     combined_onboarding_snapshot,
+    create_fleet_enrollment,
     fleet_snapshot,
+    public_fleet_enrollment,
     register_fleet_node,
 )
 from ops_agent.ai.config_patches import (
@@ -66,6 +70,19 @@ from ops_agent.monitor_targets import (
     get_monitor_target,
     list_monitor_targets,
 )
+from ops_agent.identity import (
+    LoginThrottle,
+    auth_status,
+    bootstrap_identity,
+    create_api_credential,
+    create_user,
+    hash_access_token,
+    identity_settings,
+    login,
+    public_credential,
+    public_user,
+    update_user,
+)
 from ops_agent.operator_workflow import (
     build_operator_guide,
     build_operator_inbox,
@@ -89,7 +106,7 @@ from ops_agent.remediation.recommendations import (
     request_recommendation_approval,
 )
 from ops_agent.storage import Storage
-from ops_agent.simple_dashboard import render_simple_page
+from ops_agent.simple_dashboard import render_login_page, render_simple_page
 
 
 ACTIONABLE_RECOMMENDATION_STATUSES = ["suggested", "pending_approval", "failed", "verified_failed", "skipped"]
@@ -102,23 +119,74 @@ def start_dashboard(
     config: AppConfig | None = None,
     notifier: Notifier | None = None,
 ) -> ThreadingHTTPServer:
+    storage.ensure_identity_schema()
     api_tokens = configured_api_tokens(config)
     protect_reads = bool(config.app.get("api_auth_required_for_reads", False)) if config else False
     app_context = dict(config.app) if config else {}
+    login_throttle = LoginThrottle()
+    identity_config = identity_settings(config)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             path, query = split_request_path(self.path)
-            if path.startswith("/api/") and protect_reads:
+            if path == "/api/auth/status":
+                self.send_json(auth_status(storage, config))
+                return
+            if path.startswith("/api/") and (protect_reads or storage.identity_user_count() > 0):
                 auth = self.require_role(path, "viewer")
+                if auth is None:
+                    return
+            if operator_read_required(path):
+                auth = self.require_role(path, "operator")
+                if auth is None:
+                    return
+            if admin_read_required(path):
+                auth = self.require_role(path, "admin")
                 if auth is None:
                     return
             if path == "/api/fleet/nodes" and not protect_reads:
                 auth = self.require_role(path, "viewer")
                 if auth is None:
                     return
+            if path == "/api/fleet/enrollment-tokens":
+                auth = self.require_role(path, "admin")
+                if auth is None:
+                    return
+                self.send_json(
+                    {
+                        "tokens": [
+                            public_fleet_enrollment(row)
+                            for row in storage.list_fleet_enrollment_tokens(auth.organization_id)
+                        ]
+                    }
+                )
+                return
+            if path == "/api/auth/me":
+                self.send_json(auth_payload(self.authenticate()))
+                return
+            if path == "/api/users":
+                auth = self.require_role(path, "admin")
+                if auth is None:
+                    return
+                self.send_json({"users": [public_user(row) for row in storage.list_identity_users(auth.organization_id)]})
+                return
+            if path == "/api/api-credentials":
+                auth = self.require_role(path, "admin")
+                if auth is None:
+                    return
+                self.send_json(
+                    {"credentials": [public_credential(row) for row in storage.list_api_credentials(auth.organization_id)]}
+                )
+                return
             if path == "/api/summary":
-                self.send_json(filtered_dashboard_summary(storage, config, **summary_filters_from_query(query)))
+                self.send_json(
+                    filtered_dashboard_summary(
+                        storage,
+                        config,
+                        auth=self.authenticate(),
+                        **summary_filters_from_query(query),
+                    )
+                )
                 return
             if path == "/api/ops/metrics":
                 self.send_json(storage.ops_metrics(query_hours(query)))
@@ -163,7 +231,12 @@ def start_dashboard(
                 if config is None:
                     self.send_json({"error": "config is not configured"}, status=503)
                     return
-                self.send_json(combined_onboarding_snapshot(storage, config, project_onboarding_snapshot(config)))
+                self.send_json(
+                    filter_onboarding_for_auth(
+                        combined_onboarding_snapshot(storage, config, project_onboarding_snapshot(config)),
+                        self.authenticate(),
+                    )
+                )
                 return
             if path == "/api/backups":
                 if config is None:
@@ -184,10 +257,12 @@ def start_dashboard(
                 self.send_json(storage.latest_learning_config_patches(**learning_config_patch_filters_from_query(query)))
                 return
             if path == "/api/ai-repairs":
-                self.send_json(storage.latest_ai_repair_proposals(**ai_repair_filters_from_query(query)))
+                rows = storage.latest_ai_repair_proposals(**ai_repair_filters_from_query(query))
+                self.send_json(filter_ai_repairs_for_auth(storage, rows, self.authenticate()))
                 return
             if path == "/api/ai-repairs/approval-queue":
-                self.send_json(ai_repair_approval_queue(storage, **ai_repair_queue_filters_from_query(query)))
+                queue = ai_repair_approval_queue(storage, **ai_repair_queue_filters_from_query(query))
+                self.send_json(filter_ai_repair_queue_for_auth(storage, queue, self.authenticate()))
                 return
             if path == "/api/change-events":
                 self.send_json(storage.latest_change_events(**change_event_filters_from_query(query)))
@@ -233,6 +308,10 @@ def start_dashboard(
                     if not row:
                         self.send_json({"error": "learning config patch not found"}, status=404)
                         return
+                    incident = storage.get_incident(int(row.get("incident_id") or 0))
+                    if incident and not auth_can_access_record(self.authenticate(), incident):
+                        self.send_auth_error(403, "forbidden")
+                        return
                     self.send_json(row)
                     return
             ai_repair_request = parse_ai_repair_api_path(path)
@@ -242,6 +321,10 @@ def start_dashboard(
                     row = storage.get_ai_repair_proposal(repair_id)
                     if not row:
                         self.send_json({"error": "AI repair proposal not found"}, status=404)
+                        return
+                    incident = storage.get_incident(int(row.get("incident_id") or 0))
+                    if incident and not auth_can_access_record(self.authenticate(), incident):
+                        self.send_auth_error(403, "forbidden")
                         return
                     self.send_json(row)
                     return
@@ -256,23 +339,34 @@ def start_dashboard(
                     self.send_json(row)
                     return
             if path == "/api/results":
-                self.send_json(storage.latest_results(**result_filters_from_query(query)))
+                self.send_json(
+                    storage.latest_results(
+                        **result_filters_from_query(query),
+                        **auth_scope_filters(self.authenticate()),
+                    )
+                )
                 return
             if path == "/api/projects":
-                self.send_json({"projects": list_projects(config)})
+                self.send_json({"projects": visible_projects(config, self.authenticate())})
                 return
             if path == "/api/projects/summary":
                 hours = query_hours(query)
-                self.send_json(project_summary_payload(config, storage.context_summaries(hours), hours))
+                payload = project_summary_payload(config, storage.context_summaries(hours), hours)
+                self.send_json(filter_project_summary_for_auth(payload, self.authenticate()))
                 return
             if path == "/api/projects/repair-readiness":
                 if config is None:
                     self.send_json({"error": "config is not configured"}, status=503)
                     return
-                self.send_json(project_repair_readiness_snapshot(config))
+                self.send_json(filter_project_rows_for_auth(project_repair_readiness_snapshot(config), self.authenticate()))
                 return
             if path == "/api/projects/capabilities":
-                self.send_json(projects_capability_snapshot(config, list_projects(config)))
+                self.send_json(
+                    filter_project_rows_for_auth(
+                        projects_capability_snapshot(config, list_projects(config)),
+                        self.authenticate(),
+                    )
+                )
                 return
             if path == "/api/monitor-targets":
                 self.send_json(list_monitor_targets(config.raw if config else {}))
@@ -303,18 +397,32 @@ def start_dashboard(
                     self.send_json({"error": str(exc)}, status=404)
                 return
             if path == "/api/incidents":
-                self.send_json(storage.latest_incidents(**incident_filters_from_query(query)))
+                self.send_json(
+                    storage.latest_incidents(
+                        **incident_filters_from_query(query),
+                        **auth_scope_filters(self.authenticate()),
+                    )
+                )
                 return
             if path == "/api/incidents/escalated":
-                self.send_json(storage.latest_escalated_incidents())
+                self.send_json(
+                    filter_incident_linked_rows(storage, storage.latest_escalated_incidents(), self.authenticate(), direct=True)
+                )
                 return
             incident_request = parse_incident_api_path(path)
             if incident_request:
                 incident_id, action = incident_request
+                scoped_incident = storage.get_incident(incident_id)
+                if scoped_incident and not auth_can_access_record(self.authenticate(), scoped_incident):
+                    self.send_auth_error(403, "forbidden")
+                    return
                 if action == "":
                     incident = storage.get_incident(incident_id)
                     if not incident:
                         self.send_json({"error": "incident not found"}, status=404)
+                        return
+                    if not auth_can_access_record(self.authenticate(), incident):
+                        self.send_auth_error(403, "forbidden")
                         return
                     self.send_json(incident)
                     return
@@ -347,6 +455,8 @@ def start_dashboard(
                     self.send_json(storage.latest_incident_diagnoses(incident_id))
                     return
                 if action == "diagnosis":
+                    if self.require_role(path, "operator") is None:
+                        return
                     try:
                         self.send_json(persist_incident_diagnosis(storage, config, incident_id))
                     except ValueError as exc:
@@ -367,6 +477,8 @@ def start_dashboard(
                     self.send_json(storage.latest_incident_reviews(incident_id, limit=query_limit(query, default=10, maximum=100)))
                     return
                 if action == "review":
+                    if self.require_role(path, "operator") is None:
+                        return
                     reviews = storage.latest_incident_reviews(incident_id, limit=1)
                     review = reviews[0] if reviews else storage.generate_incident_review(
                         incident_id,
@@ -404,7 +516,7 @@ def start_dashboard(
                         self.send_json({"error": str(exc)}, status=404)
                     return
             if path == "/api/action-logs":
-                self.send_json(storage.latest_action_logs())
+                self.send_json(filter_incident_linked_rows(storage, storage.latest_action_logs(), self.authenticate()))
                 return
             if path == "/api/notification-logs":
                 self.send_json(storage.latest_notification_logs())
@@ -413,19 +525,19 @@ def start_dashboard(
                 self.send_json(storage.latest_api_audit_logs())
                 return
             if path == "/api/actions/pending":
-                self.send_json(storage.latest_action_logs(100, status="pending_approval"))
+                self.send_json(filter_incident_linked_rows(storage, storage.latest_action_logs(100, status="pending_approval"), self.authenticate()))
                 return
             if path == "/api/actions/failed":
-                self.send_json(storage.latest_failed_action_logs())
+                self.send_json(filter_incident_linked_rows(storage, storage.latest_failed_action_logs(), self.authenticate()))
                 return
             if path == "/api/recommendations":
-                self.send_json(storage.latest_recommendations(**recommendation_filters_from_query(query)))
+                self.send_json(filter_incident_linked_rows(storage, storage.latest_recommendations(**recommendation_filters_from_query(query)), self.authenticate()))
                 return
             if path == "/api/recommendations/pending":
-                self.send_json(storage.latest_recommendations(statuses=["pending_approval"]))
+                self.send_json(filter_incident_linked_rows(storage, storage.latest_recommendations(statuses=["pending_approval"]), self.authenticate()))
                 return
             if path == "/api/recommendations/actionable":
-                self.send_json(storage.latest_recommendations(statuses=ACTIONABLE_RECOMMENDATION_STATUSES))
+                self.send_json(filter_incident_linked_rows(storage, storage.latest_recommendations(statuses=ACTIONABLE_RECOMMENDATION_STATUSES), self.authenticate()))
                 return
             recommendation_request = parse_recommendation_api_path(path)
             if recommendation_request:
@@ -434,6 +546,9 @@ def start_dashboard(
                     row = storage.get_incident_recommendation(recommendation_id)
                     if not row:
                         self.send_json({"error": "recommendation not found"}, status=404)
+                        return
+                    if not filter_incident_linked_rows(storage, [row], self.authenticate()):
+                        self.send_auth_error(403, "forbidden")
                         return
                     self.send_json(row)
                     return
@@ -445,17 +560,55 @@ def start_dashboard(
                     if not row:
                         self.send_json({"error": "action not found"}, status=404)
                         return
+                    if not filter_incident_linked_rows(storage, [row], self.authenticate()):
+                        self.send_auth_error(403, "forbidden")
+                        return
                     self.send_json(row)
                     return
-            self.send_html(render_page(storage, config))
+            if path == "/":
+                auth = self.authenticate()
+                browser_auth_required = protect_reads or storage.identity_user_count() > 0
+                if browser_auth_required and not auth.authenticated:
+                    self.send_html(render_login_page(auth_status(storage, config)))
+                    return
+                self.send_html(render_page(storage, config, auth=auth))
+                return
+            self.send_json({"error": "not found"}, status=404)
 
         def do_POST(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
+            if path in {"/api/auth/login", "/api/auth/bootstrap", "/api/auth/logout"}:
+                self.handle_auth_post(path)
+                return
             if path in {"/api/fleet/register", "/api/fleet/heartbeat"}:
                 self.handle_fleet_heartbeat_post(path)
                 return
             auth = self.require_role(path, "operator")
             if auth is None:
+                return
+
+            if path == "/api/users" or parse_user_api_path(path):
+                if not has_role(auth.role, "admin"):
+                    self.record_audit(path, 403, "forbidden", "requires admin role", auth=auth)
+                    self.send_auth_error(403, "forbidden")
+                    return
+                self.handle_user_post(path, auth)
+                return
+
+            if path == "/api/fleet/enrollment-tokens" or parse_fleet_enrollment_path(path):
+                if not has_role(auth.role, "admin"):
+                    self.record_audit(path, 403, "forbidden", "requires admin role", auth=auth)
+                    self.send_auth_error(403, "forbidden")
+                    return
+                self.handle_fleet_enrollment_post(path, auth)
+                return
+
+            if path == "/api/api-credentials" or parse_api_credential_path(path):
+                if not has_role(auth.role, "admin"):
+                    self.record_audit(path, 403, "forbidden", "requires admin role", auth=auth)
+                    self.send_auth_error(403, "forbidden")
+                    return
+                self.handle_api_credential_post(path, auth)
                 return
 
             fleet_node_request = parse_fleet_node_api_path(path)
@@ -465,6 +618,10 @@ def start_dashboard(
 
             onboarding_request = parse_project_onboarding_api_path(path)
             if onboarding_request:
+                if not has_role(auth.role, "admin"):
+                    self.record_audit(path, 403, "forbidden", "project onboarding requires admin role", auth=auth)
+                    self.send_auth_error(403, "forbidden")
+                    return
                 self.handle_project_onboarding_post(onboarding_request, auth)
                 return
 
@@ -474,6 +631,10 @@ def start_dashboard(
                 return
 
             if path.startswith("/api/config"):
+                if not has_role(auth.role, "admin"):
+                    self.record_audit(path, 403, "forbidden", "configuration changes require admin role", auth=auth)
+                    self.send_auth_error(403, "forbidden")
+                    return
                 self.handle_config_center_post(path, auth)
                 return
 
@@ -487,6 +648,10 @@ def start_dashboard(
                 return
 
             if path == "/api/ai-repairs/approval-queue/notify":
+                if not has_role(auth.role, "admin"):
+                    self.record_audit(path, 403, "forbidden", "approval queue notification requires admin role", auth=auth)
+                    self.send_auth_error(403, "forbidden")
+                    return
                 self.handle_ai_repair_queue_notify_post(auth)
                 return
 
@@ -496,16 +661,31 @@ def start_dashboard(
 
             ai_repair_request = parse_ai_repair_api_path(path)
             if ai_repair_request:
+                repair = storage.get_ai_repair_proposal(ai_repair_request[0])
+                incident = storage.get_incident(int(repair.get("incident_id") or 0)) if repair else None
+                if incident and not auth_can_access_record(auth, incident):
+                    self.record_audit(path, 403, "forbidden", "project access denied", auth=auth)
+                    self.send_auth_error(403, "forbidden")
+                    return
                 self.handle_ai_repair_post(ai_repair_request, auth)
                 return
 
             incident_ai_repair_request = parse_incident_ai_repair_api_path(path)
             if incident_ai_repair_request:
+                incident = storage.get_incident(incident_ai_repair_request[0])
+                if incident and not auth_can_access_record(auth, incident):
+                    self.record_audit(path, 403, "forbidden", "project access denied", auth=auth)
+                    self.send_auth_error(403, "forbidden")
+                    return
                 self.handle_incident_ai_repair_post(incident_ai_repair_request, auth)
                 return
 
             project_ai_repair_request = parse_project_ai_repair_api_path(path)
             if project_ai_repair_request:
+                if not auth_can_access_project(auth, project_ai_repair_request[0]):
+                    self.record_audit(path, 403, "forbidden", "project access denied", auth=auth)
+                    self.send_auth_error(403, "forbidden")
+                    return
                 self.handle_project_ai_repair_post(project_ai_repair_request, auth)
                 return
 
@@ -529,19 +709,18 @@ def start_dashboard(
                 self.record_audit(path, 404, "not_found", "unsupported api path", auth=auth)
                 self.send_json({"error": "not found"}, status=404)
                 return
+            incident = storage.get_incident(incident_request[0])
+            if incident and not auth_can_access_record(auth, incident):
+                self.record_audit(path, 403, "forbidden", "project access denied", auth=auth)
+                self.send_auth_error(403, "forbidden")
+                return
             self.handle_incident_post(incident_request, auth)
 
         def handle_fleet_heartbeat_post(self, path: str) -> None:
             if config is None:
                 self.send_json({"error": "config is not configured"}, status=503)
                 return
-            token_name = authenticate_fleet_token(self.provided_token(), config)
-            if not token_name:
-                auth = AuthResult(authenticated=False, reason="invalid fleet enrollment token")
-                self.record_audit(path, 401, "unauthorized", auth.reason, auth=auth)
-                self.send_auth_error(401, "unauthorized")
-                return
-            auth = AuthResult(authenticated=True, role="fleet_node", token_name=token_name)
+            auth = AuthResult(authenticated=False, reason="invalid fleet enrollment token")
             try:
                 content_length = int(self.headers.get("Content-Length", "0") or "0")
                 if content_length > 1_000_000:
@@ -549,6 +728,15 @@ def start_dashboard(
                     self.send_json({"error": "payload is too large"}, status=413)
                     return
                 body = self.read_json_body()
+                node_id = str(body.get("node_id") or "").strip()
+                token_name = authenticate_fleet_token(
+                    self.provided_token(), config, storage=storage, node_id=node_id
+                )
+                if not token_name:
+                    self.record_audit(path, 401, "unauthorized", auth.reason, auth=auth)
+                    self.send_auth_error(401, "unauthorized")
+                    return
+                auth = AuthResult(authenticated=True, role="fleet_node", token_name=token_name)
                 node = register_fleet_node(storage, config, body, source_ip=self.client_ip())
                 self.record_audit(
                     path,
@@ -595,6 +783,58 @@ def start_dashboard(
             except Exception as exc:
                 self.record_audit(path, 500, "error", str(exc), auth=auth)
                 self.send_json({"error": str(exc)}, status=500)
+
+        def handle_fleet_enrollment_post(self, path: str, auth: AuthResult) -> None:
+            try:
+                token_id = parse_fleet_enrollment_path(path)
+                if token_id is not None:
+                    row = storage.revoke_fleet_enrollment_token(token_id, auth.organization_id)
+                    self.record_audit(path, 200, "success", f"fleet enrollment token revoked: {token_id}", auth=auth)
+                    self.send_json(public_fleet_enrollment(row))
+                    return
+                body = self.read_json_body()
+                enrollment, token = create_fleet_enrollment(
+                    storage,
+                    auth.organization_id,
+                    body,
+                    auth.email or auth.token_name,
+                )
+                fleet_config = dict(config.raw.get("fleet") or {}) if config else {}
+                central_url = str(
+                    fleet_config.get("public_url")
+                    or f"{self.headers.get('X-Forwarded-Proto', 'http')}://{self.headers.get('Host', '')}"
+                ).rstrip("/")
+                installer_url = str(fleet_config.get("installer_url") or "").strip()
+                release_url = str(fleet_config.get("release_url") or "").strip()
+                release_sha256 = str(fleet_config.get("release_sha256") or "").strip()
+                command = ""
+                if installer_url and release_url:
+                    checksum_env = (
+                        f"OPS_AGENT_FLEET_RELEASE_SHA256={shlex.quote(release_sha256)} "
+                        if release_sha256
+                        else ""
+                    )
+                    command = (
+                        f"curl -fsSL {shlex.quote(installer_url)} -o /tmp/install_ops_agent.sh && "
+                        f"sudo OPS_AGENT_FLEET_ENROLLMENT_TOKEN={shlex.quote(token)} "
+                        f"{checksum_env}OPS_AGENT_FLEET_RELEASE_URL={shlex.quote(release_url)} "
+                        f"bash /tmp/install_ops_agent.sh {shlex.quote(central_url)} "
+                        f"{shlex.quote(str(enrollment.get('node_id') or 'server-1'))}"
+                    )
+                self.record_audit(path, 201, "success", f"fleet enrollment token created: {enrollment['name']}", auth=auth)
+                self.send_json(
+                    {
+                        "enrollment": enrollment,
+                        "token": token,
+                        "central_url": central_url,
+                        "install_command": command,
+                        "installer_ready": bool(installer_url and release_url),
+                    },
+                    status=201,
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                self.record_audit(path, 400, "error", str(exc), auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
 
         def handle_incident_post(self, incident_request: tuple[int, str], auth: AuthResult) -> None:
             incident_id, action = incident_request
@@ -1752,6 +1992,126 @@ def start_dashboard(
             payload = json.loads(raw)
             return payload if isinstance(payload, dict) else {}
 
+        def handle_auth_post(self, path: str) -> None:
+            try:
+                body = self.read_json_body()
+                if path == "/api/auth/bootstrap":
+                    if api_tokens:
+                        bootstrap_auth = authenticate_token(self.provided_token(), api_tokens)
+                        if not bootstrap_auth.authenticated or not has_role(bootstrap_auth.role, "admin"):
+                            self.send_auth_error(401, "administrator token required")
+                            return
+                    elif self.client_ip() not in {"127.0.0.1", "::1"}:
+                        self.send_auth_error(403, "initial setup must be completed locally")
+                        return
+                    user, token = bootstrap_identity(storage, config, body)
+                    login_throttle.success(self.client_ip())
+                    self.record_audit(path, 201, "success", "identity setup completed", actor=user["email"])
+                    self.send_json(
+                        {"status": "created", "user": user},
+                        status=201,
+                        headers={"Set-Cookie": session_cookie(token, identity_config)},
+                    )
+                    return
+                if path == "/api/auth/login":
+                    throttle_key = self.client_ip() or "unknown"
+                    login_throttle.check(throttle_key)
+                    provided_api_token = str(body.get("token") or "").strip()
+                    if provided_api_token:
+                        auth = authenticate_access_token(provided_api_token, api_tokens, storage)
+                        if not auth.authenticated or auth.token_kind == "disabled":
+                            login_throttle.failure(throttle_key)
+                            raise ValueError("invalid administrator token")
+                        login_throttle.success(throttle_key)
+                        self.record_audit(path, 200, "success", "token login completed", auth=auth)
+                        self.send_json(
+                            {"status": "authenticated", "auth": auth_payload(auth)},
+                            headers={"Set-Cookie": session_cookie(provided_api_token, identity_config)},
+                        )
+                        return
+                    user, token = login(storage, config, body.get("email"), str(body.get("password") or ""))
+                    login_throttle.success(throttle_key)
+                    self.record_audit(path, 200, "success", "user login completed", actor=user["email"])
+                    self.send_json(
+                        {"status": "authenticated", "user": user},
+                        headers={"Set-Cookie": session_cookie(token, identity_config)},
+                    )
+                    return
+                provided = self.provided_token()
+                if provided:
+                    storage.revoke_auth_session(hash_access_token(provided))
+                self.send_json(
+                    {"status": "logged_out"},
+                    headers={"Set-Cookie": expired_session_cookie(identity_config)},
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                if path == "/api/auth/login":
+                    login_throttle.failure(self.client_ip() or "unknown")
+                self.record_audit(path, 400, "error", str(exc))
+                status = 429 if "too many login attempts" in str(exc) else 400
+                self.send_json({"error": str(exc)}, status=status)
+
+        def handle_user_post(self, path: str, auth: AuthResult) -> None:
+            try:
+                body = self.read_json_body()
+                user_id = parse_user_api_path(path)
+                if user_id is None:
+                    requested_role = str(body.get("role") or "viewer").strip().lower()
+                    if requested_role == "owner" and auth.role != "owner":
+                        raise ValueError("only an owner can create another owner")
+                    validate_known_project_ids(config, body.get("project_ids"))
+                    user = create_user(
+                        storage,
+                        auth.organization_id,
+                        body.get("email"),
+                        str(body.get("password") or ""),
+                        body.get("display_name"),
+                        requested_role,
+                        body.get("project_ids"),
+                    )
+                    self.record_audit(path, 201, "success", f"user created: {user['email']}", auth=auth)
+                    self.send_json(user, status=201)
+                    return
+                current = storage.get_identity_user(user_id)
+                if not current or str(current.get("organization_id") or "") != auth.organization_id:
+                    self.send_json({"error": "user not found"}, status=404)
+                    return
+                if str(current.get("role")) == "owner" and auth.role != "owner":
+                    self.send_auth_error(403, "only an owner can manage an owner account")
+                    return
+                if str(body.get("role") or "").strip().lower() == "owner" and auth.role != "owner":
+                    self.send_auth_error(403, "only an owner can grant owner access")
+                    return
+                validate_known_project_ids(config, body.get("project_ids"))
+                user = update_user(storage, user_id, body, actor_user_id=auth.user_id)
+                self.record_audit(path, 200, "success", f"user updated: {user['email']}", auth=auth)
+                self.send_json(user)
+            except (json.JSONDecodeError, ValueError) as exc:
+                self.record_audit(path, 400, "error", str(exc), auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+
+        def handle_api_credential_post(self, path: str, auth: AuthResult) -> None:
+            try:
+                credential_id = parse_api_credential_path(path)
+                if credential_id is not None:
+                    row = storage.revoke_api_credential(credential_id, auth.organization_id)
+                    self.record_audit(path, 200, "success", f"API credential revoked: {credential_id}", auth=auth)
+                    self.send_json(public_credential(row))
+                    return
+                body = self.read_json_body()
+                validate_known_project_ids(config, body.get("project_ids"))
+                credential, token = create_api_credential(
+                    storage,
+                    auth.organization_id,
+                    body,
+                    auth.email or auth.token_name,
+                )
+                self.record_audit(path, 201, "success", f"API credential created: {credential['name']}", auth=auth)
+                self.send_json({"credential": credential, "token": token}, status=201)
+            except (json.JSONDecodeError, ValueError) as exc:
+                self.record_audit(path, 400, "error", str(exc), auth=auth)
+                self.send_json({"error": str(exc)}, status=400)
+
         def require_role(self, path: str, required_role: str) -> AuthResult | None:
             auth = self.authenticate()
             if not auth.authenticated:
@@ -1767,13 +2127,20 @@ def start_dashboard(
             return auth
 
         def authenticate(self) -> AuthResult:
-            return authenticate_token(self.provided_token(), api_tokens)
+            return authenticate_access_token(self.provided_token(), api_tokens, storage)
 
         def provided_token(self) -> str:
             provided = self.headers.get("X-Ops-Agent-Token", "").strip()
             authorization = self.headers.get("Authorization", "").strip()
             if authorization.lower().startswith("bearer "):
                 provided = authorization[7:].strip()
+            if not provided:
+                cookie = SimpleCookie()
+                try:
+                    cookie.load(self.headers.get("Cookie", ""))
+                    provided = str(cookie.get("ops_agent_session").value if cookie.get("ops_agent_session") else "").strip()
+                except (AttributeError, TypeError):
+                    provided = ""
             return provided
 
         def actor_from_body(self, body: dict, auth: AuthResult) -> str:
@@ -1844,10 +2211,12 @@ def start_dashboard(
                 return forwarded_for.split(",", 1)[0].strip()
             return str(self.client_address[0]) if self.client_address else ""
 
-        def send_json(self, payload: object, status: int = 200) -> None:
+        def send_json(self, payload: object, status: int = 200, headers: dict[str, str] | None = None) -> None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            for name, value in dict(headers or {}).items():
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -1874,6 +2243,265 @@ def start_dashboard(
 def split_request_path(raw_path: str) -> tuple[str, dict[str, list[str]]]:
     parsed = urlsplit(raw_path)
     return parsed.path, parse_qs(parsed.query, keep_blank_values=False)
+
+
+def parse_user_api_path(path: str) -> int | None:
+    parts = path.strip("/").split("/")
+    if len(parts) != 3 or parts[:2] != ["api", "users"]:
+        return None
+    try:
+        return int(parts[2])
+    except ValueError:
+        return None
+
+
+def parse_api_credential_path(path: str) -> int | None:
+    parts = path.strip("/").split("/")
+    if len(parts) != 4 or parts[:2] != ["api", "api-credentials"] or parts[3] != "revoke":
+        return None
+    try:
+        return int(parts[2])
+    except ValueError:
+        return None
+
+
+def parse_fleet_enrollment_path(path: str) -> int | None:
+    parts = path.strip("/").split("/")
+    if len(parts) != 5 or parts[:3] != ["api", "fleet", "enrollment-tokens"] or parts[4] != "revoke":
+        return None
+    try:
+        return int(parts[3])
+    except ValueError:
+        return None
+
+
+def session_cookie(token: str, settings: dict) -> str:
+    max_age = max(3600, int(settings.get("session_hours") or 12) * 3600)
+    parts = [
+        f"ops_agent_session={token}",
+        "Path=/",
+        f"Max-Age={max_age}",
+        "HttpOnly",
+        "SameSite=Strict",
+    ]
+    if bool(settings.get("secure_cookie")):
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+def expired_session_cookie(settings: dict) -> str:
+    parts = ["ops_agent_session=", "Path=/", "Max-Age=0", "HttpOnly", "SameSite=Strict"]
+    if bool(settings.get("secure_cookie")):
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+def auth_payload(auth: AuthResult) -> dict:
+    return {
+        "authenticated": auth.authenticated,
+        "role": auth.role,
+        "token_name": auth.token_name,
+        "organization_id": auth.organization_id,
+        "user_id": auth.user_id,
+        "email": auth.email,
+        "display_name": auth.display_name,
+        "project_ids": list(auth.project_ids),
+        "all_projects": auth.all_projects,
+        "token_kind": auth.token_kind,
+    }
+
+
+def validate_known_project_ids(config: AppConfig | None, value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, list):
+        raise ValueError("project_ids must be a list")
+    known = {str(project.get("id") or "") for project in list_projects(config)}
+    unknown = sorted({str(item) for item in value if str(item) not in known})
+    if unknown:
+        raise ValueError("unknown project_ids: " + ", ".join(unknown))
+
+
+def auth_scope_filters(auth: AuthResult) -> dict:
+    if not auth.authenticated:
+        return {"organization_id": "", "project_ids": None}
+    return {
+        "organization_id": auth.organization_id,
+        "project_ids": None if auth.all_projects else auth.project_ids,
+    }
+
+
+def auth_can_access_project(auth: AuthResult, project_id: object) -> bool:
+    if not auth.authenticated or auth.all_projects:
+        return auth.authenticated
+    return str(project_id or "").strip() in set(auth.project_ids)
+
+
+def auth_can_access_record(auth: AuthResult, record: dict) -> bool:
+    if not auth.authenticated or auth.all_projects:
+        return auth.authenticated
+    project_id = str(record.get("project_id") or "").strip()
+    return bool(project_id) and project_id in set(auth.project_ids)
+
+
+def admin_read_required(path: str) -> bool:
+    exact_paths = {
+        "/api/audit-logs",
+        "/api/change-events",
+        "/api/classifications/summary",
+        "/api/discovery",
+        "/api/enterprise/readiness",
+        "/api/fleet/enrollment-tokens",
+        "/api/learning/config-patches",
+        "/api/learning/recommendations",
+        "/api/learning/summary",
+        "/api/monitor-targets",
+        "/api/notification-logs",
+        "/api/ops/metrics",
+        "/api/ops/report",
+        "/api/remediation/audit",
+    }
+    return (
+        path in exact_paths
+        or path == "/api/config"
+        or path.startswith("/api/config/")
+        or path.startswith("/api/learning/")
+    )
+
+
+def operator_read_required(path: str) -> bool:
+    return path == "/api/backups"
+
+
+def filter_project_rows_for_auth(payload: dict, auth: AuthResult) -> dict:
+    if not auth.authenticated or auth.all_projects:
+        return payload
+    allowed = set(auth.project_ids)
+    filtered = dict(payload)
+    rows = [
+        row
+        for row in payload.get("projects", [])
+        if str(row.get("id") or row.get("project_id") or "") in allowed
+    ]
+    filtered["projects"] = rows
+    if "summary" in filtered:
+        summary = dict(filtered.get("summary") or {})
+        summary["total"] = len(rows)
+        if "by_status" in summary:
+            by_status: dict[str, int] = {}
+            for row in rows:
+                status = str(row.get("status") or "unknown")
+                by_status[status] = by_status.get(status, 0) + 1
+            summary["by_status"] = by_status
+        filtered["summary"] = summary
+    return filtered
+
+
+def filter_incident_linked_rows(
+    storage: Storage,
+    rows: list[dict],
+    auth: AuthResult,
+    *,
+    direct: bool = False,
+) -> list[dict]:
+    if not auth.authenticated:
+        return []
+    if auth.all_projects:
+        return rows
+    visible: list[dict] = []
+    for row in rows:
+        incident = row if direct else storage.get_incident(int(row.get("incident_id") or 0))
+        if incident and auth_can_access_record(auth, incident):
+            visible.append(row)
+    return visible
+
+
+def filter_ai_repairs_for_auth(storage: Storage, rows: list[dict], auth: AuthResult) -> list[dict]:
+    if not auth.authenticated:
+        return []
+    if auth.all_projects:
+        return rows
+    visible: list[dict] = []
+    for row in rows:
+        incident = storage.get_incident(int(row.get("incident_id") or 0))
+        if incident and auth_can_access_record(auth, incident):
+            visible.append(row)
+    return visible
+
+
+def filter_ai_repair_queue_for_auth(storage: Storage, payload: dict, auth: AuthResult) -> dict:
+    if auth.all_projects:
+        return payload
+    filtered = dict(payload)
+    items = []
+    for item in payload.get("items", []):
+        incident = storage.get_incident(int(item.get("incident_id") or 0))
+        if incident and auth_can_access_record(auth, incident):
+            items.append(item)
+    filtered["items"] = items
+    by_state: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    by_risk: dict[str, int] = {}
+    for item in items:
+        state = str(item.get("queue_state") or "unknown")
+        status = str(item.get("status") or "unknown")
+        risk = str(item.get("risk") or "unknown")
+        by_state[state] = by_state.get(state, 0) + 1
+        by_status[status] = by_status.get(status, 0) + 1
+        by_risk[risk] = by_risk.get(risk, 0) + 1
+    filtered["summary"] = {
+        "total": len(items),
+        "ready_for_approval": sum(1 for item in items if item.get("can_approve")),
+        "needs_sandbox": sum(1 for item in items if item.get("queue_state") == "needs_sandbox"),
+        "blocked": sum(1 for item in items if item.get("queue_state") == "blocked"),
+        "review_only": sum(1 for item in items if item.get("queue_state") == "review_only"),
+        "by_state": by_state,
+        "by_status": by_status,
+        "by_risk": by_risk,
+    }
+    return filtered
+
+
+def visible_projects(config: AppConfig | None, auth: AuthResult) -> list[dict]:
+    projects = list_projects(config)
+    if not auth.authenticated or auth.all_projects:
+        return projects
+    allowed = set(auth.project_ids)
+    return [project for project in projects if str(project.get("id") or "") in allowed]
+
+
+def filter_project_summary_for_auth(payload: dict, auth: AuthResult) -> dict:
+    if not auth.authenticated or auth.all_projects:
+        return payload
+    allowed = set(auth.project_ids)
+    filtered = dict(payload)
+    filtered["projects"] = [
+        row for row in payload.get("projects", []) if str(row.get("id") or "") in allowed
+    ]
+    filtered["contexts"] = []
+    filtered["unmapped_contexts"] = []
+    return filtered
+
+
+def filter_onboarding_for_auth(payload: dict, auth: AuthResult) -> dict:
+    if not auth.authenticated or auth.all_projects:
+        return payload
+    allowed = set(auth.project_ids)
+    filtered = dict(payload)
+    filtered["projects"] = [
+        row for row in payload.get("projects", []) if str(row.get("id") or "") in allowed
+    ]
+    filtered["candidates"] = [
+        row
+        for row in payload.get("candidates", [])
+        if str(row.get("matched_project_id") or "") in allowed
+    ]
+    summary = dict(payload.get("summary") or {})
+    summary["detected_projects"] = len(filtered["candidates"])
+    summary["bound_projects"] = len(filtered["projects"])
+    summary["unbound_projects"] = 0
+    filtered["summary"] = summary
+    return filtered
 
 
 def recommendation_filters_from_query(query: dict[str, list[str]]) -> dict:
@@ -2082,8 +2710,14 @@ def filtered_dashboard_summary(
     hours: int = 24,
     environment: str = "",
     run_type: str = "",
+    auth: AuthResult | None = None,
 ) -> dict:
-    summary = storage.dashboard_summary(hours=hours, environment=environment, run_type=run_type)
+    summary = storage.dashboard_summary(
+        hours=hours,
+        environment=environment,
+        run_type=run_type,
+        **auth_scope_filters(auth) if auth else {},
+    )
     if config is None:
         return summary
     latest_targets = filter_report_rows(summary["latest_targets"], enabled_report_target_keys(config))
@@ -2100,10 +2734,19 @@ def filtered_dashboard_summary(
     return summary
 
 
-def render_page(storage: Storage, config: AppConfig | None = None) -> str:
-    summary = filtered_dashboard_summary(storage, config)
+def render_page(storage: Storage, config: AppConfig | None = None, auth: AuthResult | None = None) -> str:
+    effective_auth = auth or AuthResult(
+        authenticated=True,
+        role="admin",
+        token_name="local-render",
+        token_kind="internal",
+    )
+    summary = filtered_dashboard_summary(storage, config, auth=effective_auth)
     onboarding = (
-        combined_onboarding_snapshot(storage, config, project_onboarding_snapshot(config))
+        filter_onboarding_for_auth(
+            combined_onboarding_snapshot(storage, config, project_onboarding_snapshot(config)),
+            effective_auth,
+        )
         if config is not None
         else {
             "status": "warning",
@@ -2113,13 +2756,54 @@ def render_page(storage: Storage, config: AppConfig | None = None) -> str:
             "error": "config is not configured",
         }
     )
+    if config is not None:
+        repair_rows = {
+            str(row.get("id") or ""): row
+            for row in project_repair_readiness_snapshot(config).get("projects", [])
+        }
+        onboarding = dict(onboarding)
+        onboarding["projects"] = [
+            {**row, "repair_readiness": repair_rows.get(str(row.get("id") or ""), {})}
+            for row in onboarding.get("projects", [])
+        ]
     inbox = build_operator_inbox(storage, config, limit=30)
+    if effective_auth.authenticated and not effective_auth.all_projects:
+        inbox = dict(inbox)
+        inbox["items"] = [
+            item
+            for item in inbox.get("items", [])
+            if auth_can_access_record(effective_auth, storage.get_incident(int(item.get("incident_id") or 0)) or {})
+        ]
+        inbox["count"] = len(inbox["items"])
+    identity = {
+        "auth": auth_payload(effective_auth),
+        "users": (
+            [public_user(row) for row in storage.list_identity_users(effective_auth.organization_id)]
+            if has_role(effective_auth.role, "admin")
+            else []
+        ),
+        "credentials": (
+            [public_credential(row) for row in storage.list_api_credentials(effective_auth.organization_id)]
+            if has_role(effective_auth.role, "admin")
+            else []
+        ),
+        "fleet_enrollments": (
+            [
+                public_fleet_enrollment(row)
+                for row in storage.list_fleet_enrollment_tokens(effective_auth.organization_id)
+            ]
+            if has_role(effective_auth.role, "admin")
+            else []
+        ),
+        "projects": visible_projects(config, effective_auth),
+    }
     return render_simple_page(
         summary,
         onboarding,
         inbox,
-        storage.latest_api_audit_logs(50),
+        storage.latest_api_audit_logs(50) if has_role(effective_auth.role, "admin") else [],
         fleet_snapshot(storage, config),
+        identity,
     )
 
     # Kept temporarily because the helper renderers below are part of the public test surface.
@@ -2530,6 +3214,13 @@ def audit_target_from_path(path: str) -> tuple[str, str, int | None]:
         return f"fleet.node_{action.replace('-', '_')}", "fleet_node", None
     if path in {"/api/fleet/register", "/api/fleet/heartbeat"}:
         return "fleet.heartbeat", "fleet_node", None
+    fleet_enrollment_id = parse_fleet_enrollment_path(path)
+    if path == "/api/fleet/enrollment-tokens" or fleet_enrollment_id is not None:
+        return (
+            "fleet.enrollment_revoke" if fleet_enrollment_id is not None else "fleet.enrollment_create",
+            "fleet_enrollment_token",
+            fleet_enrollment_id,
+        )
 
     monitor_request = parse_monitor_target_api_path(path)
     if monitor_request:

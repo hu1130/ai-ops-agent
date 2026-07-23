@@ -18,6 +18,7 @@ from ops_agent.fleet import (
     fleet_snapshot,
     register_fleet_node,
     run_fleet_node_checks,
+    version_is_older,
 )
 from ops_agent.storage import Storage
 
@@ -136,6 +137,30 @@ class FleetTest(unittest.TestCase):
         self.assertEqual("warning", disk.status)
         self.assertEqual(88.5, disk.details["used_percent"])
 
+    def test_outdated_agent_is_visible_and_generates_upgrade_warning(self) -> None:
+        config = self.config(required_agent_version="1.2.0")
+        register_fleet_node(
+            self.storage,
+            config,
+            {
+                "node_id": "server-1",
+                "agent_version": "1.1.9",
+                "projects": [],
+                "discovery": {"status": "ok"},
+            },
+        )
+
+        snapshot = fleet_snapshot(self.storage, config)
+        checks = run_fleet_node_checks(self.storage, config)
+        version_check = next(row for row in checks if row.source == "fleet_agent")
+
+        self.assertEqual(1, snapshot["summary"]["outdated"])
+        self.assertTrue(snapshot["nodes"][0]["upgrade_required"])
+        self.assertEqual("warning", version_check.status)
+        self.assertEqual("upgrade_fleet_agent", version_check.details["operator_action"])
+        self.assertTrue(version_is_older("v1.0.9", "1.1.0"))
+        self.assertFalse(version_is_older("1.2", "1.1.9"))
+
     def test_remote_project_can_be_bound_to_config(self) -> None:
         config_path = self.root / "config.json"
         config_path.write_text(
@@ -204,6 +229,58 @@ class FleetTest(unittest.TestCase):
 
 
 class FleetApiTest(unittest.TestCase):
+    def test_admin_can_issue_node_bound_enrollment_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "ops.db")
+            config = AppConfig(
+                raw={
+                    "app": {"api_token": "admin-secret", "api_auth_required_for_reads": True},
+                    "fleet": {"enabled": True},
+                },
+                base_dir=Path(tmp),
+            )
+            server = start_dashboard(storage, "127.0.0.1", 0, config=config)
+            host, port = server.server_address
+            base = f"http://{host}:{port}"
+            try:
+                issued = post_json(
+                    f"{base}/api/fleet/enrollment-tokens",
+                    {"name": "server-2", "node_id": "server-2"},
+                    "admin-secret",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as wrong_node:
+                    post_json(
+                        f"{base}/api/fleet/heartbeat",
+                        {"node_id": "server-3", "projects": []},
+                        issued["token"],
+                    )
+                accepted = post_json(
+                    f"{base}/api/fleet/heartbeat",
+                    {"node_id": "server-2", "projects": [], "discovery": {"status": "ok"}},
+                    issued["token"],
+                )
+                listed = get_json(f"{base}/api/fleet/enrollment-tokens", "admin-secret")
+                post_json(
+                    f"{base}/api/fleet/enrollment-tokens/{issued['enrollment']['id']}/revoke",
+                    {},
+                    "admin-secret",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as revoked:
+                    post_json(
+                        f"{base}/api/fleet/heartbeat",
+                        {"node_id": "server-2", "projects": []},
+                        issued["token"],
+                    )
+            finally:
+                server.shutdown()
+                server.server_close()
+                storage.close()
+
+        self.assertEqual(401, wrong_node.exception.code)
+        self.assertEqual("online", accepted["status"])
+        self.assertEqual(1, listed["tokens"][0]["use_count"])
+        self.assertEqual(401, revoked.exception.code)
+
     def test_registration_auth_and_admin_disable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "ops.db")

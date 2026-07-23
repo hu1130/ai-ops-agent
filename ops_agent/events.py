@@ -21,6 +21,7 @@ class RunContext:
     environment: str = "prod"
     run_type: str = "normal"
     trace_id: str = field(default_factory=new_trace_id)
+    organization_id: str = "default"
 
 
 @dataclass
@@ -34,6 +35,8 @@ class CheckResult:
     environment: str = "prod"
     run_type: str = "normal"
     trace_id: str = ""
+    organization_id: str = "default"
+    project_id: str = ""
 
     @property
     def is_problem(self) -> bool:
@@ -48,4 +51,6 @@ def apply_context(results: list[CheckResult], context: RunContext) -> list[Check
             result.run_type = context.run_type
         if not result.trace_id:
             result.trace_id = context.trace_id
+        if not result.organization_id or result.organization_id == "default":
+            result.organization_id = context.organization_id
     return results

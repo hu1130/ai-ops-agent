@@ -71,6 +71,29 @@ class CliTest(unittest.TestCase):
         )
         self.assertEqual([], validate_config(config))
 
+    def test_validate_config_accepts_disabled_missing_log_path(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60},
+                "log_checks": [{"name": "future log", "enabled": False, "path": "missing.log"}],
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+            },
+            base_dir=Path("."),
+        )
+        self.assertEqual([], validate_config(config))
+
+    def test_validate_config_rejects_non_boolean_log_enabled(self) -> None:
+        config = AppConfig(
+            raw={
+                "app": {"interval_seconds": 60},
+                "log_checks": [{"name": "bad", "enabled": "no", "path": "missing.log"}],
+                "alerts": {"consecutive_failures": 2, "cooldown_seconds": 300},
+            },
+            base_dir=Path("."),
+        )
+        errors = validate_config(config)
+        self.assertTrue(any("log_checks[0].enabled" in error for error in errors))
+
     def test_validate_config_accepts_docker_check(self) -> None:
         config = AppConfig(
             raw={

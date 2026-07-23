@@ -60,6 +60,45 @@ class SimpleDashboardTest(unittest.TestCase):
         self.assertIn('data-node-action="disable"', html)
         self.assertIn("1 台服务器在线", html)
 
+    def test_admin_page_includes_repair_enrollment_and_member_controls(self) -> None:
+        html = render_simple_page(
+            {"current_status": "ok", "latest_targets": []},
+            {
+                "summary": {},
+                "candidates": [],
+                "projects": [
+                    {
+                        "id": "sales",
+                        "name": "Sales",
+                        "repo_root": "/srv/sales",
+                        "git_remote": "origin",
+                        "base_branch": "main",
+                        "capabilities": {"ready": True, "automation_level": "pull_request"},
+                        "repair_readiness": {
+                            "status": "ready",
+                            "closure": {"status": "ready", "blockers": []},
+                        },
+                    }
+                ],
+            },
+            {"items": []},
+            [],
+            {"summary": {}, "nodes": []},
+            {
+                "auth": {"role": "owner", "display_name": "Owner"},
+                "users": [{"id": 2, "email": "user@example.com", "role": "viewer", "enabled": True}],
+                "credentials": [],
+                "fleet_enrollments": [],
+                "projects": [{"id": "sales", "name": "Sales", "enabled": True}],
+            },
+        )
+
+        self.assertIn('data-project-form="sales"', html)
+        self.assertIn('data-repair-drill="sales"', html)
+        self.assertIn('id="enrollment-form"', html)
+        self.assertIn('data-user-id="2"', html)
+        self.assertIn('data-user-action="disable"', html)
+
 
 if __name__ == "__main__":
     unittest.main()

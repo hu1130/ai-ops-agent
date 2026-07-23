@@ -4,6 +4,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -184,7 +185,10 @@ class BackupWorkflowTest(unittest.TestCase):
             config.raw["app"].update(
                 {
                     "api_auth_required_for_reads": True,
-                    "api_tokens": [{"name": "owner", "token": "owner-token", "role": "operator"}],
+                    "api_tokens": [
+                        {"name": "owner", "token": "owner-token", "role": "operator"},
+                        {"name": "viewer", "token": "viewer-token", "role": "viewer"},
+                    ],
                 }
             )
             storage = Storage(Path(tmp) / "ops.db")
@@ -212,6 +216,12 @@ class BackupWorkflowTest(unittest.TestCase):
                 with urllib.request.urlopen(status_request, timeout=10) as response:
                     status = json.loads(response.read().decode("utf-8"))
                 audits = storage.latest_api_audit_logs()
+                viewer_request = urllib.request.Request(
+                    f"http://{host}:{port}/api/backups",
+                    headers={"Authorization": "Bearer viewer-token"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as denied:
+                    urllib.request.urlopen(viewer_request, timeout=10)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -220,6 +230,7 @@ class BackupWorkflowTest(unittest.TestCase):
         self.assertEqual("success", backup["status"])
         self.assertEqual("success", drill["status"])
         self.assertEqual(2, len(status["runs"]))
+        self.assertEqual(403, denied.exception.code)
         self.assertEqual(["backup.drill", "backup.run"], [row["operation"] for row in audits[:2]])
 
     def test_backup_warning_has_dedicated_classification(self) -> None:

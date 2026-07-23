@@ -167,6 +167,7 @@ def resilience_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
     heartbeat_configured = bool(heartbeat.get("enabled")) and bool(heartbeat.get("url"))
     fleet = fleet_policy(config)
     fleet_tokens_ready = bool(configured_fleet_tokens(config))
+    fleet_distribution_ready = bool(fleet.get("installer_url") and fleet.get("release_url"))
     backup_targets = [
         item
         for item in safe_list(backups.get("targets"))
@@ -226,11 +227,9 @@ def resilience_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
         ReadinessCheck(
             "resilience",
             "multi_server_fleet",
-            "pass" if fleet["enabled"] and fleet_tokens_ready else "blocker" if fleet["enabled"] else "warning",
+            "pass" if fleet["enabled"] else "warning",
             (
-                "Multi-server fleet enrollment is enabled."
-                if fleet["enabled"] and fleet_tokens_ready
-                else "Fleet is enabled but its enrollment token is missing."
+                "Multi-server fleet enrollment is enabled; administrators can issue one-time node tokens."
                 if fleet["enabled"]
                 else "Multi-server fleet enrollment is disabled."
             ),
@@ -239,6 +238,22 @@ def resilience_governance_checks(config: AppConfig) -> list[ReadinessCheck]:
                 "enrollment_token_env": fleet["enrollment_token_env"],
                 "enrollment_ready": fleet_tokens_ready,
                 "offline_after_seconds": fleet["offline_after_seconds"],
+            },
+        ),
+        ReadinessCheck(
+            "resilience",
+            "fleet_release_distribution",
+            "pass" if fleet["enabled"] and fleet_distribution_ready else "warning",
+            (
+                "Fleet installer and release URLs are configured."
+                if fleet["enabled"] and fleet_distribution_ready
+                else "Fleet installer or release URL is not configured."
+            ),
+            {
+                "enabled": fleet["enabled"],
+                "installer_url_configured": bool(fleet.get("installer_url")),
+                "release_url_configured": bool(fleet.get("release_url")),
+                "required_agent_version": str(fleet.get("required_agent_version") or ""),
             },
         ),
     ]

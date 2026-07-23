@@ -1206,3 +1206,54 @@ export OPS_AGENT_FLEET_SERVER_URL="https://你的运维中心地址"
 export OPS_AGENT_FLEET_ENROLLMENT_TOKEN="节点令牌"
 python3 -m ops_agent.cli --config config.json fleet-agent --node-id server-1 --once
 ```
+
+## 企业 V1 使用流程
+
+管理页面的第一屏就是实际运维工作台，不需要先学习复杂配置：
+
+1. 首次打开页面，创建公司 Owner 账号。密码至少 12 位，登录失败会限流。
+2. 在“服务器”页生成一次性节点令牌，把页面给出的安装命令放到客户 Linux 服务器执行。
+3. 节点会自动上报 Docker 项目、资源指标、Agent 版本和心跳；管理员在“项目”页选择托管、只读或忽略。
+4. 在“成员与密钥”页创建成员，角色分为只读、运维人员、管理员和 Owner，并为成员绑定可见项目。
+5. 需要代码修复的项目填写代码目录、Git 远程、测试命令、部署命令、回滚命令和健康检查地址，再运行安全演练。
+
+服务器节点令牌、用户会话和 API 密钥只存摘要，明文只在创建时显示一次。项目成员不能读取或执行其他项目的事件、建议、动作和 AI 修复记录。
+
+### AI 修复安全边界
+
+默认生产流程为：
+
+```text
+发现异常 -> 诊断 -> DeepSeek 生成补丁 -> 路径与敏感文件检查
+-> 隔离副本测试 -> 人工审批 -> 修复分支 -> GitHub PR
+-> 合并确认 -> 部署 -> 健康验证 -> 失败自动回滚
+```
+
+系统不会因为缺少 GitHub 凭据而绕过 PR 直接改生产代码。客户项目必须已经检出到 repo_root，并由客户提供该仓库的推送权限。生产环境仍默认 auto_approve=false。
+
+### 多服务器升级
+
+中心端可以配置：
+
+```json
+"fleet": {
+  "enabled": true,
+  "public_url": "https://ops.example.com",
+  "installer_url": "https://ops.example.com/releases/install_fleet_agent.sh",
+  "release_url": "https://ops.example.com/releases/ops-agent-1.0.0.tar.gz",
+  "release_sha256": "发布包的 SHA256",
+  "required_agent_version": "1.0.0"
+}
+```
+
+节点版本低于 required_agent_version 时会产生独立升级提示。重复执行安装命令会创建新版本目录、原子切换并重启服务；启动失败会切回上一版本。节点不会未经确认自动升级。
+
+### 生产部署仍需提供的外部条件
+
+- HTTPS 域名和反向代理。
+- DeepSeek API Key，只放在服务环境变量中。
+- 客户代码仓库的 Git/GitHub 凭据。
+- SMTP 或其他告警渠道。
+- 一个位于本机之外的 dead-man heartbeat 地址；同一台服务器无法可靠证明自己已经宕机。
+
+这些条件缺失时系统会在企业就绪检查中报告警告或阻塞，不会偷偷降级安全策略。

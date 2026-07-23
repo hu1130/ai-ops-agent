@@ -3,6 +3,8 @@ import unittest
 from pathlib import Path
 
 from ops_agent.events import CheckResult
+from ops_agent.fleet import create_fleet_enrollment
+from ops_agent.identity import create_api_credential, create_user
 from ops_agent.mysql_migration import MysqlExportOptions, export_sqlite_to_mysql
 from ops_agent.storage import Storage
 
@@ -13,6 +15,28 @@ class MysqlMigrationTest(unittest.TestCase):
             db_path = Path(tmp) / "ops.db"
             output_path = Path(tmp) / "mysql.sql"
             storage = Storage(db_path)
+            storage.ensure_organization("acme", "Acme")
+            create_user(
+                storage,
+                "acme",
+                "owner@example.com",
+                "StrongPassword!123",
+                "Owner",
+                "owner",
+                [],
+            )
+            create_api_credential(
+                storage,
+                "acme",
+                {"name": "migration-reader", "role": "viewer", "project_ids": []},
+                "owner@example.com",
+            )
+            create_fleet_enrollment(
+                storage,
+                "acme",
+                {"name": "server-1", "node_id": "server-1"},
+                "owner@example.com",
+            )
             incident_id = storage.save_incident(
                 "critical",
                 "Site down",
@@ -65,6 +89,10 @@ class MysqlMigrationTest(unittest.TestCase):
         self.assertIn("INSERT INTO `incidents`", sql)
         self.assertIn("analysis with 中文", sql)
         self.assertIn("INSERT INTO `ai_repair_proposals`", sql)
+        self.assertIn("CREATE TABLE `users`", sql)
+        self.assertIn("INSERT INTO `users`", sql)
+        self.assertIn("INSERT INTO `api_credentials`", sql)
+        self.assertIn("INSERT INTO `fleet_enrollment_tokens`", sql)
 
     def test_schema_only_export_omits_inserts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
