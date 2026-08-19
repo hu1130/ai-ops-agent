@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from ops_agent.config import AppConfig
-from ops_agent.storage import Storage
+from ops_agent.storage import Storage, scalar_value
 from ops_agent.storage_factory import (
     BufferedCursor,
     MySQLConnectionAdapter,
@@ -89,6 +89,10 @@ class StorageFactoryTest(unittest.TestCase):
         self.assertEqual({"id": 1}, cursor.fetchone())
         self.assertEqual([{"id": 2}], cursor.fetchall())
         self.assertEqual(7, cursor.lastrowid)
+
+    def test_scalar_value_supports_sqlite_and_mysql_rows(self) -> None:
+        self.assertEqual(3, scalar_value((3,)))
+        self.assertEqual(4, scalar_value({"total": 4}))
 
     def test_mysql_read_only_query_ends_transaction_without_committing_pending_writes(self) -> None:
         connection = FakeConnection()

@@ -1,4 +1,6 @@
+import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -471,6 +473,72 @@ class RemediationTest(unittest.TestCase):
         result = execute_action(action, config, dry_run=False, approved=True)
         self.assertEqual("skipped", result.status)
         self.assertIn("policy denied", result.error)
+
+    def test_cleanup_temp_files_deletes_only_old_allowlisted_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "tmp"
+            root.mkdir()
+            old_file = root / "old.tmp"
+            new_file = root / "new.tmp"
+            old_file.write_text("old", encoding="utf-8")
+            new_file.write_text("new", encoding="utf-8")
+            old_timestamp = time.time() - 96 * 3600
+            os.utime(old_file, (old_timestamp, old_timestamp))
+
+            config = AppConfig(
+                raw={
+                    "remediation": {
+                        "policies": [
+                            {
+                                "action_type": "cleanup_temp_files",
+                                "targets": [str(root)],
+                                "enabled": True,
+                                "requires_approval": True,
+                            }
+                        ]
+                    }
+                },
+                base_dir=Path(tmp),
+            )
+            action = RemediationAction(
+                action_type="cleanup_temp_files",
+                title="Cleanup temp",
+                reason="Manual test",
+                risk="medium",
+                params={"paths": [str(root)], "max_age_hours": 72, "max_files": 10},
+            )
+            result = execute_action(action, config, dry_run=False, approved=True)
+
+            self.assertEqual("executed", result.status)
+            self.assertIn("deleted_files=1", result.output)
+            self.assertFalse(old_file.exists())
+            self.assertTrue(new_file.exists())
+
+    def test_cleanup_temp_files_requires_allowlist_without_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "tmp"
+            root.mkdir()
+            old_file = root / "old.tmp"
+            old_file.write_text("old", encoding="utf-8")
+            old_timestamp = time.time() - 96 * 3600
+            os.utime(old_file, (old_timestamp, old_timestamp))
+
+            config = AppConfig(
+                raw={"remediation": {"allowed_actions": ["cleanup_temp_files"]}},
+                base_dir=Path(tmp),
+            )
+            action = RemediationAction(
+                action_type="cleanup_temp_files",
+                title="Cleanup temp",
+                reason="Manual test",
+                risk="medium",
+                params={"paths": [str(root)], "max_age_hours": 72},
+            )
+            result = execute_action(action, config, dry_run=False, approved=True)
+
+            self.assertEqual("skipped", result.status)
+            self.assertIn("allowed_cleanup_paths", result.error)
+            self.assertTrue(old_file.exists())
 
     def test_dry_run_does_not_execute_mutating_action(self) -> None:
         config = AppConfig(raw={"remediation": {"allowed_actions": ["restart_service"]}}, base_dir=Path("."))

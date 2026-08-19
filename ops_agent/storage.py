@@ -3287,10 +3287,12 @@ class Storage:
             test_run_types or [],
         )
         with self.lock:
-            count = self.connection.execute(
-                f"select count(*) from incidents where {where}",
-                params,
-            ).fetchone()[0]
+            count = scalar_value(
+                self.connection.execute(
+                    f"select count(*) from incidents where {where}",
+                    params,
+                ).fetchone(),
+            )
         return int(count)
 
     def close_resolved_incidents(
@@ -3388,26 +3390,36 @@ class Storage:
             test_run_types,
         )
         with self.lock:
-            check_results = self.connection.execute(
-                f"select count(*) from check_results where {check_where}",
-                check_params,
-            ).fetchone()[0]
-            incidents = self.connection.execute(
-                f"select count(*) from incidents where {incident_where}",
-                incident_params,
-            ).fetchone()[0]
-            action_logs = self.connection.execute(
-                f"select count(*) from action_logs where {action_where}",
-                action_params,
-            ).fetchone()[0]
-            api_audit_logs = self.connection.execute(
-                f"select count(*) from api_audit_logs where {api_audit_where}",
-                api_audit_params,
-            ).fetchone()[0]
-            notification_logs = self.connection.execute(
-                f"select count(*) from notification_logs where {notification_where}",
-                notification_params,
-            ).fetchone()[0]
+            check_results = scalar_value(
+                self.connection.execute(
+                    f"select count(*) from check_results where {check_where}",
+                    check_params,
+                ).fetchone()
+            )
+            incidents = scalar_value(
+                self.connection.execute(
+                    f"select count(*) from incidents where {incident_where}",
+                    incident_params,
+                ).fetchone()
+            )
+            action_logs = scalar_value(
+                self.connection.execute(
+                    f"select count(*) from action_logs where {action_where}",
+                    action_params,
+                ).fetchone()
+            )
+            api_audit_logs = scalar_value(
+                self.connection.execute(
+                    f"select count(*) from api_audit_logs where {api_audit_where}",
+                    api_audit_params,
+                ).fetchone()
+            )
+            notification_logs = scalar_value(
+                self.connection.execute(
+                    f"select count(*) from notification_logs where {notification_where}",
+                    notification_params,
+                ).fetchone()
+            )
         return {
             "check_results": int(check_results),
             "incidents": int(incidents),
@@ -5267,6 +5279,18 @@ def count_by_key(rows: list[dict], key: str, default: str = "unknown") -> dict[s
         value = str(row.get(key) or default)
         counts[value] = counts.get(value, 0) + 1
     return counts
+
+
+def scalar_value(row: object, default: int = 0) -> int:
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        value = next(iter(row.values()), default)
+        return int(value or default)
+    try:
+        return int(row[0] or default)  # type: ignore[index]
+    except (TypeError, KeyError, IndexError, ValueError):
+        return default
 
 
 MUTATING_ACTION_TYPES = {"restart_service", "restart_docker_container", "cleanup_temp_files", "rotate_large_log"}

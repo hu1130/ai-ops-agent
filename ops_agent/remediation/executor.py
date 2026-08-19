@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import shlex
 import socket
+import os
+import stat
 import subprocess
+import time
+from pathlib import Path
+from typing import Any
 
 from ops_agent.config import AppConfig
 from ops_agent.remediation.actions import ActionResult, RemediationAction
@@ -61,8 +66,10 @@ def execute_action(
         return restart_service(action, config)
     if action.action_type == "restart_docker_container":
         return restart_docker_container(action, config)
-    if action.action_type in {"cleanup_temp_files", "rotate_large_log"}:
-        return ActionResult(action=action, status="skipped", error="该修改类动作已建模，但执行器尚未开放。")
+    if action.action_type == "cleanup_temp_files":
+        return cleanup_temp_files(action, config)
+    if action.action_type == "rotate_large_log":
+        return ActionResult(action=action, status="skipped", error="日志轮转动作已建模，但执行器尚未开放。")
     return ActionResult(action=action, status="skipped", error=f"未知动作类型: {action.action_type}")
 
 
@@ -119,6 +126,62 @@ def restart_docker_container(action: RemediationAction, config: AppConfig) -> Ac
     return run_mutating_command(action, ["docker", "restart", container], config)
 
 
+def cleanup_temp_files(action: RemediationAction, config: AppConfig) -> ActionResult:
+    paths = clean_path_list(action.params.get("paths"))
+    if not paths:
+        return ActionResult(action=action, status="failed", error="paths 参数不能为空。")
+
+    allowed_roots = cleanup_allowed_roots(config)
+    if not allowed_roots:
+        return ActionResult(action=action, status="skipped", error="未配置 allowed_cleanup_paths 或清理策略 targets。")
+
+    max_age_hours = positive_float(action.params.get("max_age_hours"), 72.0)
+    max_files = positive_int(action.params.get("max_files"), 500)
+    max_bytes = positive_int(action.params.get("max_bytes"), 0)
+    cutoff = time.time() - max_age_hours * 3600
+
+    deleted_files = 0
+    deleted_bytes = 0
+    scanned_files = 0
+    skipped: list[str] = []
+
+    for raw_path in paths:
+        root = cleanup_path(raw_path, config.base_dir)
+        if not path_allowed(root, allowed_roots):
+            skipped.append(f"{raw_path}: not allowlisted")
+            continue
+        if root.is_symlink():
+            skipped.append(f"{raw_path}: symlink root skipped")
+            continue
+        if not root.exists():
+            skipped.append(f"{raw_path}: path not found")
+            continue
+
+        for file_path, size in cleanup_candidates(root, cutoff):
+            scanned_files += 1
+            if deleted_files >= max_files:
+                skipped.append("max_files reached")
+                break
+            if max_bytes > 0 and deleted_bytes + size > max_bytes:
+                skipped.append("max_bytes reached")
+                break
+            try:
+                file_path.unlink()
+            except OSError as exc:
+                skipped.append(f"{file_path}: {exc}")
+                continue
+            deleted_files += 1
+            deleted_bytes += size
+
+    output = (
+        f"scanned={scanned_files}, deleted_files={deleted_files}, "
+        f"deleted_bytes={deleted_bytes}, max_age_hours={max_age_hours}"
+    )
+    if skipped:
+        output += "; skipped=" + "; ".join(skipped[:8])
+    return ActionResult(action=action, status="executed", output=output)
+
+
 def run_read_only_command(action: RemediationAction, args: list[str], config: AppConfig) -> ActionResult:
     return run_command(action, args, config)
 
@@ -149,6 +212,98 @@ def run_command(action: RemediationAction, args: list[str], config: AppConfig) -
     if completed.returncode != 0:
         return ActionResult(action=action, status="failed", output=output, error=f"exit {completed.returncode}")
     return ActionResult(action=action, status="executed", output=output)
+
+
+def clean_path_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def cleanup_allowed_roots(config: AppConfig) -> list[Path]:
+    remediation = config.raw.get("remediation", {})
+    if not isinstance(remediation, dict):
+        return []
+    values: list[str] = []
+    values.extend(clean_path_list(remediation.get("allowed_cleanup_paths")))
+    policies = remediation.get("policies")
+    if isinstance(policies, list):
+        for policy in policies:
+            if not isinstance(policy, dict):
+                continue
+            if str(policy.get("action_type") or "") != "cleanup_temp_files":
+                continue
+            if not bool(policy.get("enabled", True)):
+                continue
+            values.extend(clean_path_list(policy.get("targets")))
+    roots = [cleanup_path(value, config.base_dir) for value in values if value != "*"]
+    return sorted(set(roots), key=lambda item: str(item))
+
+
+def cleanup_path(value: str, base_dir: Path) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = base_dir / path
+    return path.resolve(strict=False)
+
+
+def path_allowed(path: Path, allowed_roots: list[Path]) -> bool:
+    for root in allowed_roots:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def cleanup_candidates(root: Path, cutoff: float):
+    if root.is_file():
+        candidate = safe_cleanup_candidate(root, cutoff)
+        if candidate:
+            yield candidate
+        return
+
+    if not root.is_dir():
+        return
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        base = Path(dirpath)
+        dirnames[:] = [name for name in dirnames if not (base / name).is_symlink()]
+        for filename in filenames:
+            candidate = safe_cleanup_candidate(base / filename, cutoff)
+            if candidate:
+                yield candidate
+
+
+def safe_cleanup_candidate(path: Path, cutoff: float) -> tuple[Path, int] | None:
+    try:
+        file_stat = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(file_stat.st_mode):
+        return None
+    if file_stat.st_mtime > cutoff:
+        return None
+    return path, int(file_stat.st_size)
+
+
+def positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def describe_dry_run(action: RemediationAction) -> str:

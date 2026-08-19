@@ -178,6 +178,9 @@
     "disk_path": ".",
     "cpu_percent_warn": 85,
     "memory_percent_warn": 85,
+    "memory_collect_evidence": true,
+    "memory_top_processes": 5,
+    "memory_top_containers": 5,
     "disk_percent_warn": 90
   },
   "docker_checks": [
@@ -397,6 +400,7 @@
     "allowed_actions": ["check_port", "check_process", "run_diagnostic_command"],
     "allowed_services": [],
     "allowed_containers": [],
+    "allowed_cleanup_paths": ["/tmp", "/var/tmp"],
     "command_timeout_seconds": 8,
     "max_command_output_chars": 4000,
     "verification": {

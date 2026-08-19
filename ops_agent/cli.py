@@ -68,6 +68,10 @@ def parse_args() -> argparse.Namespace:
     run_parser.add_argument("--command", dest="diagnostic_command", default="", help="Read-only diagnostic command")
     run_parser.add_argument("--service", default="", help="Service name for restart_service")
     run_parser.add_argument("--container", default="", help="Container name for restart_docker_container")
+    run_parser.add_argument("--cleanup-path", action="append", default=[], help="Path for cleanup_temp_files; can repeat")
+    run_parser.add_argument("--max-age-hours", type=float, default=72, help="Minimum file age for cleanup_temp_files")
+    run_parser.add_argument("--max-files", type=int, default=500, help="Maximum files to delete in one cleanup action")
+    run_parser.add_argument("--max-bytes", type=int, default=0, help="Maximum bytes to delete in one cleanup action; 0 disables")
     run_parser.add_argument("--incident-id", type=int, default=0, help="Related incident id")
     run_parser.add_argument("--execute", action="store_true", help="Actually execute safe actions; default is dry-run")
     add_verify_args(run_parser)
@@ -572,6 +576,23 @@ def build_cli_action(args: argparse.Namespace) -> RemediationAction:
             reason="人工请求重启 Docker 容器。",
             risk="medium",
             params=with_verify({"container": args.container}, verify_after),
+        )
+    if args.type == "cleanup_temp_files":
+        paths = list(getattr(args, "cleanup_path", []) or [])
+        return RemediationAction(
+            action_type="cleanup_temp_files",
+            title="清理临时文件",
+            reason="人工请求清理白名单路径里的过期临时文件。",
+            risk="medium",
+            params=with_verify(
+                {
+                    "paths": paths,
+                    "max_age_hours": args.max_age_hours,
+                    "max_files": args.max_files,
+                    "max_bytes": args.max_bytes,
+                },
+                verify_after,
+            ),
         )
     return RemediationAction(
         action_type=args.type,
