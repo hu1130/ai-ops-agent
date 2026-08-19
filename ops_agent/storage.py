@@ -17,6 +17,9 @@ from ops_agent.incident_lifecycle import (
 )
 
 
+RETENTION_DELETE_BATCH_SIZE = 5000
+
+
 class Storage:
     def __init__(self, database_path: Path):
         self.database_path = database_path
@@ -3497,43 +3500,39 @@ class Storage:
                 notification_cutoff=notification_cutoff,
                 test_notification_cutoff=test_notification_cutoff,
             )
-            self.connection.execute(
-                f"delete from check_results where {check_where}",
-                check_params,
-            )
-            self.connection.execute(
-                f"""
-                delete from incident_events
-                where incident_id in (
-                    select id from incidents where {incident_where}
-                )
-                """,
-                incident_params,
-            )
-            self.connection.execute(
-                f"""
-                delete from incident_recommendations
-                where incident_id in (
-                    select id from incidents where {incident_where}
-                )
-                """,
-                incident_params,
-            )
-            self.connection.execute(
-                f"""
-                delete from incident_comments
-                where incident_id in (
-                    select id from incidents where {incident_where}
-                )
-                """,
-                incident_params,
-            )
-            self.connection.execute(f"delete from incidents where {incident_where}", incident_params)
-            self.connection.execute(f"delete from action_logs where {action_where}", action_params)
-            self.connection.execute(f"delete from api_audit_logs where {api_audit_where}", api_audit_params)
-            self.connection.execute(f"delete from notification_logs where {notification_where}", notification_params)
-            self.connection.commit()
+            self.delete_rows_by_where("check_results", check_where, check_params)
+            self.delete_incidents_by_where(incident_where, incident_params)
+            self.delete_rows_by_where("action_logs", action_where, action_params)
+            self.delete_rows_by_where("api_audit_logs", api_audit_where, api_audit_params)
+            self.delete_rows_by_where("notification_logs", notification_where, notification_params)
         return before
+
+    def delete_rows_by_where(self, table: str, where: str, params: Sequence[object]) -> None:
+        while True:
+            ids = self.select_ids_for_delete(table, where, params)
+            if not ids:
+                return
+            placeholders = ", ".join("?" for _ in ids)
+            self.connection.execute(f"delete from {table} where id in ({placeholders})", ids)
+            self.connection.commit()
+
+    def delete_incidents_by_where(self, where: str, params: Sequence[object]) -> None:
+        while True:
+            ids = self.select_ids_for_delete("incidents", where, params)
+            if not ids:
+                return
+            placeholders = ", ".join("?" for _ in ids)
+            for table in ("incident_events", "incident_recommendations", "incident_comments"):
+                self.connection.execute(f"delete from {table} where incident_id in ({placeholders})", ids)
+            self.connection.execute(f"delete from incidents where id in ({placeholders})", ids)
+            self.connection.commit()
+
+    def select_ids_for_delete(self, table: str, where: str, params: Sequence[object]) -> list[int]:
+        rows = self.connection.execute(
+            f"select id from {table} where {where} order by id asc limit ?",
+            [*params, RETENTION_DELETE_BATCH_SIZE],
+        ).fetchall()
+        return [scalar_value(row) for row in rows]
 
     def vacuum(self) -> None:
         with self.lock:

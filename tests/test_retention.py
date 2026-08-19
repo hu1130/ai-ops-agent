@@ -5,6 +5,7 @@ from pathlib import Path
 
 from ops_agent.retention import run_retention_cleanup
 from ops_agent.storage import Storage
+import ops_agent.storage as storage_module
 
 
 class RetentionTest(unittest.TestCase):
@@ -36,6 +37,27 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(1, result.deleted_check_results)
         self.assertEqual(2, len(rows))
         self.assertEqual({"ok", "warning"}, {row["status"] for row in rows})
+
+    def test_retention_deletes_check_results_in_batches(self) -> None:
+        original_batch_size = storage_module.RETENTION_DELETE_BATCH_SIZE
+        storage_module.RETENTION_DELETE_BATCH_SIZE = 2
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                storage = Storage(Path(tmp) / "ops.db")
+                for _ in range(5):
+                    insert_check(storage, "ok", days_ago=40)
+                result = run_retention_cleanup(
+                    storage,
+                    {"enabled": True, "check_results_days": 30},
+                    dry_run=False,
+                )
+                rows = storage.latest_results(10)
+                storage.close()
+        finally:
+            storage_module.RETENTION_DELETE_BATCH_SIZE = original_batch_size
+
+        self.assertEqual(5, result.deleted_check_results)
+        self.assertEqual([], rows)
 
     def test_problem_results_are_not_kept_shorter_than_ok_results(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
