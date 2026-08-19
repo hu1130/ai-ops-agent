@@ -128,7 +128,16 @@ def proc_memory_check(config: dict[str, Any]) -> CheckResult | None:
     used_percent = round(((total - available) / total) * 100, 2)
     threshold = float(config.get("memory_percent_warn", 85))
     status = "warning" if used_percent >= threshold else "ok"
-    details = {"used_percent": used_percent, "available_bytes": available, "threshold": threshold}
+    details: dict[str, Any] = {"used_percent": used_percent, "available_bytes": available, "threshold": threshold}
+    if should_collect_memory_evidence(config, status):
+        details["top_processes"] = collect_top_processes_from_ps(
+            int(config.get("memory_top_processes", 5)),
+            float(config.get("memory_process_stats_timeout_seconds", 3)),
+        )
+        details["top_containers"] = collect_top_containers(
+            int(config.get("memory_top_containers", 5)),
+            float(config.get("memory_container_stats_timeout_seconds", 3)),
+        )
     return CheckResult(
         source="server",
         name="Memory usage",
@@ -207,6 +216,51 @@ def collect_top_processes(psutil_module: Any, limit: int) -> list[dict[str, Any]
             )
         except Exception:
             continue
+    rows.sort(key=lambda item: int(item["rss_bytes"]), reverse=True)
+    return rows[:limit]
+
+
+def collect_top_processes_from_ps(limit: int, timeout_seconds: float) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    try:
+        completed = subprocess.run(
+            ["ps", "-eo", "pid=,comm=,rss=,%mem=", "--sort=-rss"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(1.0, timeout_seconds),
+            check=False,
+        )
+    except Exception:
+        return []
+    if completed.returncode != 0:
+        return []
+    return parse_ps_top_processes(completed.stdout, limit)
+
+
+def parse_ps_top_processes(output: str, limit: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) != 4:
+            continue
+        try:
+            pid = int(parts[0])
+            rss_kib = int(parts[2])
+            memory_percent = float(parts[3])
+        except ValueError:
+            continue
+        rows.append(
+            {
+                "pid": pid,
+                "name": parts[1],
+                "rss_bytes": rss_kib * 1024,
+                "rss_mib": round(rss_kib / 1024, 1),
+                "memory_percent": round(memory_percent, 2),
+            }
+        )
     rows.sort(key=lambda item: int(item["rss_bytes"]), reverse=True)
     return rows[:limit]
 
