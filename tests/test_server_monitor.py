@@ -1,6 +1,6 @@
 import unittest
 
-from ops_agent.monitors.server_monitor import memory_summary, parse_percent, parse_ps_top_processes
+from ops_agent.monitors.server_monitor import memory_status, memory_summary, parse_percent, parse_ps_top_processes
 
 
 class ServerMonitorTest(unittest.TestCase):
@@ -15,6 +15,15 @@ class ServerMonitorTest(unittest.TestCase):
         self.assertIn("Memory usage 88.5%", text)
         self.assertIn("available 512.0MiB", text)
         self.assertIn("mysqld 700.1MiB", text)
+
+    def test_memory_status_uses_available_floor_when_configured(self) -> None:
+        config = {"memory_available_mb_warn": 512}
+
+        self.assertEqual("ok", memory_status(88.5, 800 * 1024 * 1024, config, 85))
+        self.assertEqual("warning", memory_status(88.5, 400 * 1024 * 1024, config, 85))
+
+    def test_memory_status_preserves_percent_only_default(self) -> None:
+        self.assertEqual("warning", memory_status(88.5, 800 * 1024 * 1024, {}, 85))
 
     def test_parse_percent_handles_bad_values(self) -> None:
         self.assertEqual(4.5, parse_percent("4.5%"))

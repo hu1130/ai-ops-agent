@@ -178,6 +178,7 @@
     "disk_path": ".",
     "cpu_percent_warn": 85,
     "memory_percent_warn": 85,
+    "memory_available_mb_warn": 512,
     "memory_collect_evidence": true,
     "memory_top_processes": 5,
     "memory_top_containers": 5,

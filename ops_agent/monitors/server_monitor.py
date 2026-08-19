@@ -57,11 +57,12 @@ def memory_check(config: dict[str, Any]) -> CheckResult | None:
     vm = psutil.virtual_memory()
     threshold = float(config.get("memory_percent_warn", 85))
     used_percent = round(float(vm.percent), 2)
-    status = "warning" if used_percent >= threshold else "ok"
+    status = memory_status(used_percent, int(vm.available), config, threshold)
     details: dict[str, Any] = {
         "used_percent": used_percent,
         "available_bytes": int(vm.available),
         "threshold": threshold,
+        **memory_threshold_details(config),
     }
     if should_collect_memory_evidence(config, status):
         details["top_processes"] = collect_top_processes(psutil, int(config.get("memory_top_processes", 5)))
@@ -127,8 +128,13 @@ def proc_memory_check(config: dict[str, Any]) -> CheckResult | None:
 
     used_percent = round(((total - available) / total) * 100, 2)
     threshold = float(config.get("memory_percent_warn", 85))
-    status = "warning" if used_percent >= threshold else "ok"
-    details: dict[str, Any] = {"used_percent": used_percent, "available_bytes": available, "threshold": threshold}
+    status = memory_status(used_percent, available, config, threshold)
+    details: dict[str, Any] = {
+        "used_percent": used_percent,
+        "available_bytes": available,
+        "threshold": threshold,
+        **memory_threshold_details(config),
+    }
     if should_collect_memory_evidence(config, status):
         details["top_processes"] = collect_top_processes_from_ps(
             int(config.get("memory_top_processes", 5)),
@@ -192,6 +198,22 @@ def should_collect_memory_evidence(config: dict[str, Any], status: str) -> bool:
     if not bool(config.get("memory_collect_evidence", True)):
         return False
     return status != "ok" or bool(config.get("memory_collect_evidence_when_ok", False))
+
+
+def memory_status(used_percent: float, available_bytes: int, config: dict[str, Any], percent_threshold: float) -> str:
+    if used_percent < percent_threshold:
+        return "ok"
+    available_threshold_mb = float(config.get("memory_available_mb_warn") or 0)
+    if available_threshold_mb <= 0:
+        return "warning"
+    return "warning" if available_bytes <= available_threshold_mb * 1024 * 1024 else "ok"
+
+
+def memory_threshold_details(config: dict[str, Any]) -> dict[str, Any]:
+    available_threshold_mb = float(config.get("memory_available_mb_warn") or 0)
+    if available_threshold_mb <= 0:
+        return {}
+    return {"available_threshold_bytes": int(available_threshold_mb * 1024 * 1024)}
 
 
 def collect_top_processes(psutil_module: Any, limit: int) -> list[dict[str, Any]]:
